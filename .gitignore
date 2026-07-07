@@ -1,0 +1,32 @@
+# Вспомогательные скрипты (не входят в проект)
+make_calibration_pattern.py
+make_chessboard_pairs.py
+make_test_pair.py
+
+# Сгенерированные калибровки и паттерны
+stereo_calib*.npz
+calibration_pattern*.png
+calibration_pattern*.pdf
+
+# Наборы калибровочных снимков
+calib/
+calibNew/
+
+# Тестовые и выходные изображения/данные
+test_left.png
+test_right.png
+disparity*.png
+disp*.png
+overlay*.png
+left*.jpg
+right*.jpg
+left*.png
+right*.png
+*.npy
+*.ply
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
