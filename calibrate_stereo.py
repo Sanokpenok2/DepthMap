@@ -60,15 +60,8 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help=(
             "Масштаб ректификации (0..1): 0 — максимальная обрезка без чёрных полей, "
-            "1 — сохранить весь кадр (возможны чёрные края). "
-            "Для --model fisheye используется как balance."
+            "1 — сохранить весь кадр (возможны чёрные края)."
         ),
-    )
-    p.add_argument(
-        "--model",
-        choices=["pinhole", "fisheye"],
-        default="pinhole",
-        help="Модель объектива: pinhole (стандартная) или fisheye (широкоугольная).",
     )
     return p.parse_args()
 
@@ -282,129 +275,6 @@ def calibrate_pinhole(
     }
 
 
-def calibrate_fisheye(
-    objpoints: list[np.ndarray],
-    imgpoints_l: list[np.ndarray],
-    imgpoints_r: list[np.ndarray],
-    image_size: tuple[int, int],
-    alpha: float,
-    log: list[str],
-) -> dict:
-    log.append("Калибровка fisheye-модели...")
-
-    objpoints_f = [objp.reshape(1, -1, 3) for objp in objpoints]
-    imgpoints_l_f = [pts.reshape(1, -1, 2) for pts in imgpoints_l]
-    imgpoints_r_f = [pts.reshape(1, -1, 2) for pts in imgpoints_r]
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-6)
-
-    # Сначала pinhole-оценка как стартовое приближение для fisheye.
-    _, mtx_init_l, _, _, _ = cv2.calibrateCamera(
-        objpoints, imgpoints_l, image_size, None, None
-    )
-    _, mtx_init_r, _, _, _ = cv2.calibrateCamera(
-        objpoints, imgpoints_r, image_size, None, None
-    )
-
-    K_l = mtx_init_l.copy()
-    K_r = mtx_init_r.copy()
-    D_l = np.zeros((4, 1), dtype=np.float64)
-    D_r = np.zeros((4, 1), dtype=np.float64)
-
-    ret_l, K_l, D_l, _, _ = cv2.fisheye.calibrate(
-        objpoints_f,
-        imgpoints_l_f,
-        image_size,
-        K_l,
-        D_l,
-        None,
-        None,
-        cv2.CALIB_USE_INTRINSIC_GUESS,
-        criteria,
-    )
-    ret_r, K_r, D_r, _, _ = cv2.fisheye.calibrate(
-        objpoints_f,
-        imgpoints_r_f,
-        image_size,
-        K_r,
-        D_r,
-        None,
-        None,
-        cv2.CALIB_USE_INTRINSIC_GUESS,
-        criteria,
-    )
-    log.append(f"  RMS-ошибка левой камеры:  {ret_l:.4f}")
-    log.append(f"  RMS-ошибка правой камеры: {ret_r:.4f}")
-
-    stereo_result = cv2.fisheye.stereoCalibrate(
-        objpoints_f,
-        imgpoints_l_f,
-        imgpoints_r_f,
-        K_l,
-        D_l,
-        K_r,
-        D_r,
-        image_size,
-        flags=cv2.CALIB_FIX_INTRINSIC,
-        criteria=criteria,
-    )
-    ret_stereo = float(stereo_result[0])
-    K_l, D_l, K_r, D_r = stereo_result[1:5]
-    R, T = stereo_result[5:7]
-    log.append(f"  RMS-ошибка стереокалибровки: {ret_stereo:.4f}")
-
-    balance = float(np.clip(alpha, 0.0, 1.0))
-    log.append(f"Ректификация: balance={balance:.2f}")
-
-    R1, R2, P1, P2, Q = cv2.fisheye.stereoRectify(
-        K_l,
-        D_l,
-        K_r,
-        D_r,
-        image_size,
-        R,
-        T,
-        flags=cv2.CALIB_ZERO_DISPARITY,
-        newImageSize=image_size,
-        balance=balance,
-        fov_scale=1.0,
-    )
-    roi1 = (0, 0, image_size[0], image_size[1])
-    roi2 = (0, 0, image_size[0], image_size[1])
-    log.append("  Fisheye-ректификация не возвращает ROI; проверяйте % валидных пикселей.")
-
-    map1_l, map2_l = cv2.fisheye.initUndistortRectifyMap(
-        K_l, D_l, R1, P1, image_size, cv2.CV_16SC2
-    )
-    map1_r, map2_r = cv2.fisheye.initUndistortRectifyMap(
-        K_r, D_r, R2, P2, image_size, cv2.CV_16SC2
-    )
-
-    return {
-        "model": "fisheye",
-        "rms_l": ret_l,
-        "rms_r": ret_r,
-        "rms_stereo": ret_stereo,
-        "mtx_l": K_l,
-        "dist_l": D_l,
-        "mtx_r": K_r,
-        "dist_r": D_r,
-        "R": R,
-        "T": T,
-        "R1": R1,
-        "R2": R2,
-        "P1": P1,
-        "P2": P2,
-        "Q": Q,
-        "alpha": balance,
-        "roi1": roi1,
-        "roi2": roi2,
-        "map1_l": map1_l,
-        "map2_l": map2_l,
-        "map1_r": map1_r,
-        "map2_r": map2_r,
-    }
-
-
 def calibrate_stereo(
     left_paths: list[str],
     right_paths: list[str],
@@ -414,7 +284,6 @@ def calibrate_stereo(
     output: str,
     debug_dir: str | None = None,
     alpha: float = 1.0,
-    model: str = "pinhole",
 ) -> tuple[str, list[str]]:
     """Выполняет стереокалибровку и сохраняет результат в .npz."""
     if not left_paths or not right_paths:
@@ -429,10 +298,7 @@ def calibrate_stereo(
         left_paths, right_paths, cols, rows, square_size, debug_dir
     )
 
-    if model == "fisheye":
-        result = calibrate_fisheye(objpoints, imgpoints_l, imgpoints_r, image_size, alpha, log)
-    else:
-        result = calibrate_pinhole(objpoints, imgpoints_l, imgpoints_r, image_size, alpha, log)
+    result = calibrate_pinhole(objpoints, imgpoints_l, imgpoints_r, image_size, alpha, log)
 
     geom_lines, focal_px, baseline_mm = describe_stereo_geometry(
         result["mtx_l"], result["mtx_r"], result["T"], result["P1"]
@@ -507,7 +373,6 @@ def main() -> None:
             args.output,
             args.debug_dir,
             args.alpha,
-            args.model,
         )
     except ValueError as exc:
         sys.exit(f"Ошибка: {exc}")

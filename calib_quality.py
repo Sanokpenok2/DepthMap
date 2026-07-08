@@ -116,7 +116,7 @@ def assess_calibration_quality(
     if alpha >= 0.99 and (valid_l < WARN_VALID_RECT_FRACTION or valid_r < WARN_VALID_RECT_FRACTION):
         warnings.append(
             "При alpha=1 на краях возможны сильные искажения. "
-            "Попробуйте alpha=0.5 или перекалибруйте с --model fisheye."
+            "Попробуйте alpha=0.5."
         )
 
     if model == "pinhole" and dist_l is not None and dist_r is not None:
@@ -124,9 +124,9 @@ def assess_calibration_quality(
         k3_r = abs(float(dist_r.ravel()[4])) if dist_r.size >= 5 else 0.0
         if k3_l > WARN_PINHOLE_K3 or k3_r > WARN_PINHOLE_K3:
             warnings.append(
-                "Сильная дисторсия для pinhole-модели "
+                "Сильная дисторсия / переобучение коэффициентов "
                 f"(|k3|: {k3_l:.2f} / {k3_r:.2f}). "
-                "Для широкоугольных объективов используйте --model fisheye."
+                "Проверьте покрытие кадра доской и качество углов."
             )
 
     return warnings
