@@ -21,6 +21,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from calib_quality import assess_calibration_quality, format_quality_report
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -215,7 +217,7 @@ def normalize_disparity(disp: np.ndarray, min_disp: int, num_disp: int) -> np.nd
 
 def load_calibration(path: str) -> dict:
     try:
-        data = np.load(path, allow_pickle=False)
+        data = np.load(path, allow_pickle=True)
     except OSError:
         sys.exit(f"Ошибка: не удалось прочитать файл калибровки '{path}'.")
     required = ["map1_l", "map2_l", "map1_r", "map2_r", "Q"]
@@ -223,6 +225,54 @@ def load_calibration(path: str) -> dict:
     if missing:
         sys.exit(f"Ошибка: в файле калибровки нет полей: {', '.join(missing)}.")
     return {k: data[k] for k in data.files}
+
+
+def calibration_quality_warnings(calib: dict) -> list[str]:
+    """Возвращает предупреждения о качестве загруженной калибровки."""
+    if "quality_warnings" in calib:
+        stored = calib["quality_warnings"]
+        if isinstance(stored, np.ndarray):
+            return [str(w) for w in stored.tolist() if str(w)]
+        return [str(stored)]
+
+    if "mtx_l" not in calib or "mtx_r" not in calib or "T" not in calib:
+        return ["В файле калибровки нет данных для проверки качества."]
+
+    image_size = tuple(int(v) for v in calib["image_size"])
+    model = "pinhole"
+    if "model" in calib:
+        model = str(np.asarray(calib["model"]).ravel()[0])
+
+    baseline_mm = float(np.linalg.norm(calib["T"]))
+    if "baseline_mm" in calib:
+        baseline_mm = float(np.asarray(calib["baseline_mm"]).ravel()[0])
+
+    alpha = 1.0
+    if "alpha" in calib:
+        alpha = float(np.asarray(calib["alpha"]).ravel()[0])
+
+    roi1 = calib["roi1"] if "roi1" in calib else None
+    roi2 = calib["roi2"] if "roi2" in calib else None
+
+    return assess_calibration_quality(
+        model=model,
+        rms_l=float("nan"),
+        rms_r=float("nan"),
+        rms_stereo=float("nan"),
+        mtx_l=calib["mtx_l"],
+        mtx_r=calib["mtx_r"],
+        baseline_mm=baseline_mm,
+        map1_l=calib["map1_l"],
+        map2_l=calib["map2_l"],
+        map1_r=calib["map1_r"],
+        map2_r=calib["map2_r"],
+        image_size=image_size,
+        alpha=alpha,
+        roi1=roi1,
+        roi2=roi2,
+        dist_l=calib.get("dist_l"),
+        dist_r=calib.get("dist_r"),
+    )
 
 
 def rectify_pair(
@@ -372,6 +422,9 @@ def compute_stereo_disparity(
     if calib_path:
         log.append(f"Загрузка калибровки и ректификация: {calib_path}")
         calib = load_calibration(calib_path)
+        warnings = calibration_quality_warnings(calib)
+        if warnings:
+            log.extend(format_quality_report(warnings))
         left, right = rectify_pair(left, right, calib)
         rectified = True
 
@@ -433,6 +486,9 @@ def main() -> None:
     if args.calib:
         print(f"Загрузка калибровки и ректификация: {args.calib}")
         calib = load_calibration(args.calib)
+        warnings = calibration_quality_warnings(calib)
+        for line in format_quality_report(warnings):
+            print(line)
         left, right = rectify_pair(left, right, calib)
 
     if args.method == "sgbm":
