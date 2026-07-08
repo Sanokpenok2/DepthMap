@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -325,6 +326,88 @@ def get_colormap(name: str) -> int:
         print(f"Предупреждение: colormap '{name}' не найден, используется JET.", file=sys.stderr)
         return cv2.COLORMAP_JET
     return cmap
+
+
+@dataclass
+class StereoProcessResult:
+    disparity_color: np.ndarray
+    left_gray: np.ndarray
+    right_gray: np.ndarray
+    disparity_float: np.ndarray
+    rectified: bool
+    log: list[str]
+
+
+def compute_stereo_disparity(
+    left_path: str,
+    right_path: str,
+    *,
+    method: str = "sgbm",
+    num_disparities: int = 128,
+    block_size: int = 5,
+    min_disparity: int = 0,
+    wls: bool = False,
+    wls_lambda: float = 8000.0,
+    wls_sigma: float = 1.5,
+    colormap: str = "JET",
+    calib_path: str | None = None,
+) -> StereoProcessResult:
+    """Строит карту диспаритета по паре изображений."""
+    log: list[str] = []
+
+    if num_disparities % 16 != 0:
+        raise ValueError("--num-disparities должен быть кратен 16.")
+    if block_size % 2 == 0:
+        raise ValueError("--block-size должен быть нечётным.")
+
+    left = load_gray(left_path)
+    right = load_gray(right_path)
+    if left.shape != right.shape:
+        raise ValueError(
+            f"Размеры изображений различаются ({left.shape} и {right.shape}). "
+            "Стереопара должна быть выровнена или используйте калибровку."
+        )
+
+    rectified = False
+    if calib_path:
+        log.append(f"Загрузка калибровки и ректификация: {calib_path}")
+        calib = load_calibration(calib_path)
+        left, right = rectify_pair(left, right, calib)
+        rectified = True
+
+    if method == "sgbm":
+        matcher = build_sgbm(min_disparity, num_disparities, block_size)
+    else:
+        matcher = build_bm(num_disparities, block_size)
+
+    log.append(f"Вычисление диспаритета методом {method.upper()}...")
+    disp = matcher.compute(left, right)
+
+    if wls:
+        log.append("Применение WLS-фильтра...")
+        disp = apply_wls(matcher, disp, left, right, wls_lambda, wls_sigma)
+
+    disp_vis = normalize_disparity(disp, min_disparity, num_disparities)
+    disp_color = cv2.applyColorMap(disp_vis, get_colormap(colormap))
+    disp_float = disp.astype(np.float32) / 16.0
+
+    valid = disp_float[disp_float > 0]
+    if valid.size:
+        log.append(
+            f"Диспаритет: мин {valid.min():.1f}, макс {valid.max():.1f}, "
+            f"медиана {np.median(valid):.1f} px"
+        )
+    else:
+        log.append("Предупреждение: не найдено валидных значений диспаритета.")
+
+    return StereoProcessResult(
+        disparity_color=disp_color,
+        left_gray=left,
+        right_gray=right,
+        disparity_float=disp_float,
+        rectified=rectified,
+        log=log,
+    )
 
 
 def main() -> None:
