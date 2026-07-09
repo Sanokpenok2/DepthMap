@@ -59,8 +59,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help=(
-            "Масштаб ректификации (0..1): 0 — максимальная обрезка без чёрных полей, "
-            "1 — сохранить весь кадр (возможны чёрные края)."
+            "Масштаб ректификации (0..1) для stereoRectify: 0 — максимальная обрезка "
+            "без чёрных полей, 1 — сохранить весь кадр (возможны чёрные края). "
+            "В режиме uncalibrated не используется для карт ремапа."
+        ),
+    )
+    p.add_argument(
+        "--rectify",
+        choices=("calibrated", "uncalibrated"),
+        default="calibrated",
+        help=(
+            "Метод ректификации: calibrated — stereoRectify; "
+            "uncalibrated — stereoRectifyUncalibrated (гомографии по F и углам доски)."
         ),
     )
     return p.parse_args()
@@ -83,24 +93,64 @@ def describe_stereo_geometry(
     mtx_r: np.ndarray,
     T: np.ndarray,
     P1: np.ndarray,
-) -> tuple[list[str], float, float]:
-    """Возвращает строки журнала, focal (px) и baseline (мм)."""
+    P2: np.ndarray | None = None,
+) -> tuple[list[str], dict[str, float]]:
+    """Возвращает строки журнала и рассчитанные параметры камер."""
     fx_l, fy_l = float(mtx_l[0, 0]), float(mtx_l[1, 1])
     fx_r, fy_r = float(mtx_r[0, 0]), float(mtx_r[1, 1])
     baseline_mm = float(np.linalg.norm(T))
-    focal_px = float(P1[0, 0])
+    focal_rect_l = float(P1[0, 0])
+    focal_rect_r = float(P2[0, 0]) if P2 is not None else focal_rect_l
     lines = [
         "Рассчитанные параметры:",
-        f"  Левая камера:  fx={fx_l:.2f} px, fy={fy_l:.2f} px",
-        f"  Правая камера: fx={fx_r:.2f} px, fy={fy_r:.2f} px",
+        "  До ректификации:",
+        f"    Левая камера:  fx={fx_l:.2f} px, fy={fy_l:.2f} px",
+        f"    Правая камера: fx={fx_r:.2f} px, fy={fy_r:.2f} px",
+        "  После ректификации:",
+        f"    Левая камера:  fx={focal_rect_l:.2f} px",
+        f"    Правая камера: fx={focal_rect_r:.2f} px",
         f"  База между камерами: {baseline_mm:.2f} мм",
-        f"  Фокусное (после ректификации): {focal_px:.2f} px",
         (
             "  Для depth_map без --calib: "
-            f"--focal {focal_px:.1f} --baseline {baseline_mm:.1f}"
+            f"--focal {focal_rect_l:.1f} --baseline {baseline_mm:.1f}"
         ),
     ]
-    return lines, focal_px, baseline_mm
+    metrics = {
+        "focal_px": focal_rect_l,
+        "focal_rect_l_px": focal_rect_l,
+        "focal_rect_r_px": focal_rect_r,
+        "focal_l_px": fx_l,
+        "focal_r_px": fx_r,
+        "fy_l_px": fy_l,
+        "fy_r_px": fy_r,
+        "baseline_mm": baseline_mm,
+    }
+    return lines, metrics
+
+
+def clear_debug_dir(debug_dir: str) -> None:
+    """Удаляет старые файлы из каталога отладки перед новой калибровкой."""
+    path = Path(debug_dir)
+    if not path.is_dir():
+        return
+    for item in path.iterdir():
+        if item.is_file():
+            item.unlink()
+
+
+def align_stereo_pair(
+    img_l: np.ndarray, img_r: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, bool]:
+    """Обрезает пару до общего размера, если различие только в габаритах."""
+    if img_l.shape == img_r.shape:
+        return img_l, img_r, False
+
+    h = min(img_l.shape[0], img_r.shape[0])
+    w = min(img_l.shape[1], img_r.shape[1])
+    if h <= 0 or w <= 0:
+        return img_l, img_r, False
+
+    return img_l[:h, :w], img_r[:h, :w], True
 
 
 def collect_calibration_corners(
@@ -127,19 +177,40 @@ def collect_calibration_corners(
     subpix_criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-3)
     image_size: tuple[int, int] | None = None
     log: list[str] = []
+    skipped_unreadable = 0
+    skipped_size = 0
+    aligned_pairs = 0
+    size_mismatch_logged = False
 
     if debug_dir:
         Path(debug_dir).mkdir(parents=True, exist_ok=True)
+        clear_debug_dir(debug_dir)
 
     for lf, rf in zip(left_paths, right_paths):
         img_l = cv2.imread(lf, cv2.IMREAD_GRAYSCALE)
         img_r = cv2.imread(rf, cv2.IMREAD_GRAYSCALE)
         if img_l is None or img_r is None:
+            skipped_unreadable += 1
             log.append(f"Пропуск (не читается): {Path(lf).name} / {Path(rf).name}")
             continue
+
         if img_l.shape != img_r.shape:
-            log.append(f"Пропуск (разные размеры): {Path(lf).name} / {Path(rf).name}")
-            continue
+            aligned_l, aligned_r, was_aligned = align_stereo_pair(img_l, img_r)
+            if not was_aligned:
+                skipped_size += 1
+                log.append(
+                    f"Пропуск (разные размеры): {Path(lf).name} "
+                    f"{img_l.shape} / {Path(rf).name} {img_r.shape}"
+                )
+                continue
+            if not size_mismatch_logged:
+                log.append(
+                    "Предупреждение: размеры левых и правых кадров различаются. "
+                    "Пары будут обрезаны до общей области."
+                )
+                size_mismatch_logged = True
+            aligned_pairs += 1
+            img_l, img_r = aligned_l, aligned_r
 
         image_size = (img_l.shape[1], img_l.shape[0])
 
@@ -168,7 +239,13 @@ def collect_calibration_corners(
             cv2.imwrite(str(Path(debug_dir) / f"corners_right_{Path(rf).name}"), vis_r)
 
     if image_size is None:
-        raise ValueError("Не удалось прочитать ни одной пары изображений.")
+        raise ValueError(
+            "Не удалось использовать ни одной пары изображений. "
+            f"Не читается: {skipped_unreadable}, "
+            f"несовместимые размеры: {skipped_size}."
+        )
+    if aligned_pairs:
+        log.append(f"Обрезано до общего размера {image_size[0]}x{image_size[1]}: {aligned_pairs} пар.")
     if len(objpoints) < 3:
         raise ValueError(
             f"Доска найдена только на {len(objpoints)} парах. "
@@ -179,53 +256,44 @@ def collect_calibration_corners(
     return objpoints, imgpoints_l, imgpoints_r, image_size, log
 
 
-def calibrate_pinhole(
-    objpoints: list[np.ndarray],
-    imgpoints_l: list[np.ndarray],
-    imgpoints_r: list[np.ndarray],
+def stack_image_points(imgpoints: list[np.ndarray]) -> np.ndarray:
+    """Собирает углы со всех кадров в массив Nx2."""
+    return np.vstack([p.reshape(-1, 2) for p in imgpoints]).astype(np.float64)
+
+
+def homography_to_remap_maps(
+    H: np.ndarray, image_size: tuple[int, int]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Строит float-карты для cv2.remap по обратной гомографии (эквивалент warpPerspective)."""
+    w, h = image_size
+    H_inv = np.linalg.inv(H)
+    xs, ys = np.meshgrid(
+        np.arange(w, dtype=np.float32),
+        np.arange(h, dtype=np.float32),
+    )
+    ones = np.ones_like(xs, dtype=np.float32)
+    pts = np.stack([xs, ys, ones], axis=0).reshape(3, -1)
+    mapped = H_inv @ pts
+    denom = mapped[2]
+    denom = np.where(np.abs(denom) < 1e-9, 1e-9, denom)
+    map_x = (mapped[0] / denom).reshape(h, w).astype(np.float32)
+    map_y = (mapped[1] / denom).reshape(h, w).astype(np.float32)
+    return map_x, map_y
+
+
+def stereo_rectify_calibrated(
+    mtx_l: np.ndarray,
+    dist_l: np.ndarray,
+    mtx_r: np.ndarray,
+    dist_r: np.ndarray,
     image_size: tuple[int, int],
+    R: np.ndarray,
+    T: np.ndarray,
     alpha: float,
     log: list[str],
 ) -> dict:
-    log.append("Калибровка pinhole-модели...")
-
-    ret_l, mtx_l, dist_l, _, _ = cv2.calibrateCamera(
-        objpoints, imgpoints_l, image_size, None, None
-    )
-    ret_r, mtx_r, dist_r, _, _ = cv2.calibrateCamera(
-        objpoints, imgpoints_r, image_size, None, None
-    )
-    log.append(f"  RMS-ошибка левой камеры:  {ret_l:.4f}")
-    log.append(f"  RMS-ошибка правой камеры: {ret_r:.4f}")
-
-    stereo_flags = cv2.CALIB_FIX_INTRINSIC
-    stereo_criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-5)
-    (
-        ret_stereo,
-        mtx_l,
-        dist_l,
-        mtx_r,
-        dist_r,
-        R,
-        T,
-        _E,
-        _F,
-    ) = cv2.stereoCalibrate(
-        objpoints,
-        imgpoints_l,
-        imgpoints_r,
-        mtx_l,
-        dist_l,
-        mtx_r,
-        dist_r,
-        image_size,
-        criteria=stereo_criteria,
-        flags=stereo_flags,
-    )
-    log.append(f"  RMS-ошибка стереокалибровки: {ret_stereo:.4f}")
-
     alpha = float(np.clip(alpha, 0.0, 1.0))
-    log.append(f"Ректификация: alpha={alpha:.2f}")
+    log.append(f"Ректификация: stereoRectify (alpha={alpha:.2f})")
 
     R1, R2, P1, P2, Q, roi1, roi2 = cv2.stereoRectify(
         mtx_l,
@@ -250,16 +318,7 @@ def calibrate_pinhole(
     )
 
     return {
-        "model": "pinhole",
-        "rms_l": ret_l,
-        "rms_r": ret_r,
-        "rms_stereo": ret_stereo,
-        "mtx_l": mtx_l,
-        "dist_l": dist_l,
-        "mtx_r": mtx_r,
-        "dist_r": dist_r,
-        "R": R,
-        "T": T,
+        "rectification_method": "calibrated",
         "R1": R1,
         "R2": R2,
         "P1": P1,
@@ -272,6 +331,169 @@ def calibrate_pinhole(
         "map2_l": map2_l,
         "map1_r": map1_r,
         "map2_r": map2_r,
+        "H1": None,
+        "H2": None,
+    }
+
+
+def stereo_rectify_uncalibrated(
+    mtx_l: np.ndarray,
+    dist_l: np.ndarray,
+    mtx_r: np.ndarray,
+    dist_r: np.ndarray,
+    image_size: tuple[int, int],
+    R: np.ndarray,
+    T: np.ndarray,
+    F: np.ndarray,
+    imgpoints_l: list[np.ndarray],
+    imgpoints_r: list[np.ndarray],
+    alpha: float,
+    log: list[str],
+) -> dict:
+    pts_l = stack_image_points(imgpoints_l)
+    pts_r = stack_image_points(imgpoints_r)
+    ok, H1, H2 = cv2.stereoRectifyUncalibrated(pts_l, pts_r, F, image_size)
+    if not ok:
+        raise ValueError(
+            "stereoRectifyUncalibrated не удалось вычислить гомографии. "
+            "Проверьте качество углов и соответствие пар."
+        )
+
+    log.append("Ректификация: stereoRectifyUncalibrated")
+    log.append(f"  Соответствующих углов: {len(pts_l)}")
+    map1_l, map2_l = homography_to_remap_maps(H1, image_size)
+    map1_r, map2_r = homography_to_remap_maps(H2, image_size)
+
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    log.append(
+        "  Q, P1, P2 и ROI берутся из stereoRectify для совместимости с depth_map."
+    )
+    if alpha < 0.99:
+        log.append(
+            "  Предупреждение: alpha влияет только на Q/ROI, не на гомографии H1/H2."
+        )
+
+    R1, R2, P1, P2, Q, roi1, roi2 = cv2.stereoRectify(
+        mtx_l,
+        dist_l,
+        mtx_r,
+        dist_r,
+        image_size,
+        R,
+        T,
+        flags=cv2.CALIB_ZERO_DISPARITY,
+        alpha=alpha,
+    )
+    log.append(
+        f"  Область без чёрных полей (справочно): лев. {tuple(roi1)}, прав. {tuple(roi2)}"
+    )
+
+    return {
+        "rectification_method": "uncalibrated",
+        "R1": R1,
+        "R2": R2,
+        "P1": P1,
+        "P2": P2,
+        "Q": Q,
+        "alpha": alpha,
+        "roi1": roi1,
+        "roi2": roi2,
+        "map1_l": map1_l,
+        "map2_l": map2_l,
+        "map1_r": map1_r,
+        "map2_r": map2_r,
+        "H1": H1,
+        "H2": H2,
+    }
+
+
+def calibrate_pinhole(
+    objpoints: list[np.ndarray],
+    imgpoints_l: list[np.ndarray],
+    imgpoints_r: list[np.ndarray],
+    image_size: tuple[int, int],
+    alpha: float,
+    rectify_mode: str,
+    log: list[str],
+) -> dict:
+    log.append("Калибровка pinhole-модели...")
+
+    ret_l, mtx_l, dist_l, _, _ = cv2.calibrateCamera(
+        objpoints, imgpoints_l, image_size, None, None
+    )
+    ret_r, mtx_r, dist_r, _, _ = cv2.calibrateCamera(
+        objpoints, imgpoints_r, image_size, None, None
+    )
+    log.append(f"  RMS-ошибка левой камеры:  {ret_l:.4f}")
+    log.append(f"  RMS-ошибка правой камеры: {ret_r:.4f}")
+
+    stereo_flags = cv2.CALIB_FIX_INTRINSIC
+    stereo_criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-5)
+    (
+        ret_stereo,
+        mtx_l,
+        dist_l,
+        mtx_r,
+        dist_r,
+        R,
+        T,
+        _E,
+        F,
+    ) = cv2.stereoCalibrate(
+        objpoints,
+        imgpoints_l,
+        imgpoints_r,
+        mtx_l,
+        dist_l,
+        mtx_r,
+        dist_r,
+        image_size,
+        criteria=stereo_criteria,
+        flags=stereo_flags,
+    )
+    log.append(f"  RMS-ошибка стереокалибровки: {ret_stereo:.4f}")
+
+    if rectify_mode == "uncalibrated":
+        rect = stereo_rectify_uncalibrated(
+            mtx_l,
+            dist_l,
+            mtx_r,
+            dist_r,
+            image_size,
+            R,
+            T,
+            F,
+            imgpoints_l,
+            imgpoints_r,
+            alpha,
+            log,
+        )
+    else:
+        rect = stereo_rectify_calibrated(
+            mtx_l,
+            dist_l,
+            mtx_r,
+            dist_r,
+            image_size,
+            R,
+            T,
+            alpha,
+            log,
+        )
+
+    return {
+        "model": "pinhole",
+        "rms_l": ret_l,
+        "rms_r": ret_r,
+        "rms_stereo": ret_stereo,
+        "mtx_l": mtx_l,
+        "dist_l": dist_l,
+        "mtx_r": mtx_r,
+        "dist_r": dist_r,
+        "R": R,
+        "T": T,
+        "F": F,
+        **rect,
     }
 
 
@@ -284,6 +506,7 @@ def calibrate_stereo(
     output: str,
     debug_dir: str | None = None,
     alpha: float = 1.0,
+    rectify_mode: str = "calibrated",
 ) -> tuple[str, list[str]]:
     """Выполняет стереокалибровку и сохраняет результат в .npz."""
     if not left_paths or not right_paths:
@@ -298,10 +521,12 @@ def calibrate_stereo(
         left_paths, right_paths, cols, rows, square_size, debug_dir
     )
 
-    result = calibrate_pinhole(objpoints, imgpoints_l, imgpoints_r, image_size, alpha, log)
+    result = calibrate_pinhole(
+        objpoints, imgpoints_l, imgpoints_r, image_size, alpha, rectify_mode, log
+    )
 
-    geom_lines, focal_px, baseline_mm = describe_stereo_geometry(
-        result["mtx_l"], result["mtx_r"], result["T"], result["P1"]
+    geom_lines, metrics = describe_stereo_geometry(
+        result["mtx_l"], result["mtx_r"], result["T"], result["P1"], result["P2"]
     )
     log.extend(geom_lines)
 
@@ -312,7 +537,7 @@ def calibrate_stereo(
         rms_stereo=result["rms_stereo"],
         mtx_l=result["mtx_l"],
         mtx_r=result["mtx_r"],
-        baseline_mm=baseline_mm,
+        baseline_mm=metrics["baseline_mm"],
         map1_l=result["map1_l"],
         map2_l=result["map2_l"],
         map1_r=result["map1_r"],
@@ -329,6 +554,7 @@ def calibrate_stereo(
     np.savez(
         output,
         model=np.array([result["model"]]),
+        rectification_method=np.array([result["rectification_method"]]),
         image_size=np.array(image_size),
         mtx_l=result["mtx_l"],
         dist_l=result["dist_l"],
@@ -336,20 +562,29 @@ def calibrate_stereo(
         dist_r=result["dist_r"],
         R=result["R"],
         T=result["T"],
+        F=result["F"],
         R1=result["R1"],
         R2=result["R2"],
         P1=result["P1"],
         P2=result["P2"],
         Q=result["Q"],
         alpha=np.array([result["alpha"]]),
-        focal_px=np.array([focal_px]),
-        baseline_mm=np.array([baseline_mm]),
+        focal_px=np.array([metrics["focal_px"]]),
+        focal_l_px=np.array([metrics["focal_l_px"]]),
+        focal_r_px=np.array([metrics["focal_r_px"]]),
+        focal_rect_l_px=np.array([metrics["focal_rect_l_px"]]),
+        focal_rect_r_px=np.array([metrics["focal_rect_r_px"]]),
+        fy_l_px=np.array([metrics["fy_l_px"]]),
+        fy_r_px=np.array([metrics["fy_r_px"]]),
+        baseline_mm=np.array([metrics["baseline_mm"]]),
         roi1=np.array(result["roi1"]),
         roi2=np.array(result["roi2"]),
         map1_l=result["map1_l"],
         map2_l=result["map2_l"],
         map1_r=result["map1_r"],
         map2_r=result["map2_r"],
+        H1=result["H1"] if result["H1"] is not None else np.array([]),
+        H2=result["H2"] if result["H2"] is not None else np.array([]),
         quality_warnings=np.array(warnings, dtype=object),
     )
     out_path = str(Path(output).resolve())
@@ -373,6 +608,7 @@ def main() -> None:
             args.output,
             args.debug_dir,
             args.alpha,
+            args.rectify,
         )
     except ValueError as exc:
         sys.exit(f"Ошибка: {exc}")
