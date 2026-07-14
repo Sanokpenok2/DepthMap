@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import dataclass
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -141,14 +143,57 @@ def parse_args() -> argparse.Namespace:
         default=1200,
         help="Макс. сторона окна предпросмотра (пикс.). Большие фото ужимаются под экран.",
     )
+    p.add_argument(
+        "--threads",
+        type=int,
+        default=0,
+        help="Число потоков OpenCV для SGBM/remap (0 = все ядра, 1 = без параллелизма).",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=2,
+        help="Потоки для параллельной загрузки и ректификации L/R.",
+    )
     return p.parse_args()
+
+
+def configure_opencv_threads(n: int) -> int:
+    """Включает внутренний параллелизм OpenCV. Возвращает фактическое число потоков.
+
+    На части сборок Windows `setNumThreads(0)` ошибочно даёт 1 поток,
+    поэтому 0 трактуем как os.cpu_count().
+    """
+    import os
+
+    if n <= 0:
+        n = os.cpu_count() or 4
+    cv2.setNumThreads(int(n))
+    try:
+        cv2.ocl.setUseOpenCL(False)
+    except Exception:
+        pass
+    return int(cv2.getNumThreads())
 
 
 def load_gray(path: str) -> np.ndarray:
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if img is None:
-        sys.exit(f"Ошибка: не удалось прочитать изображение '{path}'.")
+        raise ValueError(f"Не удалось прочитать изображение '{path}'.")
     return img
+
+
+def load_gray_pair(
+    left_path: str,
+    right_path: str,
+    pool: ThreadPoolExecutor | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Параллельная загрузка левого и правого изображений."""
+    if pool is None:
+        return load_gray(left_path), load_gray(right_path)
+    fut_l = pool.submit(load_gray, left_path)
+    fut_r = pool.submit(load_gray, right_path)
+    return fut_l.result(), fut_r.result()
 
 
 def build_sgbm(min_disp: int, num_disp: int, block_size: int) -> cv2.StereoSGBM:
@@ -276,12 +321,45 @@ def calibration_quality_warnings(calib: dict) -> list[str]:
 
 
 def rectify_pair(
-    left: np.ndarray, right: np.ndarray, calib: dict
+    left: np.ndarray,
+    right: np.ndarray,
+    calib: dict,
+    pool: ThreadPoolExecutor | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Применяет карты ремаппинга из калибровки для выравнивания стереопары."""
-    rect_l = cv2.remap(left, calib["map1_l"], calib["map2_l"], cv2.INTER_LINEAR)
-    rect_r = cv2.remap(right, calib["map1_r"], calib["map2_r"], cv2.INTER_LINEAR)
-    return rect_l, rect_r
+    if pool is None:
+        rect_l = cv2.remap(left, calib["map1_l"], calib["map2_l"], cv2.INTER_LINEAR)
+        rect_r = cv2.remap(right, calib["map1_r"], calib["map2_r"], cv2.INTER_LINEAR)
+        return rect_l, rect_r
+
+    fut_l = pool.submit(
+        cv2.remap, left, calib["map1_l"], calib["map2_l"], cv2.INTER_LINEAR
+    )
+    fut_r = pool.submit(
+        cv2.remap, right, calib["map1_r"], calib["map2_r"], cv2.INTER_LINEAR
+    )
+    return fut_l.result(), fut_r.result()
+
+
+def format_timings(timings: dict[str, float]) -> list[str]:
+    """Строки журнала с разбивкой времени по этапам."""
+    order = [
+        ("load", "загрузка"),
+        ("rectify", "ректификация"),
+        ("sgbm", "сопоставление"),
+        ("wls", "WLS"),
+        ("visualize", "визуализация"),
+        ("total", "всего"),
+    ]
+    lines = ["Время выполнения:"]
+    for key, title in order:
+        if key in timings:
+            lines.append(f"  {title}: {timings[key] * 1000:.1f} ms ({timings[key]:.3f} s)")
+    if "opencv_threads" in timings:
+        lines.append(f"  потоки OpenCV: {int(timings['opencv_threads'])}")
+    if "workers" in timings:
+        lines.append(f"  workers L/R: {int(timings['workers'])}")
+    return lines
 
 
 def save_point_cloud(
@@ -352,6 +430,53 @@ def measure_distance(
     return None, disp
 
 
+def measure_roi_distance(
+    disp_float: np.ndarray,
+    roi: tuple[int, int, int, int],
+    Q: np.ndarray | None = None,
+    focal: float | None = None,
+    baseline: float | None = None,
+    *,
+    min_valid_fraction: float = 0.05,
+) -> tuple[float | None, float | None]:
+    """Расстояние по медиане диспаритета внутри ROI (x, y, w, h).
+
+    Возвращает (расстояние, медианный диспаритет) или (None, None), если
+    валидных пикселей слишком мало.
+    """
+    x, y, rw, rh = (int(v) for v in roi)
+    h, w = disp_float.shape
+    x0 = max(0, x)
+    y0 = max(0, y)
+    x1 = min(w, x + max(rw, 1))
+    y1 = min(h, y + max(rh, 1))
+    if x1 <= x0 or y1 <= y0:
+        return None, None
+
+    patch = disp_float[y0:y1, x0:x1]
+    valid = patch[patch > 0]
+    if valid.size < max(1, int(patch.size * min_valid_fraction)):
+        return None, None
+
+    disp = float(np.median(valid))
+    cx = (x0 + x1) // 2
+    cy = (y0 + y1) // 2
+
+    if Q is not None:
+        vec = np.array([[cx], [cy], [disp], [1.0]], dtype=np.float64)
+        xyzw = Q @ vec
+        wv = xyzw[3, 0]
+        if abs(wv) < 1e-9:
+            return None, disp
+        z = float(xyzw[2, 0] / wv)
+        if not np.isfinite(z) or z <= 0:
+            return None, disp
+        return z, disp
+    if focal is not None and baseline is not None and disp > 0:
+        return float(focal * baseline / disp), disp
+    return None, disp
+
+
 def display_scale(shape: tuple[int, int], max_side: int) -> float:
     """Коэффициент масштаба, чтобы большая сторона изображения влезла в max_side."""
     h, w = shape[:2]
@@ -386,6 +511,7 @@ class StereoProcessResult:
     disparity_float: np.ndarray
     rectified: bool
     log: list[str]
+    timings: dict[str, float] = field(default_factory=dict)
 
 
 def compute_stereo_disparity(
@@ -401,48 +527,78 @@ def compute_stereo_disparity(
     wls_sigma: float = 1.5,
     colormap: str = "JET",
     calib_path: str | None = None,
+    threads: int = 0,
+    workers: int = 2,
 ) -> StereoProcessResult:
-    """Строит карту диспаритета по паре изображений."""
+    """Строит карту диспаритета по паре изображений (с параллелизмом и таймингами)."""
     log: list[str] = []
+    timings: dict[str, float] = {}
+    t_all = time.perf_counter()
 
     if num_disparities % 16 != 0:
         raise ValueError("--num-disparities должен быть кратен 16.")
     if block_size % 2 == 0:
         raise ValueError("--block-size должен быть нечётным.")
+    if workers < 1:
+        raise ValueError("--workers должен быть >= 1.")
 
-    left = load_gray(left_path)
-    right = load_gray(right_path)
-    if left.shape != right.shape:
-        raise ValueError(
-            f"Размеры изображений различаются ({left.shape} и {right.shape}). "
-            "Стереопара должна быть выровнена или используйте калибровку."
-        )
+    opencv_threads = configure_opencv_threads(threads)
+    timings["opencv_threads"] = float(opencv_threads)
+    timings["workers"] = float(workers)
+    log.append(
+        f"Параллелизм: OpenCV threads={opencv_threads}, L/R workers={workers}."
+    )
 
-    rectified = False
-    if calib_path:
-        log.append(f"Загрузка калибровки и ректификация: {calib_path}")
-        calib = load_calibration(calib_path)
-        warnings = calibration_quality_warnings(calib)
-        if warnings:
-            log.extend(format_quality_report(warnings))
-        left, right = rectify_pair(left, right, calib)
-        rectified = True
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        t0 = time.perf_counter()
+        left, right = load_gray_pair(left_path, right_path, pool)
+        timings["load"] = time.perf_counter() - t0
 
-    if method == "sgbm":
-        matcher = build_sgbm(min_disparity, num_disparities, block_size)
-    else:
-        matcher = build_bm(num_disparities, block_size)
+        if left.shape != right.shape:
+            raise ValueError(
+                f"Размеры изображений различаются ({left.shape} и {right.shape}). "
+                "Стереопара должна быть выровнена или используйте калибровку."
+            )
 
-    log.append(f"Вычисление диспаритета методом {method.upper()}...")
-    disp = matcher.compute(left, right)
+        rectified = False
+        if calib_path:
+            log.append(f"Загрузка калибровки и ректификация: {calib_path}")
+            calib = load_calibration(calib_path)
+            warnings = calibration_quality_warnings(calib)
+            if warnings:
+                log.extend(format_quality_report(warnings))
+            t0 = time.perf_counter()
+            left, right = rectify_pair(left, right, calib, pool)
+            timings["rectify"] = time.perf_counter() - t0
+            rectified = True
 
-    if wls:
-        log.append("Применение WLS-фильтра...")
-        disp = apply_wls(matcher, disp, left, right, wls_lambda, wls_sigma)
+        if method == "sgbm":
+            matcher = build_sgbm(min_disparity, num_disparities, block_size)
+        else:
+            matcher = build_bm(num_disparities, block_size)
 
-    disp_vis = normalize_disparity(disp, min_disparity, num_disparities)
-    disp_color = cv2.applyColorMap(disp_vis, get_colormap(colormap))
-    disp_float = disp.astype(np.float32) / 16.0
+        log.append(f"Вычисление диспаритета методом {method.upper()}...")
+        t0 = time.perf_counter()
+        disp = matcher.compute(left, right)
+        timings["sgbm"] = time.perf_counter() - t0
+
+        if wls:
+            log.append("Применение WLS-фильтра...")
+            t0 = time.perf_counter()
+            disp = apply_wls(matcher, disp, left, right, wls_lambda, wls_sigma)
+            timings["wls"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        disp_vis = normalize_disparity(disp, min_disparity, num_disparities)
+        disp_color = cv2.applyColorMap(disp_vis, get_colormap(colormap))
+        disp_float = disp.astype(np.float32) / 16.0
+        timings["visualize"] = time.perf_counter() - t0
+    finally:
+        pool.shutdown(wait=False)
+
+    timings["total"] = time.perf_counter() - t_all
+    log.extend(format_timings(timings))
 
     valid = disp_float[disp_float > 0]
     if valid.size:
@@ -460,6 +616,7 @@ def compute_stereo_disparity(
         disparity_float=disp_float,
         rectified=rectified,
         log=log,
+        timings=timings,
     )
 
 
@@ -470,54 +627,47 @@ def main() -> None:
         sys.exit("Ошибка: --num-disparities должен быть кратен 16.")
     if args.block_size % 2 == 0:
         sys.exit("Ошибка: --block-size должен быть нечётным.")
+    if args.workers < 1:
+        sys.exit("Ошибка: --workers должен быть >= 1.")
 
     if (args.depth or args.point_cloud) and not args.calib:
         sys.exit("Ошибка: --depth и --point-cloud требуют указания --calib.")
 
-    left = load_gray(args.left)
-    right = load_gray(args.right)
-    if left.shape != right.shape:
-        sys.exit(
-            f"Ошибка: размеры изображений различаются "
-            f"({left.shape} и {right.shape}). Стереопара должна быть выровнена."
+    try:
+        result = compute_stereo_disparity(
+            args.left,
+            args.right,
+            method=args.method,
+            num_disparities=args.num_disparities,
+            block_size=args.block_size,
+            min_disparity=args.min_disparity,
+            wls=args.wls,
+            wls_lambda=args.wls_lambda,
+            wls_sigma=args.wls_sigma,
+            colormap=args.colormap,
+            calib_path=args.calib,
+            threads=args.threads,
+            workers=args.workers,
         )
+    except ValueError as exc:
+        sys.exit(f"Ошибка: {exc}")
 
-    calib = None
-    if args.calib:
-        print(f"Загрузка калибровки и ректификация: {args.calib}")
-        calib = load_calibration(args.calib)
-        warnings = calibration_quality_warnings(calib)
-        for line in format_quality_report(warnings):
-            print(line)
-        left, right = rectify_pair(left, right, calib)
+    for line in result.log:
+        print(line)
 
-    if args.method == "sgbm":
-        matcher = build_sgbm(args.min_disparity, args.num_disparities, args.block_size)
-    else:
-        matcher = build_bm(args.num_disparities, args.block_size)
-
-    print(f"Вычисление диспаритета методом {args.method.upper()}...")
-    disp = matcher.compute(left, right)
-
-    if args.wls:
-        print("Применение WLS-фильтра...")
-        disp = apply_wls(
-            matcher, disp, left, right, args.wls_lambda, args.wls_sigma
-        )
-
-    disp_vis = normalize_disparity(disp, args.min_disparity, args.num_disparities)
-    disp_color = cv2.applyColorMap(disp_vis, get_colormap(args.colormap))
+    left = result.left_gray
+    disp_color = result.disparity_color
+    disp_float = result.disparity_float
 
     out_path = Path(args.output)
     cv2.imwrite(str(out_path), disp_color)
     print(f"Карта глубины сохранена: {out_path.resolve()}")
 
-    disp_float = disp.astype(np.float32) / 16.0
-
     if args.save_raw:
         np.save(args.save_raw, disp_float)
         print(f"Сырая карта диспаритетов сохранена: {Path(args.save_raw).resolve()}")
 
+    calib = load_calibration(args.calib) if args.calib else None
     if calib is not None and (args.depth or args.point_cloud):
         points_3d = cv2.reprojectImageTo3D(disp_float, calib["Q"])
         if args.depth:
