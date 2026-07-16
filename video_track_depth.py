@@ -1,9 +1,10 @@
 """
-Трекинг объекта по двум видео (левая и правая камера) с измерением расстояния.
+Трекинг объекта по одному SBS-видео (side-by-side) с измерением расстояния.
 
-Пользователь выделяет объект на первом кадре левого видео. Дальше объект
-сопровождается трекером (CSRT/KCF), а расстояние считается по медиане
-диспаритета внутри ROI на стереопаре.
+Вход — один видеофайл, где кадр разрезан пополам: левая половина = левая
+камера, правая половина = правая камера. Пользователь выделяет объект на
+первом кадре (левая половина). Дальше объект сопровождается трекером
+(CSRT/KCF), а расстояние считается по медиане диспаритета внутри ROI.
 
 Ускорение на CPU:
   - cv2.setNumThreads — внутренний параллелизм OpenCV (SGBM, remap);
@@ -12,7 +13,7 @@
 
 Пример:
     python video_track_depth.py ^
-        --left-video left.mp4 --right-video right.mp4 ^
+        --video stereo_sbs.mp4 ^
         --calib stereo_calib.npz --threads 0 --async-sgbm
 
 Управление:
@@ -43,20 +44,29 @@ from depth_map import (
     load_calibration,
     measure_roi_distance,
 )
+from object_tracker import ObjectTracker
 from calib_quality import format_quality_report
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Трекинг объекта по двум видео со стерео-расстоянием.",
+        description="Трекинг объекта по SBS-видео со стерео-расстоянием.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--left-video", required=True, help="Видео с левой камеры.")
-    p.add_argument("--right-video", required=True, help="Видео с правой камеры.")
+    p.add_argument(
+        "--video",
+        required=True,
+        help="SBS-видео: левая половина кадра — левая камера, правая — правая.",
+    )
+    p.add_argument(
+        "--swap-lr",
+        action="store_true",
+        help="Поменять половины местами (если левая камера справа).",
+    )
     p.add_argument(
         "--calib",
-        required=True,
-        help="Файл стереокалибровки (.npz) — нужен для ректификации и мм.",
+        default=None,
+        help="Файл стереокалибровки (.npz). Обязателен, кроме режима --track-only.",
     )
     p.add_argument(
         "--method",
@@ -75,6 +85,117 @@ def parse_args() -> argparse.Namespace:
         choices=["csrt", "kcf", "mosse"],
         default="csrt",
         help="Тип OpenCV-трекера.",
+    )
+    p.add_argument(
+        "--roi-smooth",
+        type=float,
+        default=0.6,
+        help="Сглаживание рамки трекинга [0..1): 0 = без сглаживания, ближе к 1 = плавнее.",
+    )
+    p.add_argument(
+        "--lock-size",
+        action="store_true",
+        help="Фиксировать размер рамки трекинга (двигается только центр).",
+    )
+    p.add_argument(
+        "--keep-aspect",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Масштабировать рамку равномерно, сохраняя исходные пропорции объекта.",
+    )
+    p.add_argument(
+        "--max-scale-step",
+        type=float,
+        default=0.05,
+        help="Макс. относительное изменение масштаба рамки за кадр (0 = без лимита).",
+    )
+    p.add_argument(
+        "--verify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Отклонять дрейф рамки на другой объект/фон (сходство с эталоном + прыжок).",
+    )
+    p.add_argument(
+        "--verify-threshold",
+        type=float,
+        default=0.4,
+        help="Мин. сходство с эталоном [0..1], ниже — считаем кадр плохим.",
+    )
+    p.add_argument(
+        "--max-jump",
+        type=float,
+        default=0.9,
+        help="Макс. прыжок центра за кадр в долях диагонали ROI (0 = без лимита).",
+    )
+    p.add_argument(
+        "--verify-rel",
+        type=float,
+        default=0.75,
+        help="Отклонять кадр, если score < EMA*verify-rel (дрейф на соседний объект).",
+    )
+    p.add_argument(
+        "--min-iou",
+        type=float,
+        default=0.4,
+        help="Мин. IoU с предыдущей рамкой (отсекает перескок на пересекающийся объект).",
+    )
+    p.add_argument(
+        "--lost-patience",
+        type=int,
+        default=2,
+        help="Сколько подряд плохих кадров нужно, чтобы объявить потерю цели.",
+    )
+    p.add_argument(
+        "--reacquire",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Повторно захватывать объект после потери по эталону.",
+    )
+    p.add_argument(
+        "--reacquire-threshold",
+        type=float,
+        default=0.5,
+        help="Порог совпадения для повторного захвата [0..1].",
+    )
+    p.add_argument(
+        "--reacquire-radius",
+        type=float,
+        default=3.0,
+        help="Окно поиска при перезахвате (доли max(w,h) ROI вокруг последней позиции).",
+    )
+    p.add_argument(
+        "--reacquire-global",
+        action="store_true",
+        help="Искать объект по всему кадру при перезахвате (может хватать похожий фон).",
+    )
+    p.add_argument(
+        "--reacquire-interval",
+        type=int,
+        default=5,
+        help="Искать объект при потере каждые N кадров (1 = каждый кадр, тяжелее).",
+    )
+    p.add_argument(
+        "--reacquire-scale-min",
+        type=float,
+        default=0.35,
+        help="Мин. масштаб эталона при перезахвате (меньше = искать более далёкий/мелкий объект).",
+    )
+    p.add_argument(
+        "--reacquire-scale-max",
+        type=float,
+        default=1.4,
+        help="Макс. масштаб эталона при перезахвате.",
+    )
+    p.add_argument(
+        "--click-tolerance",
+        type=int,
+        default=16,
+        help="Допуск цвета при авто-выделении объекта кликом (клавиша C).",
+    )
+    p.add_argument(
+        "--no-grabcut",
+        action="store_true",
+        help="Не уточнять границы объекта GrabCut'ом при выборе кликом.",
     )
     p.add_argument(
         "--sgbm-interval",
@@ -107,6 +228,11 @@ def parse_args() -> argparse.Namespace:
         help="Считать диспаритет асинхронно в фоне (трекинг не блокируется).",
     )
     p.add_argument(
+        "--track-only",
+        action="store_true",
+        help="Только захват и трекинг объекта, без SGBM и измерения расстояния.",
+    )
+    p.add_argument(
         "--max-display",
         type=int,
         default=1200,
@@ -129,34 +255,6 @@ def parse_args() -> argparse.Namespace:
         help="Ограничить число кадров (0 = до конца).",
     )
     return p.parse_args()
-
-
-def create_tracker(kind: str):
-    """Создаёт трекер с учётом разных сборок OpenCV."""
-    factories = {
-        "csrt": [
-            ("TrackerCSRT_create", cv2),
-            ("TrackerCSRT_create", getattr(cv2, "legacy", None)),
-        ],
-        "kcf": [
-            ("TrackerKCF_create", cv2),
-            ("TrackerKCF_create", getattr(cv2, "legacy", None)),
-        ],
-        "mosse": [
-            ("TrackerMOSSE_create", cv2),
-            ("TrackerMOSSE_create", getattr(cv2, "legacy", None)),
-        ],
-    }
-    for name, mod in factories[kind]:
-        if mod is None:
-            continue
-        factory = getattr(mod, name, None)
-        if factory is not None:
-            return factory()
-    raise RuntimeError(
-        f"Трекер '{kind}' недоступен в этой сборке OpenCV. "
-        "Установите opencv-contrib-python."
-    )
 
 
 def open_video(path: str) -> cv2.VideoCapture:
@@ -197,9 +295,13 @@ def prepare_side(
 def prepare_pair(
     frame_l: np.ndarray,
     frame_r: np.ndarray,
-    calib: dict,
+    calib: dict | None,
     pool: ThreadPoolExecutor | None,
 ) -> tuple[np.ndarray, np.ndarray]:
+    # Без калибровки ректификация невозможна: только gray (для трекинга этого хватает).
+    if calib is None:
+        return to_gray(frame_l), to_gray(frame_r)
+
     calib_size = None
     if "image_size" in calib:
         calib_size = (int(calib["image_size"][0]), int(calib["image_size"][1]))
@@ -218,57 +320,28 @@ def prepare_pair(
     return fut_l.result(), fut_r.result()
 
 
-def read_pair(
-    cap_l: cv2.VideoCapture,
-    cap_r: cv2.VideoCapture,
-    pool: ThreadPoolExecutor | None,
+def split_sbs(
+    frame: np.ndarray, swap_lr: bool = False
+) -> tuple[np.ndarray, np.ndarray]:
+    """Разрезает SBS-кадр пополам по ширине на левую и правую камеры."""
+    w = frame.shape[1]
+    half = w // 2
+    left = frame[:, :half]
+    right = frame[:, half : half * 2]
+    if swap_lr:
+        left, right = right, left
+    return np.ascontiguousarray(left), np.ascontiguousarray(right)
+
+
+def read_sbs(
+    cap: cv2.VideoCapture, swap_lr: bool = False
 ) -> tuple[bool, np.ndarray | None, np.ndarray | None]:
-    """Параллельное чтение двух VideoCapture (разные объекты — безопасно)."""
-    if pool is None:
-        ok_l, frame_l = cap_l.read()
-        ok_r, frame_r = cap_r.read()
-        if not ok_l or not ok_r:
-            return False, None, None
-        return True, frame_l, frame_r
-
-    fut_l = pool.submit(cap_l.read)
-    fut_r = pool.submit(cap_r.read)
-    ok_l, frame_l = fut_l.result()
-    ok_r, frame_r = fut_r.result()
-    if not ok_l or not ok_r:
+    """Читает один SBS-кадр и делит его на левую/правую половины."""
+    ok, frame = cap.read()
+    if not ok or frame is None:
         return False, None, None
-    return True, frame_l, frame_r
-
-
-def clamp_roi(
-    roi: tuple[float, float, float, float], width: int, height: int
-) -> tuple[int, int, int, int]:
-    x, y, rw, rh = roi
-    x = int(round(x))
-    y = int(round(y))
-    rw = int(round(rw))
-    rh = int(round(rh))
-    x = max(0, min(x, width - 1))
-    y = max(0, min(y, height - 1))
-    rw = max(1, min(rw, width - x))
-    rh = max(1, min(rh, height - y))
-    return x, y, rw, rh
-
-
-def select_object_roi(frame_bgr: np.ndarray, max_display: int) -> tuple[int, int, int, int] | None:
-    scale = display_scale(frame_bgr.shape, max_display)
-    preview = fit_for_display(frame_bgr, scale)
-    window = "Select object (Enter/Space = OK, c = cancel)"
-    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    roi = cv2.selectROI(window, preview, showCrosshair=True, fromCenter=False)
-    cv2.destroyWindow(window)
-    x, y, rw, rh = roi
-    if rw <= 0 or rh <= 0:
-        return None
-    if scale < 1.0:
-        inv = 1.0 / scale
-        x, y, rw, rh = int(x * inv), int(y * inv), int(rw * inv), int(rh * inv)
-    return clamp_roi((x, y, rw, rh), frame_bgr.shape[1], frame_bgr.shape[0])
+    left, right = split_sbs(frame, swap_lr)
+    return True, left, right
 
 
 def compute_disparity(
@@ -316,8 +389,10 @@ def draw_overlay(
         lines.append(f"disp {disparity:.1f} px")
     if sgbm_busy:
         lines.append("SGBM...")
-    if not tracking_ok:
-        lines.append("TRACK LOST — press R")
+    if roi is None:
+        lines.append("press R (box) or C (click) to select")
+    elif not tracking_ok:
+        lines.append("TRACK LOST — searching / press R")
 
     y0 = 28
     for i, text in enumerate(lines):
@@ -381,6 +456,10 @@ def main() -> None:
         sys.exit("Ошибка: --sgbm-interval должен быть >= 1.")
     if args.workers < 1:
         sys.exit("Ошибка: --workers должен быть >= 1.")
+    if not 0.0 <= args.roi_smooth < 1.0:
+        sys.exit("Ошибка: --roi-smooth должен быть в диапазоне [0.0, 1.0).")
+    if not 0.0 <= args.reacquire_threshold <= 1.0:
+        sys.exit("Ошибка: --reacquire-threshold должен быть в диапазоне [0.0, 1.0].")
 
     opencv_threads = configure_threads(args.threads)
     print(
@@ -389,55 +468,77 @@ def main() -> None:
         f"workers={args.workers}, async_sgbm={args.async_sgbm}"
     )
 
-    print(f"Загрузка калибровки: {args.calib}")
-    calib = load_calibration(args.calib)
-    for line in format_quality_report(calibration_quality_warnings(calib)):
-        print(line)
-    Q = calib["Q"]
+    track_only = args.track_only
+    Q = None
+    matcher = None
+    calib = None
+    if not track_only and not args.calib:
+        sys.exit("Ошибка: --calib обязателен (кроме режима --track-only).")
 
-    if args.method == "sgbm":
-        matcher = build_sgbm(args.min_disparity, args.num_disparities, args.block_size)
-    else:
-        matcher = build_bm(args.num_disparities, args.block_size)
+    if track_only:
+        print("Режим --track-only: только захват и трекинг (без SGBM и расстояния).")
+
+    if args.calib:
+        print(f"Загрузка калибровки: {args.calib}")
+        calib = load_calibration(args.calib)
+        for line in format_quality_report(calibration_quality_warnings(calib)):
+            print(line)
+    elif track_only:
+        print("Калибровка не задана — трекинг по «сырым» кадрам без ректификации.")
+
+    if not track_only:
+        Q = calib["Q"]
+        if args.method == "sgbm":
+            matcher = build_sgbm(
+                args.min_disparity, args.num_disparities, args.block_size
+            )
+        else:
+            matcher = build_bm(args.num_disparities, args.block_size)
 
     prep_pool = ThreadPoolExecutor(max_workers=args.workers)
     # Отдельный пул на 1 поток: matcher.compute не запускаем параллельно самому себе.
-    sgbm_pool = ThreadPoolExecutor(max_workers=1) if args.async_sgbm else None
+    sgbm_pool = (
+        ThreadPoolExecutor(max_workers=1) if (args.async_sgbm and not track_only) else None
+    )
     sgbm_future: Future | None = None
 
-    cap_l = open_video(args.left_video)
-    cap_r = open_video(args.right_video)
+    cap = open_video(args.video)
 
-    ok, frame_l, frame_r = read_pair(cap_l, cap_r, prep_pool)
+    ok, frame_l, frame_r = read_sbs(cap, args.swap_lr)
     if not ok or frame_l is None or frame_r is None:
-        sys.exit("Ошибка: не удалось прочитать первый кадр одного из видео.")
+        sys.exit("Ошибка: не удалось прочитать первый кадр SBS-видео.")
 
     rect_l, rect_r = prepare_pair(frame_l, frame_r, calib, prep_pool)
     rect_l_bgr = cv2.cvtColor(rect_l, cv2.COLOR_GRAY2BGR)
 
-    print("Выделите объект мышью на левом кадре и нажмите Enter/Space.")
-    roi = select_object_roi(rect_l_bgr, args.max_display)
-    if roi is None:
-        prep_pool.shutdown(wait=False)
-        if sgbm_pool is not None:
-            sgbm_pool.shutdown(wait=False)
-        sys.exit("ROI не выбран — выход.")
-
-    tracker = create_tracker(args.tracker)
-    tracker.init(rect_l_bgr, roi)
-    tracking_ok = True
-
-    disp_float = compute_disparity(
-        rect_l,
-        rect_r,
-        matcher,
-        wls=args.wls,
-        wls_lambda=args.wls_lambda,
-        wls_sigma=args.wls_sigma,
+    # ROI можно выбрать в любой момент клавишей R — на старте объекта нет.
+    tracker = ObjectTracker(
+        kind=args.tracker,
+        smooth=args.roi_smooth,
+        lock_size=args.lock_size,
+        keep_aspect=args.keep_aspect,
+        max_scale_step=args.max_scale_step,
+        verify=args.verify,
+        verify_threshold=args.verify_threshold,
+        max_jump=args.max_jump,
+        lost_patience=args.lost_patience,
+        verify_rel=args.verify_rel,
+        min_iou=args.min_iou,
+        reacquire=args.reacquire,
+        reacquire_threshold=args.reacquire_threshold,
+        reacquire_radius=args.reacquire_radius,
+        reacquire_global=args.reacquire_global,
+        reacquire_interval=args.reacquire_interval,
+        reacquire_scale_min=args.reacquire_scale_min,
+        reacquire_scale_max=args.reacquire_scale_max,
     )
-    dist, disp_val = measure_roi_distance(disp_float, roi, Q=Q)
+    roi: tuple[int, int, int, int] | None = None
+    tracking_ok = False
+
+    disp_float: np.ndarray | None = None
+    dist = disp_val = None
     history: deque[float] = deque()
-    dist_s = smoothed_value(history, dist, args.smooth)
+    dist_s = None
 
     writer = None
     if args.output:
@@ -445,29 +546,32 @@ def main() -> None:
         writer = cv2.VideoWriter(
             args.output,
             fourcc,
-            max(cap_l.get(cv2.CAP_PROP_FPS), 1.0),
+            max(cap.get(cv2.CAP_PROP_FPS), 1.0),
             (rect_l_bgr.shape[1], rect_l_bgr.shape[0]),
         )
 
-    window = "Track + distance (Space=pause, R=reselect, Q=quit)"
+    window = "Track + distance (Space=pause, R=box, C=click, Q=quit)"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     paused = False
     frame_idx = 0
     t_prev = time.perf_counter()
     fps = 0.0
 
-    print(
-        "Трекинг запущен. "
-        f"SGBM каждые {args.sgbm_interval} кадр(ов), трекер={args.tracker}."
-    )
+    print("R — выбрать объект рамкой, C — кликом (авто-границы). В любой момент.")
+    if track_only:
+        print(f"Готово к трекингу (только трекинг, трекер={args.tracker}).")
+    else:
+        print(
+            f"Готово. SGBM каждые {args.sgbm_interval} кадр(ов), трекер={args.tracker}."
+        )
 
     try:
         while True:
             if not paused:
                 if frame_idx > 0:
-                    ok, frame_l, frame_r = read_pair(cap_l, cap_r, prep_pool)
+                    ok, frame_l, frame_r = read_sbs(cap, args.swap_lr)
                     if not ok or frame_l is None or frame_r is None:
-                        print("Конец одного из видео.")
+                        print("Конец видео.")
                         break
                     if args.max_frames > 0 and frame_idx >= args.max_frames:
                         print("Достигнут --max-frames.")
@@ -476,45 +580,49 @@ def main() -> None:
                     rect_l, rect_r = prepare_pair(frame_l, frame_r, calib, prep_pool)
                     rect_l_bgr = cv2.cvtColor(rect_l, cv2.COLOR_GRAY2BGR)
 
-                    tracking_ok, box = tracker.update(rect_l_bgr)
-                    if tracking_ok:
-                        roi = clamp_roi(box, rect_l.shape[1], rect_l.shape[0])
+                    if tracker.initialized:
+                        tracking_ok, roi = tracker.update(rect_l_bgr)
 
-                    # Забираем готовый асинхронный диспаритет, если есть.
-                    if sgbm_future is not None and sgbm_future.done():
-                        disp_float = sgbm_future.result()
-                        sgbm_future = None
+                    # SGBM только при живом треке — иначе при LOST зря жрёт FPS.
+                    if not track_only and tracker.initialized and tracking_ok:
+                        # Забираем готовый асинхронный диспаритет, если есть.
+                        if sgbm_future is not None and sgbm_future.done():
+                            disp_float = sgbm_future.result()
+                            sgbm_future = None
 
-                    need_sgbm = frame_idx % args.sgbm_interval == 0
-                    if need_sgbm:
-                        if sgbm_pool is not None:
-                            # Не ставим новый SGBM, пока предыдущий ещё считается.
-                            if sgbm_future is None or sgbm_future.done():
-                                if sgbm_future is not None and sgbm_future.done():
-                                    disp_float = sgbm_future.result()
-                                sgbm_future = sgbm_pool.submit(
-                                    compute_disparity,
-                                    rect_l.copy(),
-                                    rect_r.copy(),
+                        need_sgbm = frame_idx % args.sgbm_interval == 0
+                        if need_sgbm:
+                            if sgbm_pool is not None:
+                                # Не ставим новый SGBM, пока предыдущий считается.
+                                if sgbm_future is None or sgbm_future.done():
+                                    if sgbm_future is not None and sgbm_future.done():
+                                        disp_float = sgbm_future.result()
+                                    sgbm_future = sgbm_pool.submit(
+                                        compute_disparity,
+                                        rect_l.copy(),
+                                        rect_r.copy(),
+                                        matcher,
+                                        wls=args.wls,
+                                        wls_lambda=args.wls_lambda,
+                                        wls_sigma=args.wls_sigma,
+                                    )
+                            else:
+                                disp_float = compute_disparity(
+                                    rect_l,
+                                    rect_r,
                                     matcher,
                                     wls=args.wls,
                                     wls_lambda=args.wls_lambda,
                                     wls_sigma=args.wls_sigma,
                                 )
-                        else:
-                            disp_float = compute_disparity(
-                                rect_l,
-                                rect_r,
-                                matcher,
-                                wls=args.wls,
-                                wls_lambda=args.wls_lambda,
-                                wls_sigma=args.wls_sigma,
-                            )
 
-                    if tracking_ok and roi is not None:
-                        dist, disp_val = measure_roi_distance(disp_float, roi, Q=Q)
-                        dist_s = smoothed_value(history, dist, args.smooth)
-                    else:
+                        if roi is not None and disp_float is not None:
+                            dist, disp_val = measure_roi_distance(disp_float, roi, Q=Q)
+                            dist_s = smoothed_value(history, dist, args.smooth)
+                        else:
+                            dist_s = smoothed_value(history, None, args.smooth)
+                            disp_val = None
+                    elif not track_only and tracker.initialized and not tracking_ok:
                         dist_s = smoothed_value(history, None, args.smooth)
                         disp_val = None
 
@@ -547,28 +655,40 @@ def main() -> None:
                 break
             if key == ord(" "):
                 paused = not paused
-            if key in (ord("r"), ord("R")):
-                print("Повторный выбор объекта...")
+            if key in (ord("r"), ord("R"), ord("c"), ord("C")):
+                by_click = key in (ord("c"), ord("C"))
+                print(
+                    "Выбор объекта "
+                    + ("кликом" if by_click else "рамкой")
+                    + " на текущем кадре..."
+                )
                 if sgbm_future is not None:
                     sgbm_future.result()
                     sgbm_future = None
-                new_roi = select_object_roi(rect_l_bgr, args.max_display)
+                if by_click:
+                    new_roi = tracker.init_by_click(
+                        rect_l_bgr,
+                        args.max_display,
+                        tolerance=args.click_tolerance,
+                        grabcut_refine=not args.no_grabcut,
+                    )
+                else:
+                    new_roi = tracker.init_interactive(rect_l_bgr, args.max_display)
                 if new_roi is not None:
                     roi = new_roi
-                    tracker = create_tracker(args.tracker)
-                    tracker.init(rect_l_bgr, roi)
                     tracking_ok = True
                     history.clear()
-                    disp_float = compute_disparity(
-                        rect_l,
-                        rect_r,
-                        matcher,
-                        wls=args.wls,
-                        wls_lambda=args.wls_lambda,
-                        wls_sigma=args.wls_sigma,
-                    )
-                    dist, disp_val = measure_roi_distance(disp_float, roi, Q=Q)
-                    dist_s = smoothed_value(history, dist, args.smooth)
+                    if not track_only:
+                        disp_float = compute_disparity(
+                            rect_l,
+                            rect_r,
+                            matcher,
+                            wls=args.wls,
+                            wls_lambda=args.wls_lambda,
+                            wls_sigma=args.wls_sigma,
+                        )
+                        dist, disp_val = measure_roi_distance(disp_float, roi, Q=Q)
+                        dist_s = smoothed_value(history, dist, args.smooth)
     finally:
         if sgbm_future is not None:
             try:
@@ -578,8 +698,7 @@ def main() -> None:
         prep_pool.shutdown(wait=False)
         if sgbm_pool is not None:
             sgbm_pool.shutdown(wait=False)
-        cap_l.release()
-        cap_r.release()
+        cap.release()
         if writer is not None:
             writer.release()
             print(f"Видео сохранено: {Path(args.output).resolve()}")
