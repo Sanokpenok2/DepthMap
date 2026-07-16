@@ -248,19 +248,20 @@ class ObjectTracker:
         kind: str = "csrt",
         *,
         smooth: float = 0.6,
-        lock_size: bool = False,
+        lock_size: bool = True,
         keep_aspect: bool = True,
         max_scale_step: float = 0.05,
         verify: bool = True,
-        verify_threshold: float = 0.4,
-        max_jump: float = 0.9,
+        verify_threshold: float = 0.45,
+        max_jump: float = 0.7,
         min_visible: float = 0.4,
         lost_patience: int = 2,
         verify_rel: float = 0.75,
-        min_iou: float = 0.4,
+        min_iou: float = 0.5,
+        max_size_ratio: float = 1.6,
         reacquire: bool = True,
-        reacquire_threshold: float = 0.5,
-        reacquire_radius: float = 3.0,
+        reacquire_threshold: float = 0.62,
+        reacquire_radius: float = 2.5,
         reacquire_global: bool = False,
         reacquire_interval: int = 5,
         reacquire_scale_min: float = 0.35,
@@ -295,6 +296,8 @@ class ObjectTracker:
         self.verify_rel = float(verify_rel)
         # min_iou — мин. IoU с предыдущей рамкой (отсекает «перескок» на пересекающийся объект).
         self.min_iou = float(min_iou)
+        # max_size_ratio — макс. изменение площади за кадр; сильнее → LOST, а не сжатие рамки.
+        self.max_size_ratio = float(max_size_ratio)
         # reacquire — повторный захват объекта после потери по эталонному шаблону.
         self.reacquire = bool(reacquire)
         self.reacquire_threshold = float(reacquire_threshold)
@@ -381,6 +384,43 @@ class ObjectTracker:
         score = float(res[0, 0])
         return score if np.isfinite(score) else -1.0
 
+    def _appearance_ok(
+        self, img_bgr: np.ndarray, box: tuple[float, float, float, float]
+    ) -> bool:
+        """Отсекает кусты/тёмные пятна по яркости и контрасту эталона."""
+        if self._template is None:
+            return True
+        x, y, rw, rh = clamp_roi(box, img_bgr.shape[1], img_bgr.shape[0])
+        patch = img_bgr[y : y + rh, x : x + rw]
+        if patch.size == 0:
+            return False
+        gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+        templ = cv2.resize(
+            self._template, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_AREA
+        )
+        mean_diff = abs(float(gray.mean()) - float(templ.mean()))
+        if mean_diff > 55.0:
+            return False
+        pstd = float(np.std(gray))
+        tstd = float(np.std(templ))
+        if tstd < 1.0:
+            return pstd < 8.0
+        ratio = pstd / tstd
+        return 0.35 <= ratio <= 2.8
+
+    def _aspect_ok(self, box: tuple[float, float, float, float]) -> bool:
+        """Найденная рамка должна сохранять пропорции эталона."""
+        if self._template_size is None:
+            return True
+        tw, th = self._template_size
+        if tw < 1 or th < 1:
+            return True
+        _, _, w, h = box
+        if w < 1 or h < 1:
+            return False
+        ratio = (float(w) / float(h)) / (float(tw) / float(th))
+        return 1.0 / 1.35 <= ratio <= 1.35
+
     def _visible_fraction(
         self, box: tuple[float, float, float, float], width: int, height: int
     ) -> float:
@@ -390,6 +430,30 @@ class ObjectTracker:
         inter = max(0.0, x1 - x0) * max(0.0, y1 - y0)
         area = max(rw * rh, 1.0)
         return inter / area
+
+    def _size_ok(self, box: tuple[float, float, float, float]) -> bool:
+        """False, если площадь рамки резко изменилась (CSRT сжался на случайный патч).
+
+        Сравниваем с последней принятой рамкой (не с «вечным» lock), чтобы
+        постепенное удаление объекта не блокировало трекинг жёстче нужного.
+        """
+        if self.max_size_ratio <= 1.0:
+            return True
+        _, _, w, h = box
+        new_a = max(float(w) * float(h), 1.0)
+        ref_w = ref_h = None
+        if self._roi_f is not None:
+            ref_w, ref_h = self._roi_f[2], self._roi_f[3]
+        elif self.lock_size and self._locked_size is not None:
+            ref_w, ref_h = self._locked_size
+        elif self._init_size is not None:
+            ref_w, ref_h = self._init_size
+        if ref_w is None or ref_h is None:
+            return True
+        old_a = max(float(ref_w) * float(ref_h), 1.0)
+        ratio = new_a / old_a
+        return (1.0 / self.max_size_ratio) <= ratio <= self.max_size_ratio
+
 
     def _jump_ok(self, box: tuple[float, float, float, float]) -> bool:
         """False, если центр «прыгнул» слишком далеко за один кадр."""
@@ -427,11 +491,18 @@ class ObjectTracker:
         self.last_score = score
         if not self.verify:
             return True, score
+        # Резкое сжатие/раздувание рамки = потеря, а не «новый объект».
+        if not self._size_ok(box):
+            return False, score
         if not np.isfinite(score) or score < self.verify_threshold:
             return False, score
         if not self._jump_ok(box):
             return False, score
         if self._visible_fraction(box, img_bgr.shape[1], img_bgr.shape[0]) < self.min_visible:
+            return False, score
+        if not self._appearance_ok(img_bgr, box):
+            return False, score
+        if not self._aspect_ok(box):
             return False, score
 
         # Относительное падение score (постепенный дрейф на другой объект).
@@ -445,16 +516,24 @@ class ObjectTracker:
         if self._roi_f is not None:
             iou = self._iou(self._roi_f, box)
             # Резкий сдвиг рамки на пересекающийся объект при среднем score.
-            if self.min_iou > 0.0 and iou < self.min_iou and score < 0.85:
+            if self.min_iou > 0.0 and iou < self.min_iou and score < 0.88:
                 return False, score
             # Если на старой позиции объект всё ещё «узнаётся» лучше — не перескакиваем.
-            old_score = self._score_roi(img_bgr, self._roi_f)
-            if (
-                np.isfinite(old_score)
-                and old_score >= self.verify_threshold
-                and score + 0.05 < old_score
-            ):
-                return False, score
+            # (только при заметном уезде, иначе 5px сдвиг ломает NCC)
+            px, py, pw, ph = self._roi_f
+            x, y, w, h = box
+            dist = float(
+                np.hypot((x + w / 2.0) - (px + pw / 2.0), (y + h / 2.0) - (py + ph / 2.0))
+            )
+            diag = float(np.hypot(max(pw, 1.0), max(ph, 1.0)))
+            if dist > 0.2 * diag or iou < max(self.min_iou, 0.55):
+                old_score = self._score_roi(img_bgr, self._roi_f)
+                if (
+                    np.isfinite(old_score)
+                    and old_score >= self.verify_threshold
+                    and score + 0.03 < old_score
+                ):
+                    return False, score
 
         return True, score
 
@@ -481,24 +560,20 @@ class ObjectTracker:
         return (x0, y0, x1 - x0, y1 - y0)
 
     def _reacquire_scales(self) -> list[float]:
-        """Масштабы эталона: от меньшего (объект дальше) до большего."""
+        """Масштабы эталона — широкий диапазон, чтобы найти объект дальше (мельче)."""
         lo = self.reacquire_scale_min
         hi = self.reacquire_scale_max
-        # Геометрическая сетка: больше точек в сторону уменьшения размера.
         n = 9
         scales = [float(s) for s in np.geomspace(lo, hi, num=n)]
-        # Добавляем текущий сглаженный масштаб, если он в диапазоне.
         if lo <= self._scale <= hi:
             scales.append(float(self._scale))
-        # Уникальные, отсортированные.
         return sorted(set(round(s, 4) for s in scales))
 
     def _try_reacquire(self, img_bgr: np.ndarray) -> Roi | None:
         """Ищет эталон объекта. None — не найден.
 
-        По умолчанию ищет рядом с последней позицией в широком диапазоне масштабов
-        (объект мог стать заметно меньше после удаления). Сравнение — на 1/2
-        разрешения; затем проверка на полном.
+        Берёт лучший кандидат с учётом близости к последней позиции (штраф за
+        дальность), иначе matchTemplate часто цепляет похожий фон в стороне.
         """
         if self._template is None or self._template_size is None:
             return None
@@ -518,11 +593,17 @@ class ObjectTracker:
         inv = 1.0 / scale_down
         tw0, th0 = self._template_size
 
-        # Однотонный эталон: CCOEFF_NORMED вырождается (ложные 1.0) → SQDIFF.
         solid = float(np.var(self._template)) < 1.0
         method = cv2.TM_SQDIFF_NORMED if solid else cv2.TM_CCOEFF_NORMED
 
-        best: tuple[float, int, int, int, int] | None = None
+        pcx = pcy = diag = None
+        if self._roi_f is not None:
+            px, py, pw, ph = self._roi_f
+            pcx, pcy = px + pw / 2.0, py + ph / 2.0
+            diag = float(np.hypot(max(pw, 1.0), max(ph, 1.0)))
+
+        # (adj, raw_score, fx, fy, fw, fh)
+        cands: list[tuple[float, float, int, int, int, int]] = []
         for s in self._reacquire_scales():
             tw = max(8, int(round(tw0 * s * scale_down)))
             th = max(8, int(round(th0 * s * scale_down)))
@@ -539,19 +620,53 @@ class ObjectTracker:
                 score = float(maxv)
             if not np.isfinite(score) or score < self.reacquire_threshold:
                 continue
-            # Координаты обратно в полный кадр.
             fx = wx + int(round(maxloc[0] * inv))
             fy = wy + int(round(maxloc[1] * inv))
             fw = max(8, int(round(tw * inv)))
             fh = max(8, int(round(th * inv)))
-            if best is None or score > best[0]:
-                best = (score, fx, fy, fw, fh)
-        if best is None:
+            cx, cy = fx + fw / 2.0, fy + fh / 2.0
+            pen = 0.0
+            if pcx is not None and diag is not None and diag > 0:
+                dist = float(np.hypot(cx - pcx, cy - pcy))
+                pen += min(0.4, 0.18 * (dist / diag))
+            # Предпочитаем масштаб ближе к последнему известному.
+            cur = max(self._scale, 0.05)
+            pen += min(0.12, 0.1 * abs(float(np.log(s / cur))))
+            cands.append((score - pen, score, fx, fy, fw, fh))
+
+        if not cands:
             return None
-        # Перепроверяем на полном разрешении: half-res иногда даёт ложные пики.
-        cand = (best[1], best[2], best[3], best[4])
+        cands.sort(key=lambda t: t[0], reverse=True)
+        best_adj, best_raw, fx, fy, fw, fh = cands[0]
+
+        # Неоднозначность: два похожих пика → не угадываем.
+        if len(cands) >= 2:
+            second_adj = cands[1][0]
+            if best_adj - second_adj < 0.04 and best_raw < self.reacquire_threshold + 0.12:
+                return None
+
+        cand = (fx, fy, fw, fh)
+        if not self._aspect_ok(cand):
+            return None
+        if not self._appearance_ok(img_bgr, cand):
+            return None
+
+        # Дальний прыжок требует более сильного совпадения.
+        if pcx is not None and diag is not None and diag > 0:
+            cx, cy = fx + fw / 2.0, fy + fh / 2.0
+            dist = float(np.hypot(cx - pcx, cy - pcy))
+            need = self.reacquire_threshold
+            if dist > 1.2 * diag:
+                need = max(need + 0.1, 0.7)
+            if dist > 2.0 * diag:
+                need = max(need + 0.15, 0.75)
+            if best_raw < need:
+                return None
+
         full_score = self._score_roi(img_bgr, cand)
         if not np.isfinite(full_score) or full_score < self.reacquire_threshold:
+            return None
+        if not self._appearance_ok(img_bgr, cand):
             return None
         self.last_score = full_score
         return cand
@@ -654,8 +769,30 @@ class ObjectTracker:
                 self._score_ema = 0.9 * self._score_ema + 0.1 * float(self.last_score)
 
     def _reinit_on(self, img_bgr: np.ndarray, box: Roi) -> None:
-        """Пересоздаёт OpenCV-трекер на заданной рамке."""
-        box = clamp_roi(box, img_bgr.shape[1], img_bgr.shape[0])
+        """Пересоздаёт OpenCV-трекер на заданной рамке.
+
+        Размер/эталон обновляем только при уверенном match; иначе при lock_size
+        двигаем только центр — чтобы слабый ложный пик не «прилипал» навсегда.
+        """
+        h, w = img_bgr.shape[:2]
+        found = clamp_roi(
+            (float(box[0]), float(box[1]), float(box[2]), float(box[3])), w, h
+        )
+        score = (
+            float(self.last_score)
+            if self.last_score is not None and np.isfinite(self.last_score)
+            else 0.0
+        )
+        adopt_size = score >= max(self.reacquire_threshold + 0.08, 0.7)
+
+        if self.lock_size and self._locked_size is not None and not adopt_size:
+            lw, lh = self._locked_size
+            cx = found[0] + found[2] / 2.0
+            cy = found[1] + found[3] / 2.0
+            box = clamp_roi((cx - lw / 2.0, cy - lh / 2.0, lw, lh), w, h)
+        else:
+            box = found
+
         self._tracker = create_raw_tracker(self.kind)
         self._tracker.init(img_bgr, box)
         self._roi_f = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
@@ -665,9 +802,9 @@ class ObjectTracker:
         self.ok = True
         self._fail_streak = 0
         self._lost_frames = 0
-        # Обновляем эталон под новый вид/размер — дальше перезахват будет точнее.
-        self._save_template(img_bgr, box)
-        self._locked_size = (float(box[2]), float(box[3]))
+        if adopt_size:
+            self._save_template(img_bgr, box)
+            self._locked_size = (float(box[2]), float(box[3]))
         if self.last_score is not None and np.isfinite(self.last_score):
             self._score_ema = float(self.last_score)
 
@@ -678,13 +815,26 @@ class ObjectTracker:
         found = self._try_reacquire(img_bgr)
         if found is None:
             return False
-        # last_score уже выставлен в _try_reacquire.
         if (
             self.last_score is None
             or not np.isfinite(self.last_score)
             or self.last_score < self.reacquire_threshold
         ):
             return False
+
+        # Сильное изменение размера — только при очень уверенном match.
+        if self._roi_f is not None or self._locked_size is not None:
+            if self._locked_size is not None:
+                rw, rh = self._locked_size
+            else:
+                rw, rh = self._roi_f[2], self._roi_f[3]
+            old_a = max(float(rw) * float(rh), 1.0)
+            new_a = max(float(found[2]) * float(found[3]), 1.0)
+            ratio = new_a / old_a
+            if ratio < 0.55 or ratio > 1.9:
+                if self.last_score < max(0.72, self.reacquire_threshold + 0.12):
+                    return False
+
         self._reinit_on(img_bgr, found)
         self.reacquired = True
         return True
@@ -818,8 +968,9 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--lock-size",
-        action="store_true",
-        help="Фиксировать размер рамки (двигается только центр) — меньше дрожания.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Фиксировать размер рамки (двигается только центр). Резкое сжатие → LOST.",
     )
     p.add_argument(
         "--keep-aspect",
@@ -834,6 +985,12 @@ def _parse_args() -> argparse.Namespace:
         help="Макс. относительное изменение масштаба рамки за кадр (0 = без лимита).",
     )
     p.add_argument(
+        "--max-size-ratio",
+        type=float,
+        default=1.6,
+        help="Макс. изменение площади рамки за кадр (1.6 ≈ ±60%%); иначе LOST.",
+    )
+    p.add_argument(
         "--verify",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -842,13 +999,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--verify-threshold",
         type=float,
-        default=0.4,
+        default=0.45,
         help="Мин. сходство с эталоном [0..1], ниже — считаем кадр плохим.",
     )
     p.add_argument(
         "--max-jump",
         type=float,
-        default=0.9,
+        default=0.7,
         help="Макс. прыжок центра за кадр в долях диагонали ROI (0 = без лимита).",
     )
     p.add_argument(
@@ -860,7 +1017,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--min-iou",
         type=float,
-        default=0.4,
+        default=0.5,
         help="Мин. IoU с предыдущей рамкой (отсекает перескок на пересекающийся объект).",
     )
     p.add_argument(
@@ -878,13 +1035,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--reacquire-threshold",
         type=float,
-        default=0.5,
+        default=0.62,
         help="Порог совпадения для повторного захвата [0..1].",
     )
     p.add_argument(
         "--reacquire-radius",
         type=float,
-        default=3.0,
+        default=2.5,
         help="Окно поиска при перезахвате (доли max(w,h) ROI вокруг последней позиции).",
     )
     p.add_argument(
@@ -950,6 +1107,7 @@ def main() -> None:
         lock_size=args.lock_size,
         keep_aspect=args.keep_aspect,
         max_scale_step=args.max_scale_step,
+        max_size_ratio=args.max_size_ratio,
         verify=args.verify,
         verify_threshold=args.verify_threshold,
         max_jump=args.max_jump,

@@ -94,8 +94,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--lock-size",
-        action="store_true",
-        help="Фиксировать размер рамки трекинга (двигается только центр).",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Фиксировать размер рамки трекинга (двигается только центр). Резкое сжатие → LOST.",
     )
     p.add_argument(
         "--keep-aspect",
@@ -110,6 +111,12 @@ def parse_args() -> argparse.Namespace:
         help="Макс. относительное изменение масштаба рамки за кадр (0 = без лимита).",
     )
     p.add_argument(
+        "--max-size-ratio",
+        type=float,
+        default=1.6,
+        help="Макс. изменение площади рамки за кадр (1.6 ≈ ±60%%); иначе LOST.",
+    )
+    p.add_argument(
         "--verify",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -118,13 +125,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--verify-threshold",
         type=float,
-        default=0.4,
+        default=0.45,
         help="Мин. сходство с эталоном [0..1], ниже — считаем кадр плохим.",
     )
     p.add_argument(
         "--max-jump",
         type=float,
-        default=0.9,
+        default=0.7,
         help="Макс. прыжок центра за кадр в долях диагонали ROI (0 = без лимита).",
     )
     p.add_argument(
@@ -136,7 +143,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--min-iou",
         type=float,
-        default=0.4,
+        default=0.5,
         help="Мин. IoU с предыдущей рамкой (отсекает перескок на пересекающийся объект).",
     )
     p.add_argument(
@@ -154,13 +161,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--reacquire-threshold",
         type=float,
-        default=0.5,
+        default=0.62,
         help="Порог совпадения для повторного захвата [0..1].",
     )
     p.add_argument(
         "--reacquire-radius",
         type=float,
-        default=3.0,
+        default=2.5,
         help="Окно поиска при перезахвате (доли max(w,h) ROI вокруг последней позиции).",
     )
     p.add_argument(
@@ -518,6 +525,7 @@ def main() -> None:
         lock_size=args.lock_size,
         keep_aspect=args.keep_aspect,
         max_scale_step=args.max_scale_step,
+        max_size_ratio=args.max_size_ratio,
         verify=args.verify,
         verify_threshold=args.verify_threshold,
         max_jump=args.max_jump,
