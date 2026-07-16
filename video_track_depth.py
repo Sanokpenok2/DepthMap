@@ -89,8 +89,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--roi-smooth",
         type=float,
-        default=0.6,
-        help="Сглаживание рамки трекинга [0..1): 0 = без сглаживания, ближе к 1 = плавнее.",
+        default=0.3,
+        help="Сглаживание рамки трекинга [0..1): 0 = без сглаживания, ближе к 1 = плавнее (больше лаг).",
     )
     p.add_argument(
         "--lock-size",
@@ -131,7 +131,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--max-jump",
         type=float,
-        default=0.7,
+        default=1.0,
         help="Макс. прыжок центра за кадр в долях диагонали ROI (0 = без лимита).",
     )
     p.add_argument(
@@ -143,7 +143,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--min-iou",
         type=float,
-        default=0.5,
+        default=0.35,
         help="Мин. IoU с предыдущей рамкой (отсекает перескок на пересекающийся объект).",
     )
     p.add_argument(

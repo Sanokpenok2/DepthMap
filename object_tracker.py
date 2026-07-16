@@ -247,17 +247,17 @@ class ObjectTracker:
         self,
         kind: str = "csrt",
         *,
-        smooth: float = 0.6,
+        smooth: float = 0.3,
         lock_size: bool = True,
         keep_aspect: bool = True,
         max_scale_step: float = 0.05,
         verify: bool = True,
         verify_threshold: float = 0.45,
-        max_jump: float = 0.7,
+        max_jump: float = 1.0,
         min_visible: float = 0.4,
         lost_patience: int = 2,
         verify_rel: float = 0.75,
-        min_iou: float = 0.5,
+        min_iou: float = 0.35,
         max_size_ratio: float = 1.6,
         reacquire: bool = True,
         reacquire_threshold: float = 0.62,
@@ -454,6 +454,83 @@ class ObjectTracker:
         ratio = new_a / old_a
         return (1.0 / self.max_size_ratio) <= ratio <= self.max_size_ratio
 
+    def _apply_locked_size(
+        self, box: tuple[float, float, float, float], width: int, height: int
+    ) -> tuple[float, float, float, float]:
+        """Центр из box, размер — зафиксированный (если lock_size)."""
+        if not self.lock_size or self._locked_size is None:
+            return (
+                float(box[0]),
+                float(box[1]),
+                float(box[2]),
+                float(box[3]),
+            )
+        x, y, w, h = box
+        cx, cy = x + w / 2.0, y + h / 2.0
+        lw, lh = self._locked_size
+        return clamp_roi((cx - lw / 2.0, cy - lh / 2.0, lw, lh), width, height)
+
+    def _refine_center(
+        self, img_bgr: np.ndarray, box: tuple[float, float, float, float]
+    ) -> tuple[tuple[float, float, float, float], float | None]:
+        """Подстраивает центр рамки локальным matchTemplate по эталону.
+
+        CSRT при движении часто «съезжает» в сторону; небольшой поиск вокруг
+        текущего центра возвращает рамку на объект, не меняя размер.
+        """
+        if self._template is None:
+            return box, None
+        h_img, w_img = img_bgr.shape[:2]
+        x, y, bw, bh = box
+        bw_i, bh_i = max(8, int(round(bw))), max(8, int(round(bh)))
+        cx, cy = x + bw / 2.0, y + bh / 2.0
+
+        # Узкое окно: только коррекция дрейфа, не глобальный поиск.
+        mx = max(6, int(round(0.28 * bw_i)))
+        my = max(6, int(round(0.28 * bh_i)))
+        x0 = max(0, int(round(cx - bw_i / 2.0)) - mx)
+        y0 = max(0, int(round(cy - bh_i / 2.0)) - my)
+        x1 = min(w_img, int(round(cx + bw_i / 2.0)) + mx)
+        y1 = min(h_img, int(round(cy + bh_i / 2.0)) + my)
+        if x1 - x0 < bw_i + 2 or y1 - y0 < bh_i + 2:
+            return box, None
+
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        region = gray[y0:y1, x0:x1]
+        templ = cv2.resize(self._template, (bw_i, bh_i), interpolation=cv2.INTER_AREA)
+        if templ.shape[0] >= region.shape[0] or templ.shape[1] >= region.shape[1]:
+            return box, None
+
+        solid = float(np.var(templ)) < 1.0
+        method = cv2.TM_SQDIFF_NORMED if solid else cv2.TM_CCOEFF_NORMED
+        res = cv2.matchTemplate(region, templ, method)
+        if solid:
+            minv, _, minloc, _ = cv2.minMaxLoc(res)
+            score = 1.0 - float(minv)
+            loc = minloc
+        else:
+            _, maxv, _, maxloc = cv2.minMaxLoc(res)
+            score = float(maxv)
+            loc = maxloc
+        if not np.isfinite(score):
+            return box, None
+
+        base = self._score_roi(img_bgr, box)
+        # Принимаем refine только если не хуже текущего положения заметно.
+        if np.isfinite(base) and score + 0.02 < base:
+            return box, base if np.isfinite(base) else None
+        if score < self.verify_threshold:
+            return box, base if np.isfinite(base) else None
+
+        fx = float(x0 + loc[0])
+        fy = float(y0 + loc[1])
+        refined = (fx, fy, float(bw_i), float(bh_i))
+        rcx, rcy = fx + bw_i / 2.0, fy + bh_i / 2.0
+        # Не уезжать слишком далеко от предложения CSRT за один кадр.
+        diag = float(np.hypot(bw_i, bh_i))
+        if float(np.hypot(rcx - cx, rcy - cy)) > 0.4 * diag:
+            return box, base if np.isfinite(base) else None
+        return refined, score
 
     def _jump_ok(self, box: tuple[float, float, float, float]) -> bool:
         """False, если центр «прыгнул» слишком далеко за один кадр."""
@@ -515,23 +592,27 @@ class ObjectTracker:
 
         if self._roi_f is not None:
             iou = self._iou(self._roi_f, box)
-            # Резкий сдвиг рамки на пересекающийся объект при среднем score.
-            if self.min_iou > 0.0 and iou < self.min_iou and score < 0.88:
-                return False, score
-            # Если на старой позиции объект всё ещё «узнаётся» лучше — не перескакиваем.
-            # (только при заметном уезде, иначе 5px сдвиг ломает NCC)
             px, py, pw, ph = self._roi_f
             x, y, w, h = box
             dist = float(
                 np.hypot((x + w / 2.0) - (px + pw / 2.0), (y + h / 2.0) - (py + ph / 2.0))
             )
             diag = float(np.hypot(max(pw, 1.0), max(ph, 1.0)))
-            if dist > 0.2 * diag or iou < max(self.min_iou, 0.55):
+
+            # IoU-порог только для слабого match: при хорошем score это обычное
+            # смещение объекта, а не перескок на куст.
+            if self.min_iou > 0.0 and iou < self.min_iou and score < 0.7:
+                return False, score
+
+            # «Старая позиция лучше» — только при телепорте (очень низкий IoU).
+            # Иначе при движении доски старая рамка ещё частично на объекте и
+            # NCC там выше → рамка отстаёт и «съезжает».
+            if iou < 0.2 and dist > 0.35 * diag:
                 old_score = self._score_roi(img_bgr, self._roi_f)
                 if (
                     np.isfinite(old_score)
                     and old_score >= self.verify_threshold
-                    and score + 0.03 < old_score
+                    and score + 0.1 < old_score
                 ):
                     return False, score
 
@@ -676,9 +757,8 @@ class ObjectTracker:
     ) -> tuple[float, float, float, float]:
         """Сглаживает рамку: центр по EMA, размер — равномерным масштабом.
 
-        Размер меняется единым масштабом относительно исходной рамки, поэтому
-        пропорции объекта сохраняются (нет неравномерного «схлопывания» сторон),
-        а сам масштаб сглаживается и ограничивается по скорости изменения.
+        При заметном смещении центра сглаживание ослабляется, чтобы рамка
+        не отставала от движущегося объекта.
         """
         x, y, w, h = box
         cx, cy = x + w / 2.0, y + h / 2.0
@@ -690,8 +770,18 @@ class ObjectTracker:
         else:
             px, py, pw, ph = self._roi_f
             pcx, pcy = px + pw / 2.0, py + ph / 2.0
-            ncx = pcx + a * (cx - pcx)
-            ncy = pcy + a * (cy - pcy)
+            dist = float(np.hypot(cx - pcx, cy - pcy))
+            diag = float(np.hypot(max(pw, 1.0), max(ph, 1.0)))
+            # Быстрое смещение → меньше EMA (иначе рамка «плывёт» позади).
+            # Не ставим почти 1.0: после refine центр уже точный, сильный chase
+            # усиливал дрожание.
+            a_pos = a
+            if diag > 1.0 and dist > 0.12 * diag:
+                a_pos = max(a, 0.65)
+            if diag > 1.0 and dist > 0.28 * diag:
+                a_pos = max(a_pos, 0.8)
+            ncx = pcx + a_pos * (cx - pcx)
+            ncy = pcy + a_pos * (cy - pcy)
 
         # --- Размер ---
         if self.lock_size and self._locked_size is not None:
@@ -865,19 +955,45 @@ class ObjectTracker:
         raw_ok, box = self._tracker.update(img)
         accepted = False
         if raw_ok:
-            valid, _score = self._validate_box(
-                img, (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
-            )
+            h_img, w_img = img.shape[:2]
+            box_f = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
+            # Фиксированный размер + локальная подстройка центра по эталону
+            # (CSRT при движении часто уводит центр в сторону).
+            box_f = self._apply_locked_size(box_f, w_img, h_img)
+            box_f, refined_score = self._refine_center(img, box_f)
+            if refined_score is not None and np.isfinite(refined_score):
+                self.last_score = float(refined_score)
+            valid, _score = self._validate_box(img, box_f)
             if valid:
-                self._accept_box(
-                    img, (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
-                )
+                self._accept_box(img, box_f)
                 accepted = True
+                # Синхронизируем CSRT с исправленной рамкой, иначе дрейф копится.
+                if self.roi is not None and self._roi_f is not None:
+                    diag = float(
+                        np.hypot(max(self._roi_f[2], 1.0), max(self._roi_f[3], 1.0))
+                    )
+                    rcx = box_f[0] + box_f[2] / 2.0
+                    rcy = box_f[1] + box_f[3] / 2.0
+                    raw_cx = float(box[0]) + float(box[2]) / 2.0
+                    raw_cy = float(box[1]) + float(box[3]) / 2.0
+                    corr = float(np.hypot(rcx - raw_cx, rcy - raw_cy))
+                    if corr > 0.06 * diag:
+                        self._tracker = create_raw_tracker(self.kind)
+                        self._tracker.init(img, self.roi)
             else:
-                # Не двигаем рамку к ложной цели. Откат CSRT — только один раз
-                # на серию сбоев (пересоздание трекера дорогое).
+                # Не двигаем рамку к ложной цели. Откат CSRT на старую ROI —
+                # только при явно плохом score; иначе при движении объекта
+                # мы сами «откатываем» трекер и рамка начинает отставать.
                 self._fail_streak += 1
-                if self.roi is not None and self._fail_streak == 1:
+                if (
+                    self.roi is not None
+                    and self._fail_streak == 1
+                    and (
+                        self.last_score is None
+                        or not np.isfinite(self.last_score)
+                        or self.last_score < self.verify_threshold
+                    )
+                ):
                     self._tracker = create_raw_tracker(self.kind)
                     self._tracker.init(img, self.roi)
         else:
@@ -963,8 +1079,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--smooth",
         type=float,
-        default=0.6,
-        help="Сглаживание рамки [0..1): 0 = без сглаживания, ближе к 1 = плавнее.",
+        default=0.3,
+        help="Сглаживание рамки [0..1): 0 = без сглаживания, ближе к 1 = плавнее (больше лаг).",
     )
     p.add_argument(
         "--lock-size",
@@ -1005,7 +1121,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--max-jump",
         type=float,
-        default=0.7,
+        default=1.0,
         help="Макс. прыжок центра за кадр в долях диагонали ROI (0 = без лимита).",
     )
     p.add_argument(
@@ -1017,7 +1133,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--min-iou",
         type=float,
-        default=0.5,
+        default=0.35,
         help="Мин. IoU с предыдущей рамкой (отсекает перескок на пересекающийся объект).",
     )
     p.add_argument(
