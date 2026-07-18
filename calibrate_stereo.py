@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from calib_quality import assess_calibration_quality, format_quality_report
+from depth_map import split_sbs
 
 
 def parse_args() -> argparse.Namespace:
@@ -18,13 +19,23 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--left",
-        required=True,
+        default=None,
         help="Glob-шаблон путей к левым изображениям (в кавычках), напр. 'calib/left_*.png'.",
     )
     p.add_argument(
         "--right",
-        required=True,
+        default=None,
         help="Glob-шаблон путей к правым изображениям (в кавычках).",
+    )
+    p.add_argument(
+        "--sbs",
+        default=None,
+        help="Glob SBS-фото доски (левая/правая половины кадра), напр. 'calib/sbs_*.png'.",
+    )
+    p.add_argument(
+        "--swap-lr",
+        action="store_true",
+        help="Поменять половины SBS местами (если левая камера справа).",
     )
     p.add_argument(
         "--cols",
@@ -154,8 +165,7 @@ def align_stereo_pair(
 
 
 def collect_calibration_corners(
-    left_paths: list[str],
-    right_paths: list[str],
+    pairs: list[tuple[np.ndarray | None, np.ndarray | None, str]],
     cols: int,
     rows: int,
     square_size: float,
@@ -167,6 +177,7 @@ def collect_calibration_corners(
     tuple[int, int],
     list[str],
 ]:
+    """Ищет углы доски на списке пар (left_gray, right_gray, label)."""
     pattern = find_pattern_size(cols, rows)
     objp = build_object_points(cols, rows, square_size)
 
@@ -186,21 +197,24 @@ def collect_calibration_corners(
         Path(debug_dir).mkdir(parents=True, exist_ok=True)
         clear_debug_dir(debug_dir)
 
-    for lf, rf in zip(left_paths, right_paths):
-        img_l = cv2.imread(lf, cv2.IMREAD_GRAYSCALE)
-        img_r = cv2.imread(rf, cv2.IMREAD_GRAYSCALE)
-        if img_l is None or img_r is None:
+    for img_l, img_r, label in pairs:
+        if img_l is None or img_r is None or img_l.size == 0 or img_r.size == 0:
             skipped_unreadable += 1
-            log.append(f"Пропуск (не читается): {Path(lf).name} / {Path(rf).name}")
+            log.append(f"Пропуск (не читается): {label}")
             continue
+
+        if img_l.ndim == 3:
+            img_l = cv2.cvtColor(img_l, cv2.COLOR_BGR2GRAY)
+        if img_r.ndim == 3:
+            img_r = cv2.cvtColor(img_r, cv2.COLOR_BGR2GRAY)
 
         if img_l.shape != img_r.shape:
             aligned_l, aligned_r, was_aligned = align_stereo_pair(img_l, img_r)
             if not was_aligned:
                 skipped_size += 1
                 log.append(
-                    f"Пропуск (разные размеры): {Path(lf).name} "
-                    f"{img_l.shape} / {Path(rf).name} {img_r.shape}"
+                    f"Пропуск (разные размеры): {label} "
+                    f"{img_l.shape} / {img_r.shape}"
                 )
                 continue
             if not size_mismatch_logged:
@@ -219,7 +233,7 @@ def collect_calibration_corners(
         found_r, corners_r = cv2.findChessboardCorners(img_r, pattern, flags)
 
         if not (found_l and found_r):
-            log.append(f"Доска не найдена: {Path(lf).name} / {Path(rf).name}")
+            log.append(f"Доска не найдена: {label}")
             continue
 
         corners_l = cv2.cornerSubPix(img_l, corners_l, (11, 11), (-1, -1), subpix_criteria)
@@ -230,13 +244,14 @@ def collect_calibration_corners(
         imgpoints_r.append(corners_r)
 
         if debug_dir:
+            safe = label.replace("/", "_").replace("\\", "_")
             vis_l = cv2.cvtColor(img_l, cv2.COLOR_GRAY2BGR)
             cv2.drawChessboardCorners(vis_l, pattern, corners_l, found_l)
-            cv2.imwrite(str(Path(debug_dir) / f"corners_left_{Path(lf).name}"), vis_l)
+            cv2.imwrite(str(Path(debug_dir) / f"corners_left_{safe}"), vis_l)
 
             vis_r = cv2.cvtColor(img_r, cv2.COLOR_GRAY2BGR)
             cv2.drawChessboardCorners(vis_r, pattern, corners_r, found_r)
-            cv2.imwrite(str(Path(debug_dir) / f"corners_right_{Path(rf).name}"), vis_r)
+            cv2.imwrite(str(Path(debug_dir) / f"corners_right_{safe}"), vis_r)
 
     if image_size is None:
         raise ValueError(
@@ -254,6 +269,43 @@ def collect_calibration_corners(
 
     log.append(f"Углы найдены на {len(objpoints)} парах.")
     return objpoints, imgpoints_l, imgpoints_r, image_size, log
+
+
+def load_pairs_from_paths(
+    left_paths: list[str], right_paths: list[str]
+) -> list[tuple[np.ndarray | None, np.ndarray | None, str]]:
+    if len(left_paths) != len(right_paths):
+        raise ValueError(
+            f"Число левых ({len(left_paths)}) и правых ({len(right_paths)}) "
+            "изображений не совпадает."
+        )
+    if not left_paths:
+        raise ValueError("Не найдено ни одной пары изображений по указанным glob.")
+    pairs: list[tuple[np.ndarray | None, np.ndarray | None, str]] = []
+    for lf, rf in zip(left_paths, right_paths):
+        img_l = cv2.imread(lf, cv2.IMREAD_GRAYSCALE)
+        img_r = cv2.imread(rf, cv2.IMREAD_GRAYSCALE)
+        label = f"{Path(lf).name} / {Path(rf).name}"
+        pairs.append((img_l, img_r, label))
+    return pairs
+
+
+def load_pairs_from_sbs(
+    sbs_paths: list[str], swap_lr: bool = False
+) -> list[tuple[np.ndarray | None, np.ndarray | None, str]]:
+    if not sbs_paths:
+        raise ValueError("Не найдено ни одного SBS-изображения по указанному glob.")
+    pairs: list[tuple[np.ndarray | None, np.ndarray | None, str]] = []
+    for path in sbs_paths:
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is None:
+            pairs.append((None, None, Path(path).name))
+            continue
+        left, right = split_sbs(img, swap_lr=swap_lr)
+        left_g = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
+        right_g = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
+        pairs.append((left_g, right_g, Path(path).name))
+    return pairs
 
 
 def stack_image_points(imgpoints: list[np.ndarray]) -> np.ndarray:
@@ -498,8 +550,7 @@ def calibrate_pinhole(
 
 
 def calibrate_stereo(
-    left_paths: list[str],
-    right_paths: list[str],
+    pairs: list[tuple[np.ndarray | None, np.ndarray | None, str]],
     cols: int,
     rows: int,
     square_size: float,
@@ -509,16 +560,11 @@ def calibrate_stereo(
     rectify_mode: str = "calibrated",
 ) -> tuple[str, list[str]]:
     """Выполняет стереокалибровку и сохраняет результат в .npz."""
-    if not left_paths or not right_paths:
+    if not pairs:
         raise ValueError("Не найдены изображения для калибровки.")
-    if len(left_paths) != len(right_paths):
-        raise ValueError(
-            f"Число левых ({len(left_paths)}) и правых "
-            f"({len(right_paths)}) изображений различается."
-        )
 
     objpoints, imgpoints_l, imgpoints_r, image_size, log = collect_calibration_corners(
-        left_paths, right_paths, cols, rows, square_size, debug_dir
+        pairs, cols, rows, square_size, debug_dir
     )
 
     result = calibrate_pinhole(
@@ -595,13 +641,25 @@ def calibrate_stereo(
 def main() -> None:
     args = parse_args()
 
-    left_files = sorted(glob.glob(args.left))
-    right_files = sorted(glob.glob(args.right))
+    use_sbs = args.sbs is not None
+    use_pair = args.left is not None or args.right is not None
+    if use_sbs and use_pair:
+        sys.exit("Ошибка: укажите либо --sbs, либо пару --left/--right, не оба варианта.")
+    if use_sbs:
+        pairs = load_pairs_from_sbs(sorted(glob.glob(args.sbs)), swap_lr=args.swap_lr)
+    elif args.left and args.right:
+        pairs = load_pairs_from_paths(
+            sorted(glob.glob(args.left)), sorted(glob.glob(args.right))
+        )
+    else:
+        sys.exit(
+            "Ошибка: укажите --left и --right (отдельные кадры) "
+            "либо --sbs (SBS-фото доски)."
+        )
 
     try:
         out_path, log = calibrate_stereo(
-            left_files,
-            right_files,
+            pairs,
             args.cols,
             args.rows,
             args.square_size,

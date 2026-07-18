@@ -62,6 +62,11 @@ def run_depth_map(
             wls_sigma=float(wls_sigma),
             colormap=colormap,
             calib_path=calib_path,
+            # При калибровке — автодиапазон под 8–40 м (см. depth_map --z-near/--z-far).
+            auto_disparity=bool(calib_path),
+            z_near_m=5.0,
+            z_far_m=40.0,
+            fuse_disparity=True,
         )
     except ValueError as exc:
         return None, None, None, f"Ошибка: {exc}", None

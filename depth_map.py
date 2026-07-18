@@ -9,6 +9,7 @@
 Пример запуска:
     python depth_map.py --left left.png --right right.png --output disparity.png
     python depth_map.py -l left.png -r right.png --method sgbm --wls --show
+    python depth_map.py --sbs stereo_sbs.png --calib stereo_calib.npz --show
 """
 
 from __future__ import annotations
@@ -24,6 +25,14 @@ import cv2
 import numpy as np
 
 from calib_quality import assess_calibration_quality, format_quality_report
+from stereo_auto import (
+    clamp_sgbm_range,
+    estimate_disparity_range_bounds,
+    extract_calib_geometry,
+    fuse_disparity_maps,
+    robust_measure_depth,
+    split_near_far_bands,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,8 +40,28 @@ def parse_args() -> argparse.Namespace:
         description="Построение карты глубины (диспарности) по стереопаре.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("-l", "--left", required=True, help="Путь к левому изображению.")
-    p.add_argument("-r", "--right", required=True, help="Путь к правому изображению.")
+    p.add_argument(
+        "-l",
+        "--left",
+        default=None,
+        help="Путь к левому изображению (не нужен при --sbs).",
+    )
+    p.add_argument(
+        "-r",
+        "--right",
+        default=None,
+        help="Путь к правому изображению (не нужен при --sbs).",
+    )
+    p.add_argument(
+        "--sbs",
+        default=None,
+        help="SBS-фото: левая половина — левая камера, правая — правая.",
+    )
+    p.add_argument(
+        "--swap-lr",
+        action="store_true",
+        help="Поменять половины SBS местами (если левая камера справа).",
+    )
     p.add_argument(
         "-o",
         "--output",
@@ -49,7 +78,7 @@ def parse_args() -> argparse.Namespace:
         "--num-disparities",
         type=int,
         default=128,
-        help="Диапазон диспаритетов (должен быть кратен 16).",
+        help="Диапазон диспаритетов (кратен 16). Игнорируется при --auto-disparity.",
     )
     p.add_argument(
         "--block-size",
@@ -61,7 +90,38 @@ def parse_args() -> argparse.Namespace:
         "--min-disparity",
         type=int,
         default=0,
-        help="Минимальный диспаритет.",
+        help="Минимальный диспаритет. Игнорируется при --auto-disparity.",
+    )
+    p.add_argument(
+        "--auto-disparity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Подбирать min/num_disparities по --calib и --z-near/--z-far "
+            "(нужен --calib). Для широкого диапазона дистанций включает "
+            "двухполосный SGBM (ближний+дальний)."
+        ),
+    )
+    p.add_argument(
+        "--z-near",
+        type=float,
+        default=5.0,
+        help="Ближняя дистанция сцены в метрах (для --auto-disparity).",
+    )
+    p.add_argument(
+        "--z-far",
+        type=float,
+        default=40.0,
+        help="Дальняя дистанция сцены в метрах (для --auto-disparity).",
+    )
+    p.add_argument(
+        "--fuse-disparity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "При --auto-disparity склеивать ближний и дальний проходы SGBM "
+            "(лучше покрывает 10–30 м одновременно)."
+        ),
     )
     p.add_argument(
         "--wls",
@@ -181,6 +241,35 @@ def load_gray(path: str) -> np.ndarray:
     if img is None:
         raise ValueError(f"Не удалось прочитать изображение '{path}'.")
     return img
+
+
+def split_sbs(
+    frame: np.ndarray, swap_lr: bool = False
+) -> tuple[np.ndarray, np.ndarray]:
+    """Разрезает SBS-кадр пополам по ширине на левую и правую камеры."""
+    if frame is None or frame.size == 0:
+        raise ValueError("Пустой SBS-кадр.")
+    w = frame.shape[1]
+    if w < 2:
+        raise ValueError("SBS-кадр слишком узкий для разделения.")
+    half = w // 2
+    left = frame[:, :half]
+    right = frame[:, half : half * 2]
+    if swap_lr:
+        left, right = right, left
+    return np.ascontiguousarray(left), np.ascontiguousarray(right)
+
+
+def load_sbs_gray_pair(path: str, swap_lr: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """Загружает SBS-изображение и возвращает серые половины L/R."""
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError(f"Не удалось прочитать SBS-изображение '{path}'.")
+    left, right = split_sbs(img, swap_lr=swap_lr)
+    return (
+        cv2.cvtColor(left, cv2.COLOR_BGR2GRAY),
+        cv2.cvtColor(right, cv2.COLOR_BGR2GRAY),
+    )
 
 
 def load_gray_pair(
@@ -398,36 +487,12 @@ def measure_distance(
 ) -> tuple[float | None, float | None]:
     """Возвращает (расстояние, медианный диспаритет) в точке (x, y).
 
-    Диспаритет усредняется по окну window×window (берётся медиана валидных
-    значений). Расстояние считается либо по матрице Q (из калибровки), либо
-    по формуле depth = focal * baseline / disparity. Если данных не хватает,
-    соответствующее значение возвращается как None.
+    Робастная медиана по окну с отсечением выбросов (IQR). Расстояние —
+    через матрицу Q или depth = focal * baseline / disparity.
     """
-    h, w = disp_float.shape
-    if not (0 <= x < w and 0 <= y < h):
-        return None, None
-
-    r = max(window // 2, 0)
-    y0, y1 = max(0, y - r), min(h, y + r + 1)
-    x0, x1 = max(0, x - r), min(w, x + r + 1)
-    patch = disp_float[y0:y1, x0:x1]
-
-    valid = patch[patch > 0]
-    if valid.size == 0:
-        return None, None
-    disp = float(np.median(valid))
-
-    if Q is not None:
-        vec = np.array([[x], [y], [disp], [1.0]], dtype=np.float64)
-        xyzw = Q @ vec
-        wv = xyzw[3, 0]
-        if abs(wv) < 1e-9:
-            return None, disp
-        z = float(xyzw[2, 0] / wv)
-        return z, disp
-    if focal is not None and baseline is not None:
-        return focal * baseline / disp, disp
-    return None, disp
+    return robust_measure_depth(
+        disp_float, x, y, window, Q, focal, baseline
+    )
 
 
 def measure_roi_distance(
@@ -514,10 +579,47 @@ class StereoProcessResult:
     timings: dict[str, float] = field(default_factory=dict)
 
 
-def compute_stereo_disparity(
-    left_path: str,
-    right_path: str,
+def _run_matcher(
+    left: np.ndarray,
+    right: np.ndarray,
     *,
+    method: str,
+    min_disparity: int,
+    num_disparities: int,
+    block_size: int,
+    wls: bool,
+    wls_lambda: float,
+    wls_sigma: float,
+) -> tuple[np.ndarray, object]:
+    """Возвращает (disp_raw fixed-point*16, matcher)."""
+    width = int(left.shape[1])
+    min_disparity, num_disparities = clamp_sgbm_range(
+        min_disparity, num_disparities, width, max_num=512
+    )
+    if num_disparities < 16 or min_disparity + num_disparities >= width:
+        raise ValueError(
+            f"Некорректный диапазон SGBM: min={min_disparity}, "
+            f"num={num_disparities}, width={width}."
+        )
+    if method == "sgbm":
+        matcher = build_sgbm(min_disparity, num_disparities, block_size)
+    else:
+        matcher = build_bm(num_disparities, block_size)
+        if min_disparity != 0:
+            # StereoBM в OpenCV не поддерживает произвольный minDisparity так же гибко.
+            pass
+    disp = matcher.compute(left, right)
+    if wls:
+        disp = apply_wls(matcher, disp, left, right, wls_lambda, wls_sigma)
+    return disp, matcher
+
+
+def compute_stereo_disparity(
+    left_path: str | None = None,
+    right_path: str | None = None,
+    *,
+    left_gray: np.ndarray | None = None,
+    right_gray: np.ndarray | None = None,
     method: str = "sgbm",
     num_disparities: int = 128,
     block_size: int = 5,
@@ -529,8 +631,20 @@ def compute_stereo_disparity(
     calib_path: str | None = None,
     threads: int = 0,
     workers: int = 2,
+    auto_disparity: bool = False,
+    z_near_m: float = 8.0,
+    z_far_m: float = 40.0,
+    fuse_disparity: bool = True,
 ) -> StereoProcessResult:
-    """Строит карту диспаритета по паре изображений (с параллелизмом и таймингами)."""
+    """Строит карту диспаритета по паре изображений (с параллелизмом и таймингами).
+
+    Источник: либо пути left_path/right_path, либо готовые left_gray/right_gray
+    (например после split_sbs / load_sbs_gray_pair).
+
+    При auto_disparity + calib подбирает диапазон под z_near_m…z_far_m.
+    Если диапазон широкий — по умолчанию два прохода SGBM (ближний/дальний)
+    и склейка, иначе дальние объекты пропадают при большом num_disparities.
+    """
     log: list[str] = []
     timings: dict[str, float] = {}
     t_all = time.perf_counter()
@@ -541,6 +655,18 @@ def compute_stereo_disparity(
         raise ValueError("--block-size должен быть нечётным.")
     if workers < 1:
         raise ValueError("--workers должен быть >= 1.")
+    has_arrays = left_gray is not None and right_gray is not None
+    has_paths = left_path is not None and right_path is not None
+    if has_arrays == has_paths:
+        raise ValueError(
+            "Укажите либо пути left/right, либо массивы left_gray/right_gray."
+        )
+    if auto_disparity and not calib_path:
+        log.append(
+            "Предупреждение: --auto-disparity без --calib — "
+            "используются --min-disparity/--num-disparities."
+        )
+        auto_disparity = False
 
     opencv_threads = configure_opencv_threads(threads)
     timings["opencv_threads"] = float(opencv_threads)
@@ -550,9 +676,18 @@ def compute_stereo_disparity(
     )
 
     pool = ThreadPoolExecutor(max_workers=workers)
+    calib = None
     try:
         t0 = time.perf_counter()
-        left, right = load_gray_pair(left_path, right_path, pool)
+        if has_arrays:
+            left = np.ascontiguousarray(left_gray)
+            right = np.ascontiguousarray(right_gray)
+            if left.ndim == 3:
+                left = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
+            if right.ndim == 3:
+                right = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
+        else:
+            left, right = load_gray_pair(left_path, right_path, pool)
         timings["load"] = time.perf_counter() - t0
 
         if left.shape != right.shape:
@@ -573,26 +708,103 @@ def compute_stereo_disparity(
             timings["rectify"] = time.perf_counter() - t0
             rectified = True
 
-        if method == "sgbm":
-            matcher = build_sgbm(min_disparity, num_disparities, block_size)
-        else:
-            matcher = build_bm(num_disparities, block_size)
+        use_fuse = False
+        vis_min, vis_num = min_disparity, num_disparities
+        if auto_disparity and calib is not None:
+            width = int(left.shape[1])
+            single_min, single_num, range_log = estimate_disparity_range_bounds(
+                calib,
+                z_near_m,
+                z_far_m,
+                image_width=width,
+            )
+            log.append(range_log)
+            # Широкий динамический диапазон (напр. 10–30 м) → два прохода.
+            focal, baseline = extract_calib_geometry(calib)
+            d_near = focal * baseline / max(z_near_m * 1000.0, 1.0)
+            d_far = focal * baseline / max(z_far_m * 1000.0, 1.0)
+            wide = (d_near / max(d_far, 1.0) >= 2.2) or single_num >= 256
+            use_fuse = bool(fuse_disparity and method == "sgbm" and wide)
+            if use_fuse:
+                (far_min, far_num), (near_min, near_num), fuse_log = split_near_far_bands(
+                    calib, z_near_m, z_far_m, image_width=width
+                )
+                log.append(fuse_log)
+                vis_min, vis_num = 0, max(far_min + far_num, near_min + near_num)
+                vis_num = int(np.ceil(vis_num / 16) * 16)
+            else:
+                min_disparity, num_disparities = single_min, single_num
+                vis_min, vis_num = min_disparity, num_disparities
+                use_fuse = False
 
-        log.append(f"Вычисление диспаритета методом {method.upper()}...")
         t0 = time.perf_counter()
-        disp = matcher.compute(left, right)
+        if use_fuse:
+            log.append(
+                f"Вычисление диспаритета (двухполосный {method.upper()})..."
+            )
+            disp_far_raw, matcher = _run_matcher(
+                left,
+                right,
+                method=method,
+                min_disparity=far_min,
+                num_disparities=far_num,
+                block_size=block_size,
+                wls=wls,
+                wls_lambda=wls_lambda,
+                wls_sigma=wls_sigma,
+            )
+            disp_near_raw, _ = _run_matcher(
+                left,
+                right,
+                method=method,
+                min_disparity=near_min,
+                num_disparities=near_num,
+                block_size=block_size,
+                wls=wls,
+                wls_lambda=wls_lambda,
+                wls_sigma=wls_sigma,
+            )
+            far_f = disp_far_raw.astype(np.float32) / 16.0
+            near_f = disp_near_raw.astype(np.float32) / 16.0
+            split_d = 0.5 * (
+                float(far_min + far_num) * 0.65 + float(near_min) * 0.35
+            )
+            # Порог склейки: диспаритет на ~z_split (ближе к ближней зоне).
+            if calib is not None:
+                focal, baseline = extract_calib_geometry(calib)
+                z_split = min(
+                    max(0.5 * (z_near_m + z_far_m), z_near_m * 1.6),
+                    z_far_m * 0.7,
+                )
+                split_d = focal * baseline / (z_split * 1000.0)
+            disp_float = fuse_disparity_maps(far_f, near_f, split_disp=split_d)
+            # Для визуализации / WLS-совместимости собираем fixed-point из float.
+            disp = (disp_float * 16.0).astype(np.int16)
+            min_disparity, num_disparities = vis_min, vis_num
+        else:
+            log.append(
+                f"Вычисление диспаритета методом {method.upper()} "
+                f"(min={min_disparity}, num={num_disparities})..."
+            )
+            disp, matcher = _run_matcher(
+                left,
+                right,
+                method=method,
+                min_disparity=min_disparity,
+                num_disparities=num_disparities,
+                block_size=block_size,
+                wls=wls,
+                wls_lambda=wls_lambda,
+                wls_sigma=wls_sigma,
+            )
+            disp_float = disp.astype(np.float32) / 16.0
         timings["sgbm"] = time.perf_counter() - t0
-
         if wls:
-            log.append("Применение WLS-фильтра...")
-            t0 = time.perf_counter()
-            disp = apply_wls(matcher, disp, left, right, wls_lambda, wls_sigma)
-            timings["wls"] = time.perf_counter() - t0
+            timings["wls"] = timings.get("wls", 0.0)
 
         t0 = time.perf_counter()
         disp_vis = normalize_disparity(disp, min_disparity, num_disparities)
         disp_color = cv2.applyColorMap(disp_vis, get_colormap(colormap))
-        disp_float = disp.astype(np.float32) / 16.0
         timings["visualize"] = time.perf_counter() - t0
     finally:
         pool.shutdown(wait=False)
@@ -633,22 +845,48 @@ def main() -> None:
     if (args.depth or args.point_cloud) and not args.calib:
         sys.exit("Ошибка: --depth и --point-cloud требуют указания --calib.")
 
+    use_sbs = args.sbs is not None
+    use_pair = args.left is not None or args.right is not None
+    if use_sbs and use_pair:
+        sys.exit("Ошибка: укажите либо --sbs, либо пару --left/--right, не оба варианта.")
+    if not use_sbs and (not args.left or not args.right):
+        sys.exit("Ошибка: укажите --left и --right либо одно SBS-фото через --sbs.")
+
+    if args.z_near <= 0 or args.z_far <= 0 or args.z_near >= args.z_far:
+        sys.exit("Ошибка: нужно 0 < --z-near < --z-far (дистанции в метрах).")
+
+    common_kwargs = dict(
+        method=args.method,
+        num_disparities=args.num_disparities,
+        block_size=args.block_size,
+        min_disparity=args.min_disparity,
+        wls=args.wls,
+        wls_lambda=args.wls_lambda,
+        wls_sigma=args.wls_sigma,
+        colormap=args.colormap,
+        calib_path=args.calib,
+        threads=args.threads,
+        workers=args.workers,
+        auto_disparity=args.auto_disparity,
+        z_near_m=args.z_near,
+        z_far_m=args.z_far,
+        fuse_disparity=args.fuse_disparity,
+    )
+
     try:
-        result = compute_stereo_disparity(
-            args.left,
-            args.right,
-            method=args.method,
-            num_disparities=args.num_disparities,
-            block_size=args.block_size,
-            min_disparity=args.min_disparity,
-            wls=args.wls,
-            wls_lambda=args.wls_lambda,
-            wls_sigma=args.wls_sigma,
-            colormap=args.colormap,
-            calib_path=args.calib,
-            threads=args.threads,
-            workers=args.workers,
-        )
+        if use_sbs:
+            left_g, right_g = load_sbs_gray_pair(args.sbs, swap_lr=args.swap_lr)
+            result = compute_stereo_disparity(
+                left_gray=left_g,
+                right_gray=right_g,
+                **common_kwargs,
+            )
+        else:
+            result = compute_stereo_disparity(
+                args.left,
+                args.right,
+                **common_kwargs,
+            )
     except ValueError as exc:
         sys.exit(f"Ошибка: {exc}")
 

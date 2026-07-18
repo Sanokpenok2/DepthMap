@@ -23,16 +23,22 @@ python app.py
 при необходимости файл `.npz` от калибровки и нажмите «Построить».
 Клик по карте диспаритета показывает расстояние (нужна калибровка или focal/baseline).
 
-## Трекинг объекта по SBS-видео
+## Трекинг объекта по стерео-видео
 
-Скрипт `video_track_depth.py` берёт **одно SBS-видео** (side-by-side): левая
-половина кадра — левая камера, правая половина — правая. Даёт выбрать объект
-на первом кадре, сопровождает его трекером и считает расстояние по медиане
-диспаритета внутри ROI.
+Скрипт `video_track_depth.py` принимает либо **одно SBS-видео** (кадр
+пополам: L|R), либо **два отдельных** файла левой и правой камеры. Даёт
+выбрать объект на левом кадре, сопровождает его трекером и считает расстояние
+по медиане диспаритета внутри ROI.
 
 ```bash
 python video_track_depth.py ^
     --video stereo_sbs.mp4 ^
+    --calib stereo_calib.npz
+```
+
+```bash
+python video_track_depth.py ^
+    --left-video left.mp4 --right-video right.mp4 ^
     --calib stereo_calib.npz
 ```
 
@@ -49,8 +55,11 @@ python video_track_depth.py ^
 | Параметр | Описание | По умолчанию |
 |---|---|---|
 | `--video` | SBS-файл (левая половина — левая камера) | — |
-| `--swap-lr` | Поменять половины местами | выкл. |
+| `--left-video` / `--right-video` | Пара отдельных видео вместо `--video` | — |
+| `--swap-lr` | Поменять L/R местами (половины или потоки) | выкл. |
 | `--calib` | Калибровка `.npz` (обязательна, кроме `--track-only`) | — |
+| `--auto-disparity` / `--no-auto-disparity` | Подстраивать диапазон диспаритета при приближении объекта | вкл. |
+| `--z-near` / `--z-far` | Ожидаемый диапазон дистанций, м | `5` / `40` |
 | `--tracker` | `csrt`, `kcf` или `mosse` | `csrt` |
 | `--roi-smooth` | Сглаживание рамки `[0..1)`: больше = плавнее (больше лаг) | `0.3` |
 | `--lock-size` / `--no-lock-size` | Фиксировать размер рамки (резкое сжатие → LOST) | вкл. |
@@ -151,6 +160,12 @@ ok, roi = trk.update(next_frame)
 python depth_map.py --left left.png --right right.png --output disparity.png
 ```
 
+Или одно **SBS-фото** (side-by-side: левая/правая половины кадра):
+
+```bash
+python depth_map.py --sbs stereo_sbs.png --calib stereo_calib.npz --wls --show
+```
+
 С WLS-фильтром (сглаживание, заполнение пропусков) и просмотром результата:
 
 ```bash
@@ -167,13 +182,18 @@ python depth_map.py -l left.png -r right.png --save-raw disparity.npy
 
 | Параметр | Описание | По умолчанию |
 |---|---|---|
-| `-l, --left` | Левое изображение (обязательно) | — |
-| `-r, --right` | Правое изображение (обязательно) | — |
+| `-l, --left` | Левое изображение (или используйте `--sbs`) | — |
+| `-r, --right` | Правое изображение (или используйте `--sbs`) | — |
+| `--sbs` | SBS-фото (левая/правая половины кадра) | — |
+| `--swap-lr` | Поменять половины SBS местами | выкл. |
 | `-o, --output` | Файл цветной карты глубины | `disparity.png` |
 | `--method` | Алгоритм: `sgbm` или `bm` | `sgbm` |
-| `--num-disparities` | Диапазон диспаритетов (кратен 16) | `128` |
+| `--num-disparities` | Диапазон диспаритетов (кратен 16); при `--auto-disparity` не нужен | `128` |
 | `--block-size` | Размер блока (нечётный) | `5` |
-| `--min-disparity` | Минимальный диспаритет | `0` |
+| `--min-disparity` | Минимальный диспаритет; при `--auto-disparity` не нужен | `0` |
+| `--auto-disparity` / `--no-auto-disparity` | Подбор диапазона по `--calib` и `--z-near/--z-far` | вкл. |
+| `--z-near` / `--z-far` | Ожидаемый диапазон дистанций сцены, м | `5` / `40` |
+| `--fuse-disparity` / `--no-fuse-disparity` | Два прохода SGBM (ближний+дальний) при широком диапазоне | вкл. |
 | `--wls` | Включить WLS-фильтр | выкл. |
 | `--wls-lambda` | Сила сглаживания WLS | `8000` |
 | `--wls-sigma` | Чувствительность к границам WLS | `1.5` |
@@ -190,6 +210,26 @@ python depth_map.py -l left.png -r right.png --save-raw disparity.npy
 | `--max-display` | Макс. сторона окна предпросмотра (большие фото ужимаются) | `1200` |
 | `--threads` | Потоки OpenCV для SGBM/remap (`0` = все ядра) | `0` |
 | `--workers` | Параллельная загрузка и ректификация L/R | `2` |
+
+## Диапазон диспаритета и дистанции 10–30 м
+
+Ближе объект → **больше** диспаритет. Один фиксированный `--num-disparities`
+не закрывает широкий диапазон дистанций:
+- малое значение (128) — видит ~30 м, но «слепнет» на 10 м;
+- большое (512) — видит ближних, но дальние часто пропадают из‑за ложных
+  совпадений на огромном диапазоне поиска.
+
+По умолчанию при наличии `--calib` включён `--auto-disparity`: диапазон
+считается из `--z-near`/`--z-far` (метры). Если диапазон широкий, включается
+двухполосный SGBM (`--fuse-disparity`) — отдельно ближняя и дальняя полосы,
+затем склейка.
+
+```bash
+python depth_map.py --sbs scene.png --calib stereo_calib.npz ^
+    --z-near 8 --z-far 40 --wls --show
+```
+
+Чтобы задать диапазон вручную, как раньше: `--no-auto-disparity --num-disparities 256`.
 
 ## Измерение расстояния до объекта
 
@@ -226,11 +266,19 @@ python depth_map.py -l left.png -r right.png --focal 700 --baseline 60 \
 углов). Печатайте в масштабе 100% и после печати проверьте размер клетки
 линейкой — это значение и укажите в `--square-size`.
 
-1. Выполните стереокалибровку:
+1. Выполните стереокалибровку по **отдельным** кадрам:
 
 ```bash
 python calibrate_stereo.py --left "calib/left_*.png" --right "calib/right_*.png" --cols 9 --rows 6 --square-size 25 --output stereo_calib.npz
 ```
+
+Или по **SBS-фото** шахматной доски (то же разрешение половин, что потом в depth/video):
+
+```bash
+python calibrate_stereo.py --sbs "calib/sbs_*.png" --cols 9 --rows 6 --square-size 25 --output stereo_calib.npz
+```
+
+Если левая камера оказалась справа в кадре — добавьте `--swap-lr`.
 
 Здесь `--cols`/`--rows` — число **внутренних** углов доски, `--square-size` —
 размер клетки в мм (задаёт масштаб глубины). Программа выведет RMS-ошибку
@@ -253,6 +301,13 @@ python calibrate_stereo.py --left "calib/left_*.png" --right "calib/right_*.png"
 
 ```bash
 python depth_map.py -l left.png -r right.png --calib stereo_calib.npz \
+    --wls --depth depth.npy --point-cloud cloud.ply -o disparity.png
+```
+
+То же для SBS-снимка:
+
+```bash
+python depth_map.py --sbs scene_sbs.png --calib stereo_calib.npz \
     --wls --depth depth.npy --point-cloud cloud.ply -o disparity.png
 ```
 

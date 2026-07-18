@@ -1,20 +1,19 @@
 """
-Трекинг объекта по одному SBS-видео (side-by-side) с измерением расстояния.
+Трекинг объекта по стерео-видео с измерением расстояния.
 
-Вход — один видеофайл, где кадр разрезан пополам: левая половина = левая
-камера, правая половина = правая камера. Пользователь выделяет объект на
-первом кадре (левая половина). Дальше объект сопровождается трекером
-(CSRT/KCF), а расстояние считается по медиане диспаритета внутри ROI.
+Вход — либо одно SBS-видео (кадр пополам: L|R), либо два отдельных файла
+(--left-video / --right-video). Пользователь выделяет объект на левом кадре;
+дальше объект сопровождается трекером, расстояние — по медиане диспаритета в ROI.
 
 Ускорение на CPU:
   - cv2.setNumThreads — внутренний параллелизм OpenCV (SGBM, remap);
   - параллельная подготовка левого/правого кадра;
   - асинхронный SGBM в фоне, чтобы трекинг не ждал каждый тяжёлый кадр.
 
-Пример:
-    python video_track_depth.py ^
-        --video stereo_sbs.mp4 ^
-        --calib stereo_calib.npz --threads 0 --async-sgbm
+Примеры:
+    python video_track_depth.py --video stereo_sbs.mp4 --calib stereo_calib.npz
+    python video_track_depth.py --left-video left.mp4 --right-video right.mp4 ^
+        --calib stereo_calib.npz
 
 Управление:
     пробел  — пауза/продолжить
@@ -43,25 +42,42 @@ from depth_map import (
     fit_for_display,
     load_calibration,
     measure_roi_distance,
+    split_sbs,
 )
 from object_tracker import ObjectTracker
 from calib_quality import format_quality_report
+from stereo_auto import (
+    clamp_sgbm_range,
+    disparity_from_depth,
+    estimate_disparity_range_bounds,
+    extract_calib_geometry,
+)
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Трекинг объекта по SBS-видео со стерео-расстоянием.",
+        description="Трекинг объекта по стерео-видео (SBS или пара L/R) со стерео-расстоянием.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
         "--video",
-        required=True,
+        default=None,
         help="SBS-видео: левая половина кадра — левая камера, правая — правая.",
+    )
+    p.add_argument(
+        "--left-video",
+        default=None,
+        help="Видео левой камеры (вместе с --right-video вместо --video).",
+    )
+    p.add_argument(
+        "--right-video",
+        default=None,
+        help="Видео правой камеры (вместе с --left-video вместо --video).",
     )
     p.add_argument(
         "--swap-lr",
         action="store_true",
-        help="Поменять половины местами (если левая камера справа).",
+        help="Поменять L/R местами (половины SBS или потоки left/right).",
     )
     p.add_argument(
         "--calib",
@@ -74,9 +90,41 @@ def parse_args() -> argparse.Namespace:
         default="sgbm",
         help="Алгоритм сопоставления.",
     )
-    p.add_argument("--num-disparities", type=int, default=128)
+    p.add_argument(
+        "--num-disparities",
+        type=int,
+        default=128,
+        help="Диапазон диспаритетов (кратен 16). При --auto-disparity — стартовое значение.",
+    )
     p.add_argument("--block-size", type=int, default=5)
-    p.add_argument("--min-disparity", type=int, default=0)
+    p.add_argument(
+        "--min-disparity",
+        type=int,
+        default=0,
+        help="Мин. диспаритет. При --auto-disparity подбирается автоматически.",
+    )
+    p.add_argument(
+        "--auto-disparity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Подбирать и расширять диапазон диспаритета по --z-near/--z-far и "
+            "текущей дистанции объекта (нужен --calib). Иначе диапазон фиксирован "
+            "и при приближении измерение портится."
+        ),
+    )
+    p.add_argument(
+        "--z-near",
+        type=float,
+        default=5.0,
+        help="Ближняя дистанция сцены, м (для --auto-disparity).",
+    )
+    p.add_argument(
+        "--z-far",
+        type=float,
+        default=40.0,
+        help="Дальняя дистанция сцены, м (для --auto-disparity).",
+    )
     p.add_argument("--wls", action="store_true", help="WLS-фильтр (медленнее).")
     p.add_argument("--wls-lambda", type=float, default=8000.0)
     p.add_argument("--wls-sigma", type=float, default=1.5)
@@ -96,7 +144,7 @@ def parse_args() -> argparse.Namespace:
         "--lock-size",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Фиксировать размер рамки трекинга (двигается только центр). Резкое сжатие → LOST.",
+        help="Фиксировать размер рамки трекинга (двигается только центр). Резкое сжатие -> LOST.",
     )
     p.add_argument(
         "--keep-aspect",
@@ -114,7 +162,7 @@ def parse_args() -> argparse.Namespace:
         "--max-size-ratio",
         type=float,
         default=1.6,
-        help="Макс. изменение площади рамки за кадр (1.6 ≈ ±60%%); иначе LOST.",
+        help="Макс. изменение площади рамки за кадр (1.6 ~ +/-60%%); иначе LOST.",
     )
     p.add_argument(
         "--verify",
@@ -271,6 +319,66 @@ def open_video(path: str) -> cv2.VideoCapture:
     return cap
 
 
+class StereoFrameSource:
+    """Читает стереопары из SBS-файла или из двух отдельных видео."""
+
+    def __init__(
+        self,
+        *,
+        sbs_path: str | None = None,
+        left_path: str | None = None,
+        right_path: str | None = None,
+        swap_lr: bool = False,
+    ) -> None:
+        self.swap_lr = bool(swap_lr)
+        self._cap_sbs: cv2.VideoCapture | None = None
+        self._cap_l: cv2.VideoCapture | None = None
+        self._cap_r: cv2.VideoCapture | None = None
+
+        if sbs_path:
+            self.mode = "sbs"
+            self._cap_sbs = open_video(sbs_path)
+            self._primary = self._cap_sbs
+        elif left_path and right_path:
+            self.mode = "dual"
+            self._cap_l = open_video(left_path)
+            self._cap_r = open_video(right_path)
+            self._primary = self._cap_l
+        else:
+            raise ValueError("Нужен --video либо пара --left-video/--right-video.")
+
+    @property
+    def fps(self) -> float:
+        return float(max(self._primary.get(cv2.CAP_PROP_FPS), 1.0))
+
+    def read(self) -> tuple[bool, np.ndarray | None, np.ndarray | None]:
+        if self.mode == "sbs":
+            assert self._cap_sbs is not None
+            ok, frame = self._cap_sbs.read()
+            if not ok or frame is None:
+                return False, None, None
+            left, right = split_sbs(frame, swap_lr=False)
+        else:
+            assert self._cap_l is not None and self._cap_r is not None
+            ok_l, left = self._cap_l.read()
+            ok_r, right = self._cap_r.read()
+            if not ok_l or not ok_r or left is None or right is None:
+                return False, None, None
+            if left.shape[:2] != right.shape[:2]:
+                # Подгоняем правый кадр под размер левого (если чуть разъехались).
+                right = cv2.resize(
+                    right, (left.shape[1], left.shape[0]), interpolation=cv2.INTER_AREA
+                )
+        if self.swap_lr:
+            left, right = right, left
+        return True, left, right
+
+    def release(self) -> None:
+        for cap in (self._cap_sbs, self._cap_l, self._cap_r):
+            if cap is not None:
+                cap.release()
+
+
 def to_gray(frame: np.ndarray) -> np.ndarray:
     if frame.ndim == 2:
         return frame
@@ -327,30 +435,6 @@ def prepare_pair(
     return fut_l.result(), fut_r.result()
 
 
-def split_sbs(
-    frame: np.ndarray, swap_lr: bool = False
-) -> tuple[np.ndarray, np.ndarray]:
-    """Разрезает SBS-кадр пополам по ширине на левую и правую камеры."""
-    w = frame.shape[1]
-    half = w // 2
-    left = frame[:, :half]
-    right = frame[:, half : half * 2]
-    if swap_lr:
-        left, right = right, left
-    return np.ascontiguousarray(left), np.ascontiguousarray(right)
-
-
-def read_sbs(
-    cap: cv2.VideoCapture, swap_lr: bool = False
-) -> tuple[bool, np.ndarray | None, np.ndarray | None]:
-    """Читает один SBS-кадр и делит его на левую/правую половины."""
-    ok, frame = cap.read()
-    if not ok or frame is None:
-        return False, None, None
-    left, right = split_sbs(frame, swap_lr)
-    return True, left, right
-
-
 def compute_disparity(
     left_gray: np.ndarray,
     right_gray: np.ndarray,
@@ -366,6 +450,91 @@ def compute_disparity(
     return disp.astype(np.float32) / 16.0
 
 
+def make_stereo_matcher(
+    method: str, min_disparity: int, num_disparities: int, block_size: int
+):
+    if method == "sgbm":
+        return build_sgbm(min_disparity, num_disparities, block_size)
+    return build_bm(num_disparities, block_size)
+
+
+def adapt_disparity_range(
+    *,
+    calib: dict,
+    image_width: int,
+    z_near_m: float,
+    z_far_m: float,
+    cur_min: int,
+    cur_num: int,
+    distance_mm: float | None,
+    disparity_px: float | None,
+) -> tuple[int, int, str | None]:
+    """Расширяет диапазон, если объект приблизился или диспаритет упёрся в потолок."""
+    width = max(int(image_width), 32)
+    upper = float(cur_min + cur_num)
+    saturating = (
+        disparity_px is not None
+        and np.isfinite(disparity_px)
+        and disparity_px > 0.75 * upper
+    )
+
+    z_m = None
+    if distance_mm is not None and np.isfinite(distance_mm) and distance_mm > 0:
+        z_m = float(distance_mm) / 1000.0
+
+    if not saturating and z_m is None:
+        return cur_min, cur_num, None
+
+    focal, baseline = extract_calib_geometry(calib)
+    if z_m is not None:
+        # Запас «ближе текущего»: иначе при подходе d выходит за num_disparities.
+        z_lo = max(min(z_near_m, z_m * 0.45), 0.5)
+        z_hi = min(z_far_m, max(z_m * 1.8, z_m + 5.0))
+    else:
+        z_lo, z_hi = z_near_m, z_far_m
+
+    if saturating:
+        # Форсируем более ближнюю зону.
+        z_lo = max(0.5, min(z_lo, z_near_m))
+        if z_m is not None:
+            z_lo = max(0.5, min(z_lo, z_m * 0.35))
+
+    if z_lo >= z_hi:
+        z_lo, z_hi = z_near_m, z_far_m
+
+    new_min, new_num, _ = estimate_disparity_range_bounds(
+        calib, z_lo, z_hi, image_width=width
+    )
+    new_min, new_num = clamp_sgbm_range(new_min, new_num, width, max_num=512)
+
+    # При насыщении гарантированно расширяем верхнюю границу.
+    if saturating and disparity_px is not None:
+        need_upper = float(disparity_px) * 1.35 + 16.0
+        if new_min + new_num < need_upper:
+            span = need_upper - float(new_min)
+            from stereo_auto import round_num_disparities
+
+            new_num = round_num_disparities(span, min_val=64, max_val=512)
+            new_min, new_num = clamp_sgbm_range(new_min, new_num, width, max_num=512)
+
+    if new_min == cur_min and new_num == cur_num:
+        return cur_min, cur_num, None
+    # Не сужаем сильно, пока объект может ещё подойти ближе.
+    if new_min + new_num < cur_min + cur_num and not saturating:
+        d_need = disparity_from_depth(focal, baseline, max(z_lo, 0.5) * 1000.0)
+        if d_need <= 0.9 * upper:
+            return cur_min, cur_num, None
+
+    log = (
+        f"Диапазон диспаритета: min={new_min}, num={new_num} "
+        f"(было {cur_min}+{cur_num}"
+        + (f", Z~{z_m:.1f} м" if z_m is not None else "")
+        + (", насыщение" if saturating else "")
+        + ")."
+    )
+    return new_min, new_num, log
+
+
 def draw_overlay(
     frame_bgr: np.ndarray,
     roi: tuple[int, int, int, int] | None,
@@ -375,6 +544,7 @@ def draw_overlay(
     frame_idx: int,
     fps: float,
     sgbm_busy: bool = False,
+    disp_range: tuple[int, int] | None = None,
 ) -> np.ndarray:
     out = frame_bgr.copy()
     if roi is not None:
@@ -394,6 +564,8 @@ def draw_overlay(
         lines.append("distance n/a")
     if disparity is not None:
         lines.append(f"disp {disparity:.1f} px")
+    if disp_range is not None:
+        lines.append(f"range {disp_range[0]}+{disp_range[1]}")
     if sgbm_busy:
         lines.append("SGBM...")
     if roi is None:
@@ -467,6 +639,27 @@ def main() -> None:
         sys.exit("Ошибка: --roi-smooth должен быть в диапазоне [0.0, 1.0).")
     if not 0.0 <= args.reacquire_threshold <= 1.0:
         sys.exit("Ошибка: --reacquire-threshold должен быть в диапазоне [0.0, 1.0].")
+    if args.z_near <= 0 or args.z_far <= 0 or args.z_near >= args.z_far:
+        sys.exit("Ошибка: нужно 0 < --z-near < --z-far (дистанции в метрах).")
+
+    use_sbs = args.video is not None
+    use_dual = args.left_video is not None or args.right_video is not None
+    if use_sbs and use_dual:
+        sys.exit(
+            "Ошибка: укажите либо --video (SBS), либо пару --left-video/--right-video."
+        )
+    if use_sbs:
+        source = StereoFrameSource(sbs_path=args.video, swap_lr=args.swap_lr)
+    elif args.left_video and args.right_video:
+        source = StereoFrameSource(
+            left_path=args.left_video,
+            right_path=args.right_video,
+            swap_lr=args.swap_lr,
+        )
+    else:
+        sys.exit(
+            "Ошибка: укажите --video (SBS) либо оба --left-video и --right-video."
+        )
 
     opencv_threads = configure_threads(args.threads)
     print(
@@ -493,14 +686,9 @@ def main() -> None:
     elif track_only:
         print("Калибровка не задана — трекинг по «сырым» кадрам без ректификации.")
 
-    if not track_only:
-        Q = calib["Q"]
-        if args.method == "sgbm":
-            matcher = build_sgbm(
-                args.min_disparity, args.num_disparities, args.block_size
-            )
-        else:
-            matcher = build_bm(args.num_disparities, args.block_size)
+    disp_min = int(args.min_disparity)
+    disp_num = int(args.num_disparities)
+    auto_disp = bool(args.auto_disparity) and not track_only
 
     prep_pool = ThreadPoolExecutor(max_workers=args.workers)
     # Отдельный пул на 1 поток: matcher.compute не запускаем параллельно самому себе.
@@ -509,14 +697,45 @@ def main() -> None:
     )
     sgbm_future: Future | None = None
 
-    cap = open_video(args.video)
-
-    ok, frame_l, frame_r = read_sbs(cap, args.swap_lr)
+    ok, frame_l, frame_r = source.read()
     if not ok or frame_l is None or frame_r is None:
-        sys.exit("Ошибка: не удалось прочитать первый кадр SBS-видео.")
+        source.release()
+        sys.exit("Ошибка: не удалось прочитать первый кадр видео.")
+
+    print(
+        f"Источник кадров: {'SBS ' + args.video if use_sbs else f'L={args.left_video}, R={args.right_video}'}"
+    )
 
     rect_l, rect_r = prepare_pair(frame_l, frame_r, calib, prep_pool)
     rect_l_bgr = cv2.cvtColor(rect_l, cv2.COLOR_GRAY2BGR)
+
+    if not track_only:
+        Q = calib["Q"]
+        if auto_disp and calib is not None:
+            disp_min, disp_num, range_log = estimate_disparity_range_bounds(
+                calib,
+                args.z_near,
+                args.z_far,
+                image_width=int(rect_l.shape[1]),
+            )
+            disp_min, disp_num = clamp_sgbm_range(
+                disp_min, disp_num, int(rect_l.shape[1]), max_num=512
+            )
+            print(range_log)
+        else:
+            if args.auto_disparity and calib is None:
+                print(
+                    "Предупреждение: --auto-disparity без --calib — "
+                    "фиксированный --num-disparities."
+                )
+                auto_disp = False
+            print(
+                f"Фиксированный диапазон диспаритета: "
+                f"min={disp_min}, num={disp_num}."
+            )
+        matcher = make_stereo_matcher(
+            args.method, disp_min, disp_num, args.block_size
+        )
 
     # ROI можно выбрать в любой момент клавишей R — на старте объекта нет.
     tracker = ObjectTracker(
@@ -554,7 +773,7 @@ def main() -> None:
         writer = cv2.VideoWriter(
             args.output,
             fourcc,
-            max(cap.get(cv2.CAP_PROP_FPS), 1.0),
+            source.fps,
             (rect_l_bgr.shape[1], rect_l_bgr.shape[0]),
         )
 
@@ -577,7 +796,7 @@ def main() -> None:
         while True:
             if not paused:
                 if frame_idx > 0:
-                    ok, frame_l, frame_r = read_sbs(cap, args.swap_lr)
+                    ok, frame_l, frame_r = source.read()
                     if not ok or frame_l is None or frame_r is None:
                         print("Конец видео.")
                         break
@@ -627,6 +846,32 @@ def main() -> None:
                         if roi is not None and disp_float is not None:
                             dist, disp_val = measure_roi_distance(disp_float, roi, Q=Q)
                             dist_s = smoothed_value(history, dist, args.smooth)
+                            # При приближении объекта расширяем диапазон SGBM.
+                            if auto_disp and calib is not None and (
+                                sgbm_future is None or sgbm_future.done()
+                            ):
+                                if sgbm_future is not None and sgbm_future.done():
+                                    disp_float = sgbm_future.result()
+                                    sgbm_future = None
+                                new_min, new_num, adapt_log = adapt_disparity_range(
+                                    calib=calib,
+                                    image_width=int(rect_l.shape[1]),
+                                    z_near_m=args.z_near,
+                                    z_far_m=args.z_far,
+                                    cur_min=disp_min,
+                                    cur_num=disp_num,
+                                    distance_mm=dist_s if dist_s is not None else dist,
+                                    disparity_px=disp_val,
+                                )
+                                if adapt_log is not None:
+                                    disp_min, disp_num = new_min, new_num
+                                    matcher = make_stereo_matcher(
+                                        args.method,
+                                        disp_min,
+                                        disp_num,
+                                        args.block_size,
+                                    )
+                                    print(adapt_log)
                         else:
                             dist_s = smoothed_value(history, None, args.smooth)
                             disp_val = None
@@ -644,6 +889,7 @@ def main() -> None:
                     frame_idx,
                     fps,
                     sgbm_busy=sgbm_busy,
+                    disp_range=(disp_min, disp_num) if not track_only else None,
                 )
                 if writer is not None:
                     writer.write(overlay)
@@ -697,6 +943,26 @@ def main() -> None:
                         )
                         dist, disp_val = measure_roi_distance(disp_float, roi, Q=Q)
                         dist_s = smoothed_value(history, dist, args.smooth)
+                        if auto_disp and calib is not None:
+                            new_min, new_num, adapt_log = adapt_disparity_range(
+                                calib=calib,
+                                image_width=int(rect_l.shape[1]),
+                                z_near_m=args.z_near,
+                                z_far_m=args.z_far,
+                                cur_min=disp_min,
+                                cur_num=disp_num,
+                                distance_mm=dist_s if dist_s is not None else dist,
+                                disparity_px=disp_val,
+                            )
+                            if adapt_log is not None:
+                                disp_min, disp_num = new_min, new_num
+                                matcher = make_stereo_matcher(
+                                    args.method,
+                                    disp_min,
+                                    disp_num,
+                                    args.block_size,
+                                )
+                                print(adapt_log)
     finally:
         if sgbm_future is not None:
             try:
@@ -706,7 +972,7 @@ def main() -> None:
         prep_pool.shutdown(wait=False)
         if sgbm_pool is not None:
             sgbm_pool.shutdown(wait=False)
-        cap.release()
+        source.release()
         if writer is not None:
             writer.release()
             print(f"Видео сохранено: {Path(args.output).resolve()}")
