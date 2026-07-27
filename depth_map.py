@@ -285,11 +285,22 @@ def load_gray_pair(
     return fut_l.result(), fut_r.result()
 
 
-def build_sgbm(min_disp: int, num_disp: int, block_size: int) -> cv2.StereoSGBM:
+def build_sgbm(
+    min_disp: int,
+    num_disp: int,
+    block_size: int,
+    *,
+    uniqueness_ratio: int = 10,
+    speckle_window_size: int = 100,
+    speckle_range: int = 2,
+    mode: int | None = None,
+) -> cv2.StereoSGBM:
     # Рекомендованные параметры штрафов P1/P2 по документации OpenCV.
     channels = 1
     p1 = 8 * channels * block_size ** 2
     p2 = 32 * channels * block_size ** 2
+    if mode is None:
+        mode = cv2.STEREO_SGBM_MODE_SGBM_3WAY
     return cv2.StereoSGBM_create(
         minDisparity=min_disp,
         numDisparities=num_disp,
@@ -297,11 +308,11 @@ def build_sgbm(min_disp: int, num_disp: int, block_size: int) -> cv2.StereoSGBM:
         P1=p1,
         P2=p2,
         disp12MaxDiff=1,
-        uniquenessRatio=10,
-        speckleWindowSize=100,
-        speckleRange=2,
+        uniquenessRatio=int(uniqueness_ratio),
+        speckleWindowSize=int(speckle_window_size),
+        speckleRange=int(speckle_range),
         preFilterCap=63,
-        mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
+        mode=mode,
     )
 
 
@@ -495,6 +506,21 @@ def measure_distance(
     )
 
 
+@dataclass
+class DisparityDebugInfo:
+    """Пиксели ROI, по которым считается диспаритет/дистанция."""
+
+    inset_roi: tuple[int, int, int, int]
+    used_ys: np.ndarray  # int32, координаты в полном кадре
+    used_xs: np.ndarray
+    used_disp: np.ndarray  # float32
+    selected_disp: float | None
+    n_patch: int
+    n_valid: int
+    n_used: int
+    surface: str
+
+
 def measure_roi_distance(
     disp_float: np.ndarray,
     roi: tuple[int, int, int, int],
@@ -502,13 +528,45 @@ def measure_roi_distance(
     focal: float | None = None,
     baseline: float | None = None,
     *,
-    min_valid_fraction: float = 0.05,
-) -> tuple[float | None, float | None]:
-    """Расстояние по медиане диспаритета внутри ROI (x, y, w, h).
+    min_valid_fraction: float = 0.10,
+    inset_fraction: float = 0.30,
+    robust: bool = True,
+    prefer_near_surface: bool = False,
+    surface: str = "far",
+    max_disparity: float | None = None,
+    min_disparity: float = 0.4,
+    max_distance_mm: float | None = None,
+    collect_debug: bool = False,
+) -> (
+    tuple[float | None, float | None]
+    | tuple[float | None, float | None, DisparityDebugInfo | None]
+):
+    """Расстояние по диспаритету внутри ROI (x, y, w, h).
 
-    Возвращает (расстояние, медианный диспаритет) или (None, None), если
-    валидных пикселей слишком мало.
+    surface:
+      - \"far\"  — слегка смещён к дальнему плану (не экстремальный перцентиль)
+      - \"near\" — ближняя (больший диспаритет)
+      - \"median\" — обычная медиана (стабильнее на шумном дальнем стерео)
+
+    max_disparity: отбросить пиксели с d больше порога (ближе z_near).
+    max_distance_mm: отбросить/ограничить Z больше ожидаемого z_far.
+    collect_debug: если True, третьим элементом вернуть DisparityDebugInfo.
     """
+    if prefer_near_surface:
+        surface = "near"
+    surface = (surface or "median").lower().strip()
+    if surface not in ("far", "near", "median"):
+        surface = "median"
+
+    def _pack(
+        dist: float | None,
+        disp: float | None,
+        dbg: DisparityDebugInfo | None = None,
+    ):
+        if collect_debug:
+            return dist, disp, dbg
+        return dist, disp
+
     x, y, rw, rh = (int(v) for v in roi)
     h, w = disp_float.shape
     x0 = max(0, x)
@@ -516,14 +574,90 @@ def measure_roi_distance(
     x1 = min(w, x + max(rw, 1))
     y1 = min(h, y + max(rh, 1))
     if x1 <= x0 or y1 <= y0:
-        return None, None
+        return _pack(None, None, None)
 
+    # Сужаем ROI к центру; низ режем сильнее (дорога перед машиной).
+    inset = float(np.clip(inset_fraction, 0.0, 0.45))
+    if inset > 0:
+        bw, bh = x1 - x0, y1 - y0
+        dx = int(round(bw * inset))
+        dy = int(round(bh * inset))
+        dy_top = dy
+        dy_bot = min(bh - 1, dy + max(1, dy // 2)) if bh > 4 else dy
+        x0 = min(x1 - 1, x0 + dx)
+        x1 = max(x0 + 1, x1 - dx)
+        y0 = min(y1 - 1, y0 + dy_top)
+        y1 = max(y0 + 1, y1 - dy_bot)
+
+    inset_roi = (x0, y0, x1 - x0, y1 - y0)
     patch = disp_float[y0:y1, x0:x1]
-    valid = patch[patch > 0]
-    if valid.size < max(1, int(patch.size * min_valid_fraction)):
-        return None, None
+    finite = np.isfinite(patch) & (patch > 0)
+    if max_disparity is not None and max_disparity > 0:
+        finite &= patch <= float(max_disparity)
+    if min_disparity > 0:
+        finite &= patch >= float(min_disparity)
 
-    disp = float(np.median(valid))
+    valid = patch[finite]
+    n_patch = int(patch.size)
+    n_valid = int(valid.size)
+    if valid.size < max(1, int(patch.size * min_valid_fraction)):
+        dbg = None
+        if collect_debug:
+            dbg = DisparityDebugInfo(
+                inset_roi=inset_roi,
+                used_ys=np.zeros(0, np.int32),
+                used_xs=np.zeros(0, np.int32),
+                used_disp=np.zeros(0, np.float32),
+                selected_disp=None,
+                n_patch=n_patch,
+                n_valid=n_valid,
+                n_used=0,
+                surface=surface,
+            )
+        return _pack(None, None, dbg)
+
+    keep_mask = finite.copy()
+    if robust and valid.size >= 8:
+        q1, q3 = np.percentile(valid, [25, 75])
+        iqr = float(q3 - q1)
+        if iqr > 1e-6:
+            lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+            in_iqr = finite & (patch >= lo) & (patch <= hi)
+            if int(in_iqr.sum()) >= max(3, int(0.25 * valid.size)):
+                keep_mask = in_iqr
+                valid = patch[keep_mask]
+
+    spread = float(valid.max()) - float(valid.min())
+    multimodal = valid.size >= 12 and spread > max(0.8, 0.25 * float(np.median(valid)))
+
+    if surface == "far":
+        disp = float(np.percentile(valid, 35 if multimodal else 40))
+    elif surface == "near":
+        disp = float(np.percentile(valid, 70 if multimodal else 60))
+    else:
+        disp = float(np.median(valid))
+
+    used_ys_l, used_xs_l = np.where(keep_mask)
+    used_disp = patch[keep_mask].astype(np.float32)
+    used_ys = (used_ys_l + y0).astype(np.int32)
+    used_xs = (used_xs_l + x0).astype(np.int32)
+    dbg = None
+    if collect_debug:
+        dbg = DisparityDebugInfo(
+            inset_roi=inset_roi,
+            used_ys=used_ys,
+            used_xs=used_xs,
+            used_disp=used_disp,
+            selected_disp=disp,
+            n_patch=n_patch,
+            n_valid=n_valid,
+            n_used=int(used_disp.size),
+            surface=surface,
+        )
+
+    if disp < float(min_disparity):
+        return _pack(None, disp, dbg)
+
     cx = (x0 + x1) // 2
     cy = (y0 + y1) // 2
 
@@ -532,14 +666,156 @@ def measure_roi_distance(
         xyzw = Q @ vec
         wv = xyzw[3, 0]
         if abs(wv) < 1e-9:
-            return None, disp
+            return _pack(None, disp, dbg)
         z = float(xyzw[2, 0] / wv)
         if not np.isfinite(z) or z <= 0:
-            return None, disp
-        return z, disp
+            return _pack(None, disp, dbg)
+        if max_distance_mm is not None and z > float(max_distance_mm):
+            return _pack(None, disp, dbg)
+        return _pack(z, disp, dbg)
     if focal is not None and baseline is not None and disp > 0:
-        return float(focal * baseline / disp), disp
-    return None, disp
+        z = float(focal * baseline / disp)
+        if max_distance_mm is not None and z > float(max_distance_mm):
+            return _pack(None, disp, dbg)
+        return _pack(z, disp, dbg)
+    return _pack(None, disp, dbg)
+
+
+def draw_disparity_debug(
+    left_bgr: np.ndarray,
+    right_bgr: np.ndarray,
+    debug: DisparityDebugInfo,
+    *,
+    max_samples: int = 48,
+    track_roi: tuple[int, int, int, int] | None = None,
+) -> np.ndarray:
+    """Side-by-side: пиксели ROI на L и соответствующие (x-d, y) на R."""
+    left = left_bgr.copy()
+    right = right_bgr.copy()
+    if left.ndim == 2:
+        left = cv2.cvtColor(left, cv2.COLOR_GRAY2BGR)
+    if right.ndim == 2:
+        right = cv2.cvtColor(right, cv2.COLOR_GRAY2BGR)
+    h = max(left.shape[0], right.shape[0])
+    if left.shape[0] != h:
+        left = cv2.resize(left, (left.shape[1], h), interpolation=cv2.INTER_AREA)
+    if right.shape[0] != h:
+        right = cv2.resize(right, (right.shape[1], h), interpolation=cv2.INTER_AREA)
+
+    ix, iy, iw, ih = debug.inset_roi
+    cv2.rectangle(left, (ix, iy), (ix + iw, iy + ih), (0, 255, 255), 1)
+    if track_roi is not None:
+        tx, ty, tw, th = track_roi
+        cv2.rectangle(left, (tx, ty), (tx + tw, ty + th), (0, 220, 0), 2)
+
+    # Полупрозрачная подсветка всех used-пикселей на L (цвет по d).
+    if debug.n_used > 0:
+        dmin = float(np.percentile(debug.used_disp, 5))
+        dmax = float(np.percentile(debug.used_disp, 95))
+        span = max(dmax - dmin, 1e-3)
+        t = np.clip((debug.used_disp.astype(np.float32) - dmin) / span, 0.0, 1.0)
+        colors = np.stack(
+            [
+                (255 * (1.0 - t)).astype(np.uint8),
+                (200 * t).astype(np.uint8),
+                (40 + 180 * t).astype(np.uint8),
+            ],
+            axis=1,
+        )
+        overlay = left.copy()
+        ys = debug.used_ys
+        xs = debug.used_xs
+        in_l = (ys >= 0) & (ys < left.shape[0]) & (xs >= 0) & (xs < left.shape[1])
+        overlay[ys[in_l], xs[in_l]] = colors[in_l]
+        left = cv2.addWeighted(overlay, 0.55, left, 0.45, 0)
+
+        overlay_r = right.copy()
+        rxs = np.rint(xs.astype(np.float32) - debug.used_disp).astype(np.int32)
+        in_r = (ys >= 0) & (ys < right.shape[0]) & (rxs >= 0) & (rxs < right.shape[1])
+        overlay_r[ys[in_r], rxs[in_r]] = colors[in_r]
+        right = cv2.addWeighted(overlay_r, 0.55, right, 0.45, 0)
+
+    # Выборка точек для линий L→R (ближе к selected_disp — приоритетнее).
+    samples: list[tuple[int, int, float]] = []
+    if debug.n_used > 0:
+        sel = (
+            float(debug.selected_disp)
+            if debug.selected_disp is not None
+            else float(np.median(debug.used_disp))
+        )
+        order = np.argsort(np.abs(debug.used_disp - sel))
+        step = max(1, int(order.size // max(max_samples, 1)))
+        pick = order[::step][:max_samples]
+        for i in pick:
+            samples.append(
+                (int(debug.used_xs[i]), int(debug.used_ys[i]), float(debug.used_disp[i]))
+            )
+
+    canvas = np.concatenate([left, right], axis=1)
+    lw = left.shape[1]
+    # Горизонтальные epipolar-линии: на идеальной ректификации сцена
+    # должна лежать на одних и тех же рядах L и R. Если объект на R
+    # визуально выше/ниже линии — это вертикальный сдвиг калибровки, не баг отрисовки.
+    for frac in (0.25, 0.50, 0.75):
+        y_line = int(round((h - 1) * frac))
+        cv2.line(canvas, (0, y_line), (canvas.shape[1] - 1, y_line), (80, 80, 80), 1)
+
+    for lx, ly, dd in samples:
+        rx = int(round(lx - dd))
+        ry = ly
+        if not (0 <= ly < left.shape[0] and 0 <= lx < left.shape[1]):
+            continue
+        if not (0 <= ry < right.shape[0] and 0 <= rx < right.shape[1]):
+            continue
+        p1 = (lx, ly)
+        p2 = (rx + lw, ry)
+        cv2.circle(canvas, p1, 3, (0, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(canvas, p2, 3, (0, 255, 255), -1, cv2.LINE_AA)
+        cv2.line(canvas, p1, p2, (0, 200, 255), 1, cv2.LINE_AA)
+
+    # Маркер selected disparity на центре inset.
+    if debug.selected_disp is not None and debug.selected_disp > 0:
+        cx = ix + iw // 2
+        cy = iy + ih // 2
+        rcx = int(round(cx - float(debug.selected_disp)))
+        cv2.drawMarker(canvas, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 16, 2)
+        if 0 <= cy < right.shape[0] and 0 <= rcx < right.shape[1]:
+            cv2.drawMarker(
+                canvas, (rcx + lw, cy), (0, 0, 255), cv2.MARKER_CROSS, 16, 2
+            )
+            cv2.line(
+                canvas, (cx, cy), (rcx + lw, cy), (0, 0, 255), 2, cv2.LINE_AA
+            )
+
+    lines = [
+        f"DEBUG disp  used={debug.n_used}/{debug.n_patch}  valid0={debug.n_valid}",
+        f"surface={debug.surface}  selected={debug.selected_disp:.2f}px"
+        if debug.selected_disp is not None
+        else f"surface={debug.surface}  selected=n/a",
+        "L|R same top edge; gray lines=epipolar rows (R higher => calib/rectify dy)",
+    ]
+    for i, text in enumerate(lines):
+        cv2.putText(
+            canvas,
+            text,
+            (10, 24 + i * 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 0),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            canvas,
+            text,
+            (10, 24 + i * 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    return canvas
 
 
 def display_scale(shape: tuple[int, int], max_side: int) -> float:

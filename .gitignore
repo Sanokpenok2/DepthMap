@@ -13,6 +13,9 @@ calib/
 *.npy
 *.ply
 
+# Локальный форк на Kornia (отдельный проект, не в этом репо)
+DepthMapKornia/
+
 # Python
 __pycache__/
 *.pyc

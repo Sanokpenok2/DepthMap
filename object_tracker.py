@@ -1,18 +1,13 @@
 """
-Захват и трекинг объекта в кадре — отдельный модуль.
+Трекер объекта для тепловизионного (серого) видео ~640x512.
 
-Здесь собрана вся логика выбора области объекта (ROI) и её сопровождения
-между кадрами. Модуль не зависит от стерео/диспаритета, поэтому его можно
-тестировать изолированно (в т.ч. на одном видео) или переиспользовать.
+Алгоритм: базовый трекер (KCF / NCC как в DepthMapKornia) + CLAHE-NCC
+(уточнение/масштаб) + тепловая сигнатура + строгий локальный reacquire.
 
-Быстрая проверка из командной строки (трекинг по одному видео):
-    python object_tracker.py --video left.mp4 --tracker csrt
+Drop-in API для video_track_depth / stereo_live.
 
-Программный вызов:
-    from object_tracker import ObjectTracker
-    trk = ObjectTracker(kind="csrt")
-    trk.init(frame_bgr, roi)          # roi = (x, y, w, h)
-    ok, roi = trk.update(next_frame)  # ok: bool, roi: (x, y, w, h) | None
+    python object_tracker.py --video left.mp4 --tracker kcf
+    python object_tracker.py --video left.mp4 --tracker ncc
 """
 
 from __future__ import annotations
@@ -26,17 +21,61 @@ import numpy as np
 from depth_map import display_scale, fit_for_display
 
 Roi = tuple[int, int, int, int]
+TRACKER_KINDS = ("csrt", "kcf", "mosse", "ncc")
 
-TRACKER_KINDS = ("csrt", "kcf", "mosse")
+
+class NccTemplateTracker:
+    """Локальный template/NCC-трекер — тот же базовый движок, что в DepthMapKornia."""
+
+    def __init__(self, *, search_scale: float = 1.0, min_score: float = 0.25) -> None:
+        self._roi: Roi | None = None
+        self._template: np.ndarray | None = None
+        self._search_scale = float(search_scale)
+        self._min_score = float(min_score)
+
+    def init(self, frame: np.ndarray, roi: tuple) -> bool:
+        x, y, w, h = (int(v) for v in roi)
+        gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self._roi = (x, y, w, h)
+        self._template = gray[y : y + h, x : x + w].copy()
+        return bool(self._template.size)
+
+    def update(self, frame: np.ndarray) -> tuple[bool, tuple[float, float, float, float]]:
+        if self._roi is None or self._template is None:
+            return False, (0.0, 0.0, 0.0, 0.0)
+        gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        x, y, w, h = self._roi
+        margin = int(round(max(w, h) * self._search_scale))
+        x0 = max(0, x - margin)
+        y0 = max(0, y - margin)
+        x1 = min(gray.shape[1], x + w + margin)
+        y1 = min(gray.shape[0], y + h + margin)
+        search = gray[y0:y1, x0:x1]
+        if search.shape[0] < h or search.shape[1] < w:
+            return False, (float(x), float(y), float(w), float(h))
+        res = cv2.matchTemplate(search, self._template, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        if max_val < self._min_score:
+            return False, (float(x), float(y), float(w), float(h))
+        nx, ny = x0 + int(max_loc[0]), y0 + int(max_loc[1])
+        self._roi = (nx, ny, w, h)
+        patch = gray[ny : ny + h, nx : nx + w]
+        if patch.shape == self._template.shape:
+            self._template = (
+                0.9 * self._template.astype(np.float32)
+                + 0.1 * patch.astype(np.float32)
+            ).astype(np.uint8)
+        return True, (float(nx), float(ny), float(w), float(h))
 
 
 def create_raw_tracker(kind: str):
-    """Создаёт «сырой» OpenCV-трекер с учётом разных сборок (cv2 / cv2.legacy)."""
     kind = kind.lower()
     if kind not in TRACKER_KINDS:
         raise ValueError(
             f"Неизвестный трекер '{kind}'. Доступны: {', '.join(TRACKER_KINDS)}."
         )
+    if kind == "ncc":
+        return NccTemplateTracker()
     name = {
         "csrt": "TrackerCSRT_create",
         "kcf": "TrackerKCF_create",
@@ -49,13 +88,12 @@ def create_raw_tracker(kind: str):
         if factory is not None:
             return factory()
     raise RuntimeError(
-        f"Трекер '{kind}' недоступен в этой сборке OpenCV. "
-        "Установите opencv-contrib-python."
+        f"Трекер '{kind}' недоступен. Установите opencv-contrib-python "
+        f"или используйте --tracker ncc / --kornia-tracker."
     )
 
 
 def clamp_roi(roi: tuple[float, float, float, float], width: int, height: int) -> Roi:
-    """Приводит ROI к целым и обрезает по границам кадра."""
     x, y, rw, rh = roi
     x = int(round(x))
     y = int(round(y))
@@ -73,8 +111,26 @@ def roi_center(roi: Roi) -> tuple[int, int]:
     return x + rw // 2, y + rh // 2
 
 
+def _as_bgr(frame: np.ndarray) -> np.ndarray:
+    if frame.ndim == 2:
+        return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    return frame
+
+
+def _as_gray(frame: np.ndarray) -> np.ndarray:
+    if frame.ndim == 2:
+        return frame
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+
+def _enhance_thermal(gray: np.ndarray) -> np.ndarray:
+    """CLAHE для низкоконтрастного ТВ/ИК 640×512."""
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(gray)
+
+
 def select_object_roi(frame_bgr: np.ndarray, max_display: int = 1200) -> Roi | None:
-    """Интерактивный выбор ROI мышью. Возвращает ROI в координатах полного кадра."""
+    frame_bgr = _as_bgr(frame_bgr)
     scale = display_scale(frame_bgr.shape, max_display)
     preview = fit_for_display(frame_bgr, scale)
     window = "Select object (Enter/Space = OK, c = cancel)"
@@ -90,79 +146,254 @@ def select_object_roi(frame_bgr: np.ndarray, max_display: int = 1200) -> Roi | N
     return clamp_roi((x, y, rw, rh), frame_bgr.shape[1], frame_bgr.shape[0])
 
 
+def _pad_roi(roi: Roi, width: int, height: int, pad_px: int = 2) -> Roi:
+    """Минимальный запас 1–2 px, без процентного раздувания."""
+    x, y, rw, rh = roi
+    p = max(0, int(pad_px))
+    return clamp_roi((x - p, y - p, rw + 2 * p, rh + 2 * p), width, height)
+
+
+def _estimate_background(gray: np.ndarray, point: tuple[int, int]) -> float:
+    h, w = gray.shape[:2]
+    px, py = int(point[0]), int(point[1])
+    border = np.concatenate(
+        [gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1]]
+    ).astype(np.float32)
+    bg_border = float(np.median(border))
+    yy, xx = np.ogrid[:h, :w]
+    dist2 = (xx - px) ** 2 + (yy - py) ** 2
+    far = (dist2 >= 90**2) & (dist2 <= 180**2)
+    if int(far.sum()) >= 80:
+        bg_far = float(np.median(gray[far]))
+        seed = float(gray[py, px])
+        return bg_far if abs(bg_far - seed) >= abs(bg_border - seed) else bg_border
+    return bg_border
+
+
+def _keep_seed_component(mask: np.ndarray, point: tuple[int, int]) -> np.ndarray | None:
+    px, py = int(point[0]), int(point[1])
+    if mask[py, px] == 0:
+        return None
+    _n, labels = cv2.connectedComponents(mask.astype(np.uint8), connectivity=8)
+    lab = int(labels[py, px])
+    if lab <= 0:
+        return None
+    return (labels == lab).astype(np.uint8)
+
+
+def _bbox_from_mask(mask: np.ndarray, *, mass_keep: float = 0.96) -> Roi | None:
+    """Плотный bbox: обрезает редкую «ауру» по проекциям массы."""
+    col = mask.sum(axis=0).astype(np.float64)
+    row = mask.sum(axis=1).astype(np.float64)
+    total = float(col.sum())
+    if total < 20:
+        return None
+    keep = float(np.clip(mass_keep, 0.8, 1.0))
+    trim = 0.5 * (1.0 - keep)
+
+    def _span(proj: np.ndarray) -> tuple[int, int] | None:
+        s = float(proj.sum())
+        if s <= 0:
+            return None
+        c = np.cumsum(proj)
+        lo = int(np.searchsorted(c, trim * s, side="left"))
+        hi = int(np.searchsorted(c, (1.0 - trim) * s, side="left"))
+        hi = min(len(proj) - 1, max(hi, lo))
+        return lo, hi
+
+    xs = _span(col)
+    ys = _span(row)
+    if xs is None or ys is None:
+        return None
+    x0, x1 = xs
+    y0, y1 = ys
+    return x0, y0, x1 - x0 + 1, y1 - y0 + 1
+
+
+def _seed_component_mask(
+    gray: np.ndarray,
+    point: tuple[int, int],
+    lo_diff: int,
+    up_diff: int,
+    *,
+    connectivity: int = 8,
+) -> np.ndarray | None:
+    """FloodFill от клика; возвращает бинарную маску компоненты или None."""
+    h, w = gray.shape[:2]
+    px, py = int(point[0]), int(point[1])
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    mask = np.zeros((h + 2, w + 2), np.uint8)
+    flags = connectivity | cv2.FLOODFILL_FIXED_RANGE | (255 << 8)
+    cv2.floodFill(
+        blurred,
+        mask,
+        (px, py),
+        0,
+        (int(lo_diff),),
+        (int(up_diff),),
+        flags,
+    )
+    region = (mask[1:-1, 1:-1] > 0).astype(np.uint8)
+    return _keep_seed_component(region, (px, py))
+
+
+def _thermal_seed_mask(
+    gray: np.ndarray,
+    point: tuple[int, int],
+    tolerance: int,
+) -> np.ndarray | None:
+    """Плотная маска объекта: порог между seed и фоном + компонента клика."""
+    px, py = int(point[0]), int(point[1])
+    seed = float(gray[py, px])
+    bg = _estimate_background(gray, (px, py))
+    hot = seed >= bg
+    delta = abs(seed - bg)
+    tol = max(6, int(tolerance))
+    if delta < 8:
+        # Низкий контраст — узкий flood вокруг seed.
+        return _seed_component_mask(gray, (px, py), tol, tol, connectivity=8)
+
+    # Порог ближе к объекту, чем к фону → меньше ореола (рамка ~ размер объекта).
+    # alpha=0.55: берем пиксели от mid+ чуть в сторону объекта.
+    alpha = 0.58
+    if hot:
+        thr = bg + alpha * delta
+        raw = (gray.astype(np.float32) >= thr).astype(np.uint8)
+    else:
+        thr = bg - alpha * delta
+        raw = (gray.astype(np.float32) <= thr).astype(np.uint8)
+
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    raw = cv2.morphologyEx(raw, cv2.MORPH_OPEN, k, iterations=1)
+    raw = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, k, iterations=1)
+    mask = _keep_seed_component(raw, (px, py))
+    if mask is not None and int(mask.sum()) >= 20:
+        return mask
+
+    # Запас: flood с умеренным допуском (не до фона).
+    if hot:
+        lo, up = max(tol, int(0.60 * delta)), max(4, tol // 2)
+    else:
+        lo, up = max(4, tol // 2), max(tol, int(0.60 * delta))
+    return _seed_component_mask(gray, (px, py), lo, up, connectivity=8)
+
+
+def _score_click_region(
+    region: np.ndarray,
+    point: tuple[int, int],
+    frame_wh: tuple[int, int],
+    *,
+    prefer_compact: bool = True,
+) -> tuple[float, Roi] | None:
+    h, w = frame_wh
+    px, py = point
+    roi = _bbox_from_mask(region, mass_keep=0.97)
+    if roi is None:
+        return None
+    x0, y0, rw, rh = roi
+    if rw < 8 or rh < 8:
+        return None
+    area = float(rw * rh)
+    fill = float(region[y0 : y0 + rh, x0 : x0 + rw].sum()) / max(area, 1.0)
+    if fill < 0.25:
+        return None
+    cx, cy = x0 + rw / 2.0, y0 + rh / 2.0
+    dist = float(np.hypot(cx - px, cy - py))
+    diag = float(np.hypot(max(rw, 1), max(rh, 1)))
+    center = max(0.0, 1.0 - dist / max(0.75 * diag, 1.0))
+    # Компактность важнее «чем больше, тем лучше».
+    size_term = min(area, 5000.0) / 5000.0
+    score = (0.55 + 0.45 * fill) * center * (0.45 + 0.55 * size_term)
+    if prefer_compact:
+        frac = area / max(float(h * w), 1.0)
+        if frac > 0.06:
+            score *= 0.65
+        if frac > 0.10:
+            score *= 0.45
+    if area < 0.0012 * h * w:
+        score *= 0.55
+    return score, (x0, y0, rw, rh)
+
+
 def estimate_roi_from_point(
     frame_bgr: np.ndarray,
     point: tuple[int, int],
     *,
     tolerance: int = 16,
     grabcut_refine: bool = True,
-    max_fraction: float = 0.6,
+    max_side_fraction: float = 0.35,
+    max_area_fraction: float = 0.08,
+    pad_px: int = 2,
 ) -> Roi | None:
-    """Оценивает границы объекта по одной точке (клику).
+    """ROI по клику: плотно по объекту (без рамки ×2).
 
-    Шаг 1: floodFill от точки — связная область похожего цвета → грубая рамка.
-    Шаг 2 (опц.): GrabCut внутри расширенной рамки уточняет границы объекта.
+    grabcut_refine оставлен для совместимости CLI (не используется).
     """
+    del grabcut_refine
     frame_bgr = _as_bgr(frame_bgr)
     h, w = frame_bgr.shape[:2]
     px, py = int(point[0]), int(point[1])
     if not (0 <= px < w and 0 <= py < h):
         return None
 
-    blurred = cv2.GaussianBlur(frame_bgr, (5, 5), 0)
-    mask = np.zeros((h + 2, w + 2), np.uint8)
-    lo = (tolerance,) * 3
-    hi = (tolerance,) * 3
-    flags = 4 | cv2.FLOODFILL_FIXED_RANGE | (255 << 8)
-    cv2.floodFill(blurred, mask, (px, py), 0, lo, hi, flags)
-    region = mask[1:-1, 1:-1]
+    # Порог по «сырому» gray даёт меньше ореола, чем по CLAHE.
+    gray_raw = _as_gray(frame_bgr)
+    gray_enh = _enhance_thermal(gray_raw)
 
-    ys, xs = np.where(region > 0)
-    if xs.size < 20:
-        return None
-    x0, x1 = int(xs.min()), int(xs.max())
-    y0, y1 = int(ys.min()), int(ys.max())
-    rw, rh = x1 - x0 + 1, y1 - y0 + 1
+    best_roi: Roi | None = None
+    best_score = -1.0
+    tols = sorted(
+        {
+            max(6, int(tolerance * 0.75)),
+            max(8, int(tolerance)),
+        }
+    )
 
-    # Слишком большая область — вероятно, залило фон: откат к боксу вокруг точки.
-    if rw > w * max_fraction and rh > h * max_fraction:
-        return None
+    thermal_regions: list[np.ndarray] = []
+    for g in (gray_raw, gray_enh):
+        for tol in tols:
+            m = _thermal_seed_mask(g, (px, py), tol)
+            if m is not None:
+                thermal_regions.append(m)
 
-    roi = (x0, y0, rw, rh)
-    if grabcut_refine:
-        refined = _grabcut_refine(frame_bgr, roi)
-        if refined is not None:
-            roi = refined
-    return clamp_roi(roi, w, h)
+    def _too_big(rw: int, rh: int) -> bool:
+        if rw > w * max_side_fraction or rh > h * max_side_fraction:
+            return True
+        if rw * rh > h * w * max_area_fraction:
+            return True
+        return False
 
+    def _consider(regions: list[np.ndarray], *, bonus: float = 0.0) -> None:
+        nonlocal best_roi, best_score
+        for region in regions:
+            scored = _score_click_region(region, (px, py), (h, w))
+            if scored is None:
+                continue
+            score, roi = scored
+            _x, _y, rw, rh = roi
+            if _too_big(rw, rh):
+                continue
+            score += bonus
+            # Среди похожих по score предпочитаем более компактный ROI.
+            score -= 0.15 * (rw * rh) / max(float(h * w), 1.0)
+            if score > best_score:
+                best_score = score
+                best_roi = roi
 
-def _grabcut_refine(frame_bgr: np.ndarray, roi: Roi) -> Roi | None:
-    """Уточняет рамку объекта GrabCut'ом внутри расширенной области."""
-    h, w = frame_bgr.shape[:2]
-    x, y, rw, rh = roi
-    mx, my = int(rw * 0.25) + 5, int(rh * 0.25) + 5
-    ex0 = max(0, x - mx)
-    ey0 = max(0, y - my)
-    ex1 = min(w, x + rw + mx)
-    ey1 = min(h, y + rh + my)
-    sub = frame_bgr[ey0:ey1, ex0:ex1]
-    if sub.shape[0] < 10 or sub.shape[1] < 10:
-        return None
-    rect = (x - ex0, y - ey0, rw, rh)
-    mask = np.zeros(sub.shape[:2], np.uint8)
-    bgd = np.zeros((1, 65), np.float64)
-    fgd = np.zeros((1, 65), np.float64)
-    try:
-        cv2.grabCut(sub, mask, rect, bgd, fgd, 3, cv2.GC_INIT_WITH_RECT)
-    except Exception:
-        return None
-    fg = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 1, 0).astype(np.uint8)
-    ys, xs = np.where(fg > 0)
-    if xs.size < 20:
-        return None
-    nx0, nx1 = int(xs.min()), int(xs.max())
-    ny0, ny1 = int(ys.min()), int(ys.max())
-    return (ex0 + nx0, ey0 + ny0, nx1 - nx0 + 1, ny1 - ny0 + 1)
+    _consider(thermal_regions, bonus=0.05)
+
+    if best_roi is None:
+        fallback: list[np.ndarray] = []
+        for tol in tols:
+            m2 = _seed_component_mask(gray_enh, (px, py), tol, tol, connectivity=8)
+            if m2 is not None:
+                fallback.append(m2)
+        _consider(fallback, bonus=0.0)
+
+    if best_roi is None:
+        side = max(24, int(min(h, w) * 0.06))
+        return clamp_roi((px - side // 2, py - side // 2, side, side), w, h)
+    return _pad_roi(best_roi, w, h, pad_px=pad_px)
 
 
 def select_object_by_click(
@@ -172,35 +403,31 @@ def select_object_by_click(
     tolerance: int = 16,
     grabcut_refine: bool = True,
 ) -> Roi | None:
-    """Клик по объекту → авто-определение рамки. Enter — принять, C/Esc — отмена."""
     frame_bgr = _as_bgr(frame_bgr)
     scale = display_scale(frame_bgr.shape, max_display)
     preview = fit_for_display(frame_bgr, scale)
     inv = 1.0 / scale if scale > 0 else 1.0
-    window = "Click object (click=detect, Enter=OK, C/Esc=cancel)"
+    window = "Click object (click=full object, +/-=tol, Enter=OK, C/Esc=cancel)"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    state: dict = {"roi": None, "pt": None, "tol": int(tolerance)}
 
-    state: dict[str, Roi | None] = {"roi": None}
+    def _recompute() -> None:
+        if state["pt"] is None:
+            return
+        state["roi"] = estimate_roi_from_point(
+            frame_bgr,
+            state["pt"],
+            tolerance=int(state["tol"]),
+            grabcut_refine=grabcut_refine,
+        )
 
     def on_mouse(event: int, mx: int, my: int, flags: int, userdata) -> None:
         if event != cv2.EVENT_LBUTTONDOWN:
             return
-        fx, fy = int(mx * inv), int(my * inv)
-        roi = estimate_roi_from_point(
-            frame_bgr, (fx, fy), tolerance=tolerance, grabcut_refine=grabcut_refine
-        )
-        if roi is None:
-            # Фолбэк: небольшой бокс вокруг клика.
-            side = max(20, int(min(frame_bgr.shape[:2]) * 0.08))
-            roi = clamp_roi(
-                (fx - side // 2, fy - side // 2, side, side),
-                frame_bgr.shape[1],
-                frame_bgr.shape[0],
-            )
-        state["roi"] = roi
+        state["pt"] = (int(mx * inv), int(my * inv))
+        _recompute()
 
     cv2.setMouseCallback(window, on_mouse)
-
     while True:
         vis = preview.copy()
         roi = state["roi"]
@@ -213,60 +440,172 @@ def select_object_by_click(
                 (0, 220, 0),
                 2,
             )
+        if state["pt"] is not None:
+            cv2.drawMarker(
+                vis,
+                (int(state["pt"][0] * scale), int(state["pt"][1] * scale)),
+                (0, 255, 255),
+                cv2.MARKER_CROSS,
+                12,
+                1,
+            )
+        cv2.putText(
+            vis,
+            f"tol={state['tol']}  (+/-)",
+            (10, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
         cv2.imshow(window, vis)
         key = cv2.waitKey(20) & 0xFF
-        if key in (13, 32):  # Enter / Space
+        if key in (13, 32, 10):
             cv2.destroyWindow(window)
             return state["roi"]
         if key in (ord("c"), ord("C"), 27):
             cv2.destroyWindow(window)
             return None
+        if key in (ord("+"), ord("="), ord("]")):
+            state["tol"] = min(64, int(state["tol"]) + 2)
+            _recompute()
+        if key in (ord("-"), ord("_"), ord("[")):
+            state["tol"] = max(3, int(state["tol"]) - 2)
+            _recompute()
 
 
-def _as_bgr(frame: np.ndarray) -> np.ndarray:
-    if frame.ndim == 2:
-        return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-    return frame
+def _extract_patch(gray: np.ndarray, roi: Roi) -> np.ndarray | None:
+    x, y, rw, rh = clamp_roi(roi, gray.shape[1], gray.shape[0])
+    patch = gray[y : y + rh, x : x + rw]
+    if patch.size < 4:
+        return None
+    return patch.copy()
 
 
-def _as_tracker_input(frame: np.ndarray) -> np.ndarray:
-    """Трекеры OpenCV ожидают 3-канальное изображение."""
-    if frame.ndim == 2:
-        return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-    return frame
+def _ncc_score(a: np.ndarray, b: np.ndarray) -> float:
+    if a.shape != b.shape or a.size < 4:
+        return -1.0
+    af = a.astype(np.float32).ravel()
+    bf = b.astype(np.float32).ravel()
+    af -= af.mean()
+    bf -= bf.mean()
+    denom = float(np.linalg.norm(af) * np.linalg.norm(bf))
+    if denom < 1e-6:
+        return 0.0
+    return float(np.dot(af, bf) / denom)
+
+
+def _score_at(
+    gray: np.ndarray, template: np.ndarray, top_left: tuple[float, float]
+) -> float:
+    th, tw = template.shape[:2]
+    x, y = int(round(top_left[0])), int(round(top_left[1]))
+    h, w = gray.shape[:2]
+    if x < 0 or y < 0 or x + tw > w or y + th > h:
+        return -1.0
+    return _ncc_score(gray[y : y + th, x : x + tw], template)
+
+
+def _match_template_local(
+    gray: np.ndarray,
+    template: np.ndarray,
+    center: tuple[float, float],
+    *,
+    max_shift_x: float,
+    max_shift_y: float,
+) -> tuple[Roi | None, float, float]:
+    th, tw = template.shape[:2]
+    if th < 2 or tw < 2:
+        return None, -1.0, 0.0
+    h, w = gray.shape[:2]
+    cx, cy = center
+    x0 = max(0, int(cx - max_shift_x - tw / 2))
+    y0 = max(0, int(cy - max_shift_y - th / 2))
+    x1 = min(w, int(cx + max_shift_x + tw / 2 + 1))
+    y1 = min(h, int(cy + max_shift_y + th / 2 + 1))
+    if x1 - x0 < tw or y1 - y0 < th:
+        return None, -1.0, 0.0
+    region = gray[y0:y1, x0:x1]
+    if float(np.var(template)) < 1.5:
+        res = cv2.matchTemplate(region, template, cv2.TM_SQDIFF_NORMED)
+        score_map = 1.0 - res.astype(np.float32)
+    else:
+        res = cv2.matchTemplate(region, template, cv2.TM_CCOEFF_NORMED)
+        score_map = res.astype(np.float32)
+
+    flat = score_map.ravel()
+    if flat.size == 0:
+        return None, -1.0, 0.0
+    best_i = int(np.argmax(flat))
+    best = float(flat[best_i])
+    if not np.isfinite(best):
+        return None, -1.0, 0.0
+    by, bx = np.unravel_index(best_i, score_map.shape)
+    mask = np.ones_like(score_map, dtype=bool)
+    y_lo, y_hi = max(0, by - 3), min(score_map.shape[0], by + 4)
+    x_lo, x_hi = max(0, bx - 3), min(score_map.shape[1], bx + 4)
+    mask[y_lo:y_hi, x_lo:x_hi] = False
+    second = float(np.max(score_map[mask])) if np.any(mask) else best * 0.5
+    peak_ratio = best / max(abs(second), 1e-3) if second > -0.5 else 99.0
+    if second <= 0 and best > 0:
+        peak_ratio = max(peak_ratio, 2.0)
+    return (int(x0 + bx), int(y0 + by), tw, th), best, float(peak_ratio)
+
+
+def _resize_templ(template: np.ndarray, tw: int, th: int) -> np.ndarray:
+    if template.shape[1] == tw and template.shape[0] == th:
+        return template
+    interp = (
+        cv2.INTER_LINEAR
+        if tw * th >= template.shape[0] * template.shape[1]
+        else cv2.INTER_AREA
+    )
+    return cv2.resize(template, (tw, th), interpolation=interp)
 
 
 class ObjectTracker:
-    """Сессия захвата и сопровождения одного объекта.
+    """
+    Thermal IR tracker (640×512 grayscale):
 
-    Инкапсулирует тип трекера, текущий ROI и состояние захвата, чтобы логика
-    трекинга не была размазана по основному циклу и легко тестировалась.
+    - base: KCF/CSRT/MOSSE или NCC (как DepthMapKornia, kind=\"ncc\")
+    - CLAHE + NCC: позиция и масштаб
+    - mean intensity: тепловая сигнатура (не цеплять «холодный» фон)
+    - reacquire: локально + строгие гейты (NCC, peak, intensity)
     """
 
     def __init__(
         self,
-        kind: str = "csrt",
+        kind: str = "kcf",
         *,
-        smooth: float = 0.3,
-        lock_size: bool = True,
+        smooth: float = 0.0,
+        lock_size: bool = False,
         keep_aspect: bool = True,
-        max_scale_step: float = 0.05,
+        max_scale_step: float = 0.07,
         verify: bool = True,
-        verify_threshold: float = 0.45,
-        max_jump: float = 1.0,
-        min_visible: float = 0.4,
-        lost_patience: int = 2,
-        verify_rel: float = 0.75,
-        min_iou: float = 0.35,
-        max_size_ratio: float = 1.6,
+        verify_threshold: float = 0.30,
+        max_jump: float = 4.0,
+        min_visible: float = 0.18,
+        lost_patience: int = 14,
+        verify_rel: float = 0.0,
+        min_iou: float = 0.0,
+        max_size_ratio: float = 2.5,
         reacquire: bool = True,
-        reacquire_threshold: float = 0.62,
-        reacquire_radius: float = 2.5,
+        reacquire_threshold: float = 0.55,
+        reacquire_radius: float = 3.5,
         reacquire_global: bool = False,
-        reacquire_interval: int = 5,
-        reacquire_scale_min: float = 0.35,
-        reacquire_scale_max: float = 1.4,
+        reacquire_interval: int = 2,
+        reacquire_scale_min: float = 0.50,
+        reacquire_scale_max: float = 2.0,
+        refine_radius: float = 0.50,
+        template_update: float = 0.04,
+        min_peak_ratio: float = 1.12,
+        scale_min: float = 0.45,
+        scale_max: float = 2.4,
+        intensity_tol: float = 28.0,
+        **_legacy: object,
     ) -> None:
+        del _legacy
         self.kind = kind.lower()
         if self.kind not in TRACKER_KINDS:
             raise ValueError(
@@ -274,551 +613,116 @@ class ObjectTracker:
             )
         if not 0.0 <= smooth < 1.0:
             raise ValueError("smooth должен быть в диапазоне [0.0, 1.0).")
-        # smooth — сила сглаживания рамки: 0 = «как есть», ближе к 1 = плавнее (но с задержкой).
+
         self.smooth = float(smooth)
         self.lock_size = bool(lock_size)
-        # keep_aspect — масштабировать рамку равномерно, сохраняя исходные пропорции
-        # (иначе CSRT «схлопывает» стороны неравномерно и обрезает объект).
         self.keep_aspect = bool(keep_aspect)
-        # max_scale_step — максимальное относительное изменение масштаба за кадр
-        # (ограничивает резкое схлопывание рамки). 0 = без ограничения.
         self.max_scale_step = float(max_scale_step)
-        # verify — отклонять «ложный» трекинг: прыжок рамки / слабое совпадение с эталоном.
         self.verify = bool(verify)
         self.verify_threshold = float(verify_threshold)
-        # max_jump — макс. смещение центра за кадр в долях диагонали ROI (0 = без лимита).
         self.max_jump = float(max_jump)
-        # min_visible — минимальная доля рамки, которая должна оставаться внутри кадра.
         self.min_visible = float(min_visible)
-        # lost_patience — сколько подряд «плохих» кадров нужно, чтобы объявить потерю.
         self.lost_patience = max(1, int(lost_patience))
-        # verify_rel — отклонять кадр, если score упал ниже EMA*verify_rel (дрейф на соседний объект).
         self.verify_rel = float(verify_rel)
-        # min_iou — мин. IoU с предыдущей рамкой (отсекает «перескок» на пересекающийся объект).
         self.min_iou = float(min_iou)
-        # max_size_ratio — макс. изменение площади за кадр; сильнее → LOST, а не сжатие рамки.
         self.max_size_ratio = float(max_size_ratio)
-        # reacquire — повторный захват объекта после потери по эталонному шаблону.
         self.reacquire = bool(reacquire)
         self.reacquire_threshold = float(reacquire_threshold)
-        # reacquire_radius — окно поиска вокруг последней позиции (в долях max(w,h) ROI).
-        # По умолчанию ищем только рядом, чтобы не хватать похожий фон в другом конце кадра.
         self.reacquire_radius = float(reacquire_radius)
-        # reacquire_global — разрешить поиск по всему кадру (осторожно: ложные срабатывания).
         self.reacquire_global = bool(reacquire_global)
-        # reacquire_interval — искать объект не каждый кадр (иначе FPS сильно падает).
         self.reacquire_interval = max(1, int(reacquire_interval))
-        # Диапазон масштабов эталона при поиске (объект мог стать меньше/больше).
         self.reacquire_scale_min = float(reacquire_scale_min)
         self.reacquire_scale_max = float(reacquire_scale_max)
-        if not 0.05 <= self.reacquire_scale_min <= self.reacquire_scale_max <= 4.0:
-            raise ValueError("reacquire_scale_min/max должны быть в (0.05..4] и min<=max.")
+        self.refine_radius = float(refine_radius)
+        self.template_update = float(np.clip(template_update, 0.0, 1.0))
+        self.min_peak_ratio = float(min_peak_ratio)
+        self.scale_min = float(scale_min)
+        self.scale_max = float(scale_max)
+        self.intensity_tol = float(intensity_tol)
+
         self._tracker = None
         self.roi: Roi | None = None
-        # Дробное (несглаженное к целым) состояние рамки для EMA-фильтра.
         self._roi_f: tuple[float, float, float, float] | None = None
-        self._locked_size: tuple[float, float] | None = None
-        # Исходный размер рамки и текущий сглаженный масштаб относительно него.
         self._init_size: tuple[float, float] | None = None
-        self._scale: float = 1.0
-        # Эталон объекта (grayscale) для повторного захвата после потери.
+        self._locked_size: tuple[float, float] | None = None
+        self._scale = 1.0
         self._template: np.ndarray | None = None
-        self._template_size: tuple[int, int] | None = None
-        self._fail_streak: int = 0
-        self._since_reacquire: int = 0
-        self._lost_frames: int = 0
+        self._template0: np.ndarray | None = None
+        self._mean_i: float | None = None
+        self._std_i: float | None = None
+        self._fail_streak = 0
+        self._since_reacquire = 0
+        self._lost_frames = 0
         self._score_ema: float | None = None
-        self.ok: bool = False
-        self.initialized: bool = False
-        self.reacquired: bool = False
+        self._vel = (0.0, 0.0)
+        self._frame_wh: tuple[int, int] | None = None
+        self.initialized = False
+        self.ok = False
+        self.reacquired = False
         self.last_score: float | None = None
 
+    def reset(self) -> None:
+        self._tracker = None
+        self.roi = None
+        self._roi_f = None
+        self._init_size = None
+        self._locked_size = None
+        self._scale = 1.0
+        self._template = None
+        self._template0 = None
+        self._mean_i = None
+        self._std_i = None
+        self._fail_streak = 0
+        self._since_reacquire = 0
+        self._lost_frames = 0
+        self._score_ema = None
+        self._vel = (0.0, 0.0)
+        self._frame_wh = None
+        self.initialized = False
+        self.ok = False
+        self.reacquired = False
+        self.last_score = None
+
+    def _capture_appearance(self, raw: np.ndarray, enh: np.ndarray, roi: Roi) -> None:
+        patch_e = _extract_patch(enh, roi)
+        patch_r = _extract_patch(raw, roi)
+        self._template = None if patch_e is None else patch_e.copy()
+        self._template0 = None if patch_e is None else patch_e.copy()
+        if patch_r is not None:
+            self._mean_i = float(np.mean(patch_r))
+            self._std_i = float(np.std(patch_r))
+        else:
+            self._mean_i = None
+            self._std_i = None
+
     def init(self, frame: np.ndarray, roi: Roi) -> Roi:
-        """Инициализирует трекер по кадру и ROI (x, y, w, h)."""
-        img = _as_tracker_input(frame)
-        roi = clamp_roi(roi, img.shape[1], img.shape[0])
+        img = _as_bgr(frame)
+        raw = _as_gray(img)
+        enh = _enhance_thermal(raw)
+        h, w = raw.shape[:2]
+        roi = clamp_roi(roi, w, h)
         self._tracker = create_raw_tracker(self.kind)
         self._tracker.init(img, roi)
         self.roi = roi
         self._roi_f = (float(roi[0]), float(roi[1]), float(roi[2]), float(roi[3]))
-        self._locked_size = (float(roi[2]), float(roi[3]))
         self._init_size = (float(roi[2]), float(roi[3]))
+        self._locked_size = (float(roi[2]), float(roi[3]))
         self._scale = 1.0
-        self._save_template(img, roi)
+        self._capture_appearance(raw, enh, roi)
         self._fail_streak = 0
         self._since_reacquire = 0
         self._lost_frames = 0
-        self.ok = True
+        self._score_ema = None
+        self._vel = (0.0, 0.0)
+        self._frame_wh = (w, h)
         self.initialized = True
+        self.ok = True
         self.reacquired = False
-        self.last_score = self._score_roi(img, roi)
-        self._score_ema = self.last_score
-        return roi
+        self.last_score = 1.0
+        return self.roi
 
-    def _save_template(self, img_bgr: np.ndarray, roi: Roi) -> None:
-        x, y, rw, rh = roi
-        patch = img_bgr[y : y + rh, x : x + rw]
-        if patch.size == 0:
-            return
-        self._template = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
-        self._template_size = (rw, rh)
-
-    def _score_roi(self, img_bgr: np.ndarray, box: tuple[float, float, float, float]) -> float:
-        """Сходство текущего патча с эталоном (примерно [-1..1])."""
-        if self._template is None:
-            return 1.0
-        x, y, rw, rh = clamp_roi(box, img_bgr.shape[1], img_bgr.shape[0])
-        patch = img_bgr[y : y + rh, x : x + rw]
-        if patch.size == 0:
-            return -1.0
-        gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
-        templ = cv2.resize(self._template, (gray.shape[1], gray.shape[0]))
-        pvar = float(np.var(gray))
-        tvar = float(np.var(templ))
-        # Однотонный патч: matchTemplate даёт ложные 1.0. Сравниваем среднюю яркость.
-        # (однотонный объект тоже имеет var≈0 — его нельзя отсекать как «фон».)
-        if pvar < 1.0 or tvar < 1.0:
-            diff = abs(float(gray.mean()) - float(templ.mean()))
-            return 1.0 - min(1.0, diff / 40.0)
-        res = cv2.matchTemplate(gray, templ, cv2.TM_CCOEFF_NORMED)
-        score = float(res[0, 0])
-        return score if np.isfinite(score) else -1.0
-
-    def _appearance_ok(
-        self, img_bgr: np.ndarray, box: tuple[float, float, float, float]
-    ) -> bool:
-        """Отсекает кусты/тёмные пятна по яркости и контрасту эталона."""
-        if self._template is None:
-            return True
-        x, y, rw, rh = clamp_roi(box, img_bgr.shape[1], img_bgr.shape[0])
-        patch = img_bgr[y : y + rh, x : x + rw]
-        if patch.size == 0:
-            return False
-        gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
-        templ = cv2.resize(
-            self._template, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_AREA
-        )
-        mean_diff = abs(float(gray.mean()) - float(templ.mean()))
-        if mean_diff > 55.0:
-            return False
-        pstd = float(np.std(gray))
-        tstd = float(np.std(templ))
-        if tstd < 1.0:
-            return pstd < 8.0
-        ratio = pstd / tstd
-        return 0.35 <= ratio <= 2.8
-
-    def _aspect_ok(self, box: tuple[float, float, float, float]) -> bool:
-        """Найденная рамка должна сохранять пропорции эталона."""
-        if self._template_size is None:
-            return True
-        tw, th = self._template_size
-        if tw < 1 or th < 1:
-            return True
-        _, _, w, h = box
-        if w < 1 or h < 1:
-            return False
-        ratio = (float(w) / float(h)) / (float(tw) / float(th))
-        return 1.0 / 1.35 <= ratio <= 1.35
-
-    def _visible_fraction(
-        self, box: tuple[float, float, float, float], width: int, height: int
-    ) -> float:
-        x, y, rw, rh = box
-        x0, y0 = max(0.0, x), max(0.0, y)
-        x1, y1 = min(float(width), x + rw), min(float(height), y + rh)
-        inter = max(0.0, x1 - x0) * max(0.0, y1 - y0)
-        area = max(rw * rh, 1.0)
-        return inter / area
-
-    def _size_ok(self, box: tuple[float, float, float, float]) -> bool:
-        """False, если площадь рамки резко изменилась (CSRT сжался на случайный патч).
-
-        Сравниваем с последней принятой рамкой (не с «вечным» lock), чтобы
-        постепенное удаление объекта не блокировало трекинг жёстче нужного.
-        """
-        if self.max_size_ratio <= 1.0:
-            return True
-        _, _, w, h = box
-        new_a = max(float(w) * float(h), 1.0)
-        ref_w = ref_h = None
-        if self._roi_f is not None:
-            ref_w, ref_h = self._roi_f[2], self._roi_f[3]
-        elif self.lock_size and self._locked_size is not None:
-            ref_w, ref_h = self._locked_size
-        elif self._init_size is not None:
-            ref_w, ref_h = self._init_size
-        if ref_w is None or ref_h is None:
-            return True
-        old_a = max(float(ref_w) * float(ref_h), 1.0)
-        ratio = new_a / old_a
-        return (1.0 / self.max_size_ratio) <= ratio <= self.max_size_ratio
-
-    def _apply_locked_size(
-        self, box: tuple[float, float, float, float], width: int, height: int
-    ) -> tuple[float, float, float, float]:
-        """Центр из box, размер — зафиксированный (если lock_size)."""
-        if not self.lock_size or self._locked_size is None:
-            return (
-                float(box[0]),
-                float(box[1]),
-                float(box[2]),
-                float(box[3]),
-            )
-        x, y, w, h = box
-        cx, cy = x + w / 2.0, y + h / 2.0
-        lw, lh = self._locked_size
-        return clamp_roi((cx - lw / 2.0, cy - lh / 2.0, lw, lh), width, height)
-
-    def _refine_center(
-        self, img_bgr: np.ndarray, box: tuple[float, float, float, float]
-    ) -> tuple[tuple[float, float, float, float], float | None]:
-        """Подстраивает центр рамки локальным matchTemplate по эталону.
-
-        CSRT при движении часто «съезжает» в сторону; небольшой поиск вокруг
-        текущего центра возвращает рамку на объект, не меняя размер.
-        """
-        if self._template is None:
-            return box, None
-        h_img, w_img = img_bgr.shape[:2]
-        x, y, bw, bh = box
-        bw_i, bh_i = max(8, int(round(bw))), max(8, int(round(bh)))
-        cx, cy = x + bw / 2.0, y + bh / 2.0
-
-        # Узкое окно: только коррекция дрейфа, не глобальный поиск.
-        mx = max(6, int(round(0.28 * bw_i)))
-        my = max(6, int(round(0.28 * bh_i)))
-        x0 = max(0, int(round(cx - bw_i / 2.0)) - mx)
-        y0 = max(0, int(round(cy - bh_i / 2.0)) - my)
-        x1 = min(w_img, int(round(cx + bw_i / 2.0)) + mx)
-        y1 = min(h_img, int(round(cy + bh_i / 2.0)) + my)
-        if x1 - x0 < bw_i + 2 or y1 - y0 < bh_i + 2:
-            return box, None
-
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        region = gray[y0:y1, x0:x1]
-        templ = cv2.resize(self._template, (bw_i, bh_i), interpolation=cv2.INTER_AREA)
-        if templ.shape[0] >= region.shape[0] or templ.shape[1] >= region.shape[1]:
-            return box, None
-
-        solid = float(np.var(templ)) < 1.0
-        method = cv2.TM_SQDIFF_NORMED if solid else cv2.TM_CCOEFF_NORMED
-        res = cv2.matchTemplate(region, templ, method)
-        if solid:
-            minv, _, minloc, _ = cv2.minMaxLoc(res)
-            score = 1.0 - float(minv)
-            loc = minloc
-        else:
-            _, maxv, _, maxloc = cv2.minMaxLoc(res)
-            score = float(maxv)
-            loc = maxloc
-        if not np.isfinite(score):
-            return box, None
-
-        base = self._score_roi(img_bgr, box)
-        # Принимаем refine только если не хуже текущего положения заметно.
-        if np.isfinite(base) and score + 0.02 < base:
-            return box, base if np.isfinite(base) else None
-        if score < self.verify_threshold:
-            return box, base if np.isfinite(base) else None
-
-        fx = float(x0 + loc[0])
-        fy = float(y0 + loc[1])
-        refined = (fx, fy, float(bw_i), float(bh_i))
-        rcx, rcy = fx + bw_i / 2.0, fy + bh_i / 2.0
-        # Не уезжать слишком далеко от предложения CSRT за один кадр.
-        diag = float(np.hypot(bw_i, bh_i))
-        if float(np.hypot(rcx - cx, rcy - cy)) > 0.4 * diag:
-            return box, base if np.isfinite(base) else None
-        return refined, score
-
-    def _jump_ok(self, box: tuple[float, float, float, float]) -> bool:
-        """False, если центр «прыгнул» слишком далеко за один кадр."""
-        if self.max_jump <= 0.0 or self._roi_f is None:
-            return True
-        px, py, pw, ph = self._roi_f
-        pcx, pcy = px + pw / 2.0, py + ph / 2.0
-        x, y, w, h = box
-        cx, cy = x + w / 2.0, y + h / 2.0
-        dist = float(np.hypot(cx - pcx, cy - pcy))
-        diag = float(np.hypot(max(pw, 1.0), max(ph, 1.0)))
-        return dist <= self.max_jump * diag
-
-    @staticmethod
-    def _iou(
-        a: tuple[float, float, float, float], b: tuple[float, float, float, float]
-    ) -> float:
-        ax, ay, aw, ah = a
-        bx, by, bw, bh = b
-        x0, y0 = max(ax, bx), max(ay, by)
-        x1, y1 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
-        inter = max(0.0, x1 - x0) * max(0.0, y1 - y0)
-        union = aw * ah + bw * bh - inter
-        return float(inter / union) if union > 0 else 0.0
-
-    def _validate_box(
-        self, img_bgr: np.ndarray, box: tuple[float, float, float, float]
-    ) -> tuple[bool, float]:
-        """Проверяет, что новая рамка — всё ещё наш объект, а не соседний куст/фон.
-
-        Отсекает типичный сбой CSRT: при лёгком пересечении границ рамка
-        «переезжает» на более текстурированный соседний объект.
-        """
-        score = self._score_roi(img_bgr, box)
-        self.last_score = score
-        if not self.verify:
-            return True, score
-        # Резкое сжатие/раздувание рамки = потеря, а не «новый объект».
-        if not self._size_ok(box):
-            return False, score
-        if not np.isfinite(score) or score < self.verify_threshold:
-            return False, score
-        if not self._jump_ok(box):
-            return False, score
-        if self._visible_fraction(box, img_bgr.shape[1], img_bgr.shape[0]) < self.min_visible:
-            return False, score
-        if not self._appearance_ok(img_bgr, box):
-            return False, score
-        if not self._aspect_ok(box):
-            return False, score
-
-        # Относительное падение score (постепенный дрейф на другой объект).
-        if (
-            self._score_ema is not None
-            and self.verify_rel > 0.0
-            and score < self._score_ema * self.verify_rel
-        ):
-            return False, score
-
-        if self._roi_f is not None:
-            iou = self._iou(self._roi_f, box)
-            px, py, pw, ph = self._roi_f
-            x, y, w, h = box
-            dist = float(
-                np.hypot((x + w / 2.0) - (px + pw / 2.0), (y + h / 2.0) - (py + ph / 2.0))
-            )
-            diag = float(np.hypot(max(pw, 1.0), max(ph, 1.0)))
-
-            # IoU-порог только для слабого match: при хорошем score это обычное
-            # смещение объекта, а не перескок на куст.
-            if self.min_iou > 0.0 and iou < self.min_iou and score < 0.7:
-                return False, score
-
-            # «Старая позиция лучше» — только при телепорте (очень низкий IoU).
-            # Иначе при движении доски старая рамка ещё частично на объекте и
-            # NCC там выше → рамка отстаёт и «съезжает».
-            if iou < 0.2 and dist > 0.35 * diag:
-                old_score = self._score_roi(img_bgr, self._roi_f)
-                if (
-                    np.isfinite(old_score)
-                    and old_score >= self.verify_threshold
-                    and score + 0.1 < old_score
-                ):
-                    return False, score
-
-        return True, score
-
-    def _search_window(
-        self, width: int, height: int
-    ) -> tuple[int, int, int, int] | None:
-        """Окно поиска для перезахвата: локально вокруг последней ROI или весь кадр.
-
-        Чем дольше цель потеряна, тем шире окно (человек мог отойти с объектом).
-        """
-        if self.reacquire_global or self._roi_f is None:
-            return (0, 0, width, height)
-        px, py, pw, ph = self._roi_f
-        cx, cy = px + pw / 2.0, py + ph / 2.0
-        # Расширение окна: +100% за ~60 кадров потери, максимум ×3.
-        expand = 1.0 + min(2.0, self._lost_frames / 60.0)
-        rad = self.reacquire_radius * max(pw, ph, 1.0) * expand
-        x0 = max(0, int(cx - rad))
-        y0 = max(0, int(cy - rad))
-        x1 = min(width, int(cx + rad))
-        y1 = min(height, int(cy + rad))
-        if x1 - x0 < 8 or y1 - y0 < 8:
-            return None
-        return (x0, y0, x1 - x0, y1 - y0)
-
-    def _reacquire_scales(self) -> list[float]:
-        """Масштабы эталона — широкий диапазон, чтобы найти объект дальше (мельче)."""
-        lo = self.reacquire_scale_min
-        hi = self.reacquire_scale_max
-        n = 9
-        scales = [float(s) for s in np.geomspace(lo, hi, num=n)]
-        if lo <= self._scale <= hi:
-            scales.append(float(self._scale))
-        return sorted(set(round(s, 4) for s in scales))
-
-    def _try_reacquire(self, img_bgr: np.ndarray) -> Roi | None:
-        """Ищет эталон объекта. None — не найден.
-
-        Берёт лучший кандидат с учётом близости к последней позиции (штраф за
-        дальность), иначе matchTemplate часто цепляет похожий фон в стороне.
-        """
-        if self._template is None or self._template_size is None:
-            return None
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        H, W = gray.shape[:2]
-        win = self._search_window(W, H)
-        if win is None:
-            return None
-        wx, wy, ww, wh = win
-        region = gray[wy : wy + wh, wx : wx + ww]
-
-        # Ускорение: matchTemplate на 1/2 разрешения (~4× дешевле).
-        scale_down = 0.5
-        rh, rw = region.shape[:2]
-        small_w, small_h = max(8, int(rw * scale_down)), max(8, int(rh * scale_down))
-        region_s = cv2.resize(region, (small_w, small_h), interpolation=cv2.INTER_AREA)
-        inv = 1.0 / scale_down
-        tw0, th0 = self._template_size
-
-        solid = float(np.var(self._template)) < 1.0
-        method = cv2.TM_SQDIFF_NORMED if solid else cv2.TM_CCOEFF_NORMED
-
-        pcx = pcy = diag = None
-        if self._roi_f is not None:
-            px, py, pw, ph = self._roi_f
-            pcx, pcy = px + pw / 2.0, py + ph / 2.0
-            diag = float(np.hypot(max(pw, 1.0), max(ph, 1.0)))
-
-        # (adj, raw_score, fx, fy, fw, fh)
-        cands: list[tuple[float, float, int, int, int, int]] = []
-        for s in self._reacquire_scales():
-            tw = max(8, int(round(tw0 * s * scale_down)))
-            th = max(8, int(round(th0 * s * scale_down)))
-            if tw >= region_s.shape[1] or th >= region_s.shape[0]:
-                continue
-            templ = cv2.resize(self._template, (tw, th), interpolation=cv2.INTER_AREA)
-            res = cv2.matchTemplate(region_s, templ, method)
-            if solid:
-                minv, _, minloc, _ = cv2.minMaxLoc(res)
-                score = 1.0 - float(minv)
-                maxloc = minloc
-            else:
-                _, maxv, _, maxloc = cv2.minMaxLoc(res)
-                score = float(maxv)
-            if not np.isfinite(score) or score < self.reacquire_threshold:
-                continue
-            fx = wx + int(round(maxloc[0] * inv))
-            fy = wy + int(round(maxloc[1] * inv))
-            fw = max(8, int(round(tw * inv)))
-            fh = max(8, int(round(th * inv)))
-            cx, cy = fx + fw / 2.0, fy + fh / 2.0
-            pen = 0.0
-            if pcx is not None and diag is not None and diag > 0:
-                dist = float(np.hypot(cx - pcx, cy - pcy))
-                pen += min(0.4, 0.18 * (dist / diag))
-            # Предпочитаем масштаб ближе к последнему известному.
-            cur = max(self._scale, 0.05)
-            pen += min(0.12, 0.1 * abs(float(np.log(s / cur))))
-            cands.append((score - pen, score, fx, fy, fw, fh))
-
-        if not cands:
-            return None
-        cands.sort(key=lambda t: t[0], reverse=True)
-        best_adj, best_raw, fx, fy, fw, fh = cands[0]
-
-        # Неоднозначность: два похожих пика → не угадываем.
-        if len(cands) >= 2:
-            second_adj = cands[1][0]
-            if best_adj - second_adj < 0.04 and best_raw < self.reacquire_threshold + 0.12:
-                return None
-
-        cand = (fx, fy, fw, fh)
-        if not self._aspect_ok(cand):
-            return None
-        if not self._appearance_ok(img_bgr, cand):
-            return None
-
-        # Дальний прыжок требует более сильного совпадения.
-        if pcx is not None and diag is not None and diag > 0:
-            cx, cy = fx + fw / 2.0, fy + fh / 2.0
-            dist = float(np.hypot(cx - pcx, cy - pcy))
-            need = self.reacquire_threshold
-            if dist > 1.2 * diag:
-                need = max(need + 0.1, 0.7)
-            if dist > 2.0 * diag:
-                need = max(need + 0.15, 0.75)
-            if best_raw < need:
-                return None
-
-        full_score = self._score_roi(img_bgr, cand)
-        if not np.isfinite(full_score) or full_score < self.reacquire_threshold:
-            return None
-        if not self._appearance_ok(img_bgr, cand):
-            return None
-        self.last_score = full_score
-        return cand
-
-    def _smooth_box(
-        self, box: tuple[float, float, float, float]
-    ) -> tuple[float, float, float, float]:
-        """Сглаживает рамку: центр по EMA, размер — равномерным масштабом.
-
-        При заметном смещении центра сглаживание ослабляется, чтобы рамка
-        не отставала от движущегося объекта.
-        """
-        x, y, w, h = box
-        cx, cy = x + w / 2.0, y + h / 2.0
-        a = 1.0 - self.smooth if self.smooth > 0.0 else 1.0
-
-        # --- Центр ---
-        if self._roi_f is None:
-            ncx, ncy = cx, cy
-        else:
-            px, py, pw, ph = self._roi_f
-            pcx, pcy = px + pw / 2.0, py + ph / 2.0
-            dist = float(np.hypot(cx - pcx, cy - pcy))
-            diag = float(np.hypot(max(pw, 1.0), max(ph, 1.0)))
-            # Быстрое смещение → меньше EMA (иначе рамка «плывёт» позади).
-            # Не ставим почти 1.0: после refine центр уже точный, сильный chase
-            # усиливал дрожание.
-            a_pos = a
-            if diag > 1.0 and dist > 0.12 * diag:
-                a_pos = max(a, 0.65)
-            if diag > 1.0 and dist > 0.28 * diag:
-                a_pos = max(a_pos, 0.8)
-            ncx = pcx + a_pos * (cx - pcx)
-            ncy = pcy + a_pos * (cy - pcy)
-
-        # --- Размер ---
-        if self.lock_size and self._locked_size is not None:
-            nw, nh = self._locked_size
-            return (ncx - nw / 2.0, ncy - nh / 2.0, nw, nh)
-
-        if not self.keep_aspect or self._init_size is None:
-            # «Сырое» поведение: стороны сглаживаются независимо (как у трекера).
-            if self._roi_f is None:
-                return (ncx - w / 2.0, ncy - h / 2.0, w, h)
-            _, _, pw, ph = self._roi_f
-            nw = pw + a * (w - pw)
-            nh = ph + a * (h - ph)
-            return (ncx - nw / 2.0, ncy - nh / 2.0, nw, nh)
-
-        # Равномерный масштаб от площади рамки трекера — сохраняет пропорции.
-        w0, h0 = self._init_size
-        target_scale = float(np.sqrt(max(w * h, 1.0) / max(w0 * h0, 1.0)))
-
-        # Сглаживаем масштаб и ограничиваем резкое изменение за кадр.
-        new_scale = self._scale + a * (target_scale - self._scale)
-        if self.max_scale_step > 0.0:
-            lo = self._scale * (1.0 - self.max_scale_step)
-            hi = self._scale * (1.0 + self.max_scale_step)
-            new_scale = max(lo, min(hi, new_scale))
-        new_scale = max(0.1, new_scale)
-        self._scale = new_scale
-
-        nw = w0 * new_scale
-        nh = h0 * new_scale
-        return (ncx - nw / 2.0, ncy - nh / 2.0, nw, nh)
-
-    def init_interactive(
-        self, frame: np.ndarray, max_display: int = 1200
-    ) -> Roi | None:
-        """Даёт выбрать объект мышью (рамкой) и инициализирует трекер. None — отмена."""
-        roi = select_object_roi(_as_tracker_input(frame), max_display)
+    def init_interactive(self, frame: np.ndarray, max_display: int = 1200) -> Roi | None:
+        roi = select_object_roi(frame, max_display)
         if roi is None:
             return None
         return self.init(frame, roi)
@@ -828,12 +732,11 @@ class ObjectTracker:
         frame: np.ndarray,
         max_display: int = 1200,
         *,
-        tolerance: int = 16,
+        tolerance: int = 12,
         grabcut_refine: bool = True,
     ) -> Roi | None:
-        """Выбор объекта кликом с авто-определением границ. None — отмена."""
         roi = select_object_by_click(
-            _as_tracker_input(frame),
+            frame,
             max_display,
             tolerance=tolerance,
             grabcut_refine=grabcut_refine,
@@ -842,455 +745,612 @@ class ObjectTracker:
             return None
         return self.init(frame, roi)
 
-    def _accept_box(self, img_bgr: np.ndarray, box: tuple[float, float, float, float]) -> None:
-        """Принимает новую рамку (сглаживание + обновление состояния)."""
-        smoothed = self._smooth_box(
-            (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
-        )
-        self._roi_f = smoothed
-        self.roi = clamp_roi(smoothed, img_bgr.shape[1], img_bgr.shape[0])
-        self.ok = True
-        self._fail_streak = 0
-        self._lost_frames = 0
-        if self.last_score is not None and np.isfinite(self.last_score):
-            if self._score_ema is None:
-                self._score_ema = float(self.last_score)
+    def _visible_fraction(
+        self, box: tuple[float, float, float, float], w: int, h: int
+    ) -> float:
+        x, y, bw, bh = box
+        x0, y0 = max(0.0, x), max(0.0, y)
+        x1, y1 = min(float(w), x + bw), min(float(h), y + bh)
+        vis = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+        return float(vis / max(bw * bh, 1.0))
+
+    def _templ_at_scale(self, scale: float) -> np.ndarray | None:
+        base = self._template0 if self._template0 is not None else self._template
+        if base is None or self._init_size is None:
+            return None
+        w0, h0 = self._init_size
+        tw = max(8, int(round(w0 * scale)))
+        th = max(8, int(round(h0 * scale)))
+        return _resize_templ(base, tw, th)
+
+    def _apply_scale(self, scale: float, *, hard: bool = False) -> tuple[float, float]:
+        scale = float(np.clip(scale, self.scale_min, self.scale_max))
+        if not hard and self.max_scale_step > 0.0:
+            lo = self._scale * (1.0 - self.max_scale_step)
+            hi = self._scale * (1.0 + self.max_scale_step)
+            scale = float(np.clip(scale, lo, hi))
+        self._scale = scale
+        if self._init_size is None:
+            return 8.0, 8.0
+        w0, h0 = self._init_size
+        nw, nh = w0 * scale, h0 * scale
+        self._locked_size = (nw, nh)
+        templ = self._templ_at_scale(scale)
+        if templ is not None:
+            self._template = templ
+        return nw, nh
+
+    def _box_size(self) -> tuple[float, float]:
+        if self._locked_size is not None:
+            return self._locked_size
+        if self._init_size is not None:
+            return self._init_size
+        return 8.0, 8.0
+
+    def _search_scales(self) -> list[float]:
+        if self.lock_size:
+            return [self._scale]
+        factors = (0.88, 0.94, 1.0, 1.06, 1.14)
+        out: list[float] = []
+        for f in factors:
+            s = float(np.clip(self._scale * f, self.scale_min, self.scale_max))
+            if not out or abs(s - out[-1]) > 0.012:
+                out.append(s)
+        return out
+
+    def _intensity_ok(self, raw: np.ndarray, roi: Roi) -> bool:
+        if self._mean_i is None:
+            return True
+        patch = _extract_patch(raw, roi)
+        if patch is None:
+            return False
+        mean = float(np.mean(patch))
+        # На ТВ яркость объекта относительно стабильна; фон часто сильно отличается.
+        tol = self.intensity_tol
+        if self._std_i is not None:
+            tol = max(tol, 1.8 * self._std_i)
+        return abs(mean - self._mean_i) <= tol
+
+    def _intensity_delta(self, raw: np.ndarray, roi: Roi) -> float:
+        if self._mean_i is None:
+            return 0.0
+        patch = _extract_patch(raw, roi)
+        if patch is None:
+            return 1e3
+        return abs(float(np.mean(patch)) - self._mean_i)
+
+    def _jump_too_far(self, ncx: float, ncy: float) -> bool:
+        if self.max_jump <= 0.0 or self._roi_f is None:
+            return False
+        px, py, pw, ph = self._roi_f
+        pcx, pcy = px + pw / 2.0, py + ph / 2.0
+        dx, dy = abs(ncx - pcx), abs(ncy - pcy)
+        fw = float(self._frame_wh[0]) if self._frame_wh else 640.0
+        lim_x = max(self.max_jump * max(pw, 1.0), 0.12 * fw, 32.0)
+        lim_y = max(0.30 * self.max_jump * max(ph, 1.0), 10.0)
+        return dx > lim_x or dy > lim_y
+
+    def _stabilize(
+        self,
+        ncx: float,
+        ncy: float,
+        *,
+        cand: float,
+        anchor: float,
+        bw: float,
+        bh: float,
+    ) -> tuple[float, float]:
+        if self._roi_f is None:
+            return ncx, ncy
+        px, py, pw, ph = self._roi_f
+        pcx, pcy = px + pw / 2.0, py + ph / 2.0
+        dx, dy = ncx - pcx, ncy - pcy
+        margin = 0.04
+        if cand < anchor + margin:
+            if abs(dx) > 0.12 * bw and cand >= anchor - 0.02:
+                ncx = pcx + 0.60 * dx
             else:
-                self._score_ema = 0.9 * self._score_ema + 0.1 * float(self.last_score)
+                ncx = pcx
+            ncy = pcy
+            return ncx, ncy
+        max_dx = max(10.0, 0.65 * bw)
+        max_dy = max(3.0, 0.10 * bh)
+        dx = float(np.clip(dx, -max_dx, max_dx))
+        dy = float(np.clip(dy, -max_dy, max_dy))
+        return pcx + dx, pcy + 0.30 * dy
 
-    def _reinit_on(self, img_bgr: np.ndarray, box: Roi) -> None:
-        """Пересоздаёт OpenCV-трекер на заданной рамке.
-
-        Размер/эталон обновляем только при уверенном match; иначе при lock_size
-        двигаем только центр — чтобы слабый ложный пик не «прилипал» навсегда.
-        """
-        h, w = img_bgr.shape[:2]
-        found = clamp_roi(
-            (float(box[0]), float(box[1]), float(box[2]), float(box[3])), w, h
-        )
-        score = (
-            float(self.last_score)
-            if self.last_score is not None and np.isfinite(self.last_score)
-            else 0.0
-        )
-        adopt_size = score >= max(self.reacquire_threshold + 0.08, 0.7)
-
-        if self.lock_size and self._locked_size is not None and not adopt_size:
-            lw, lh = self._locked_size
-            cx = found[0] + found[2] / 2.0
-            cy = found[1] + found[3] / 2.0
-            box = clamp_roi((cx - lw / 2.0, cy - lh / 2.0, lw, lh), w, h)
+    def _smooth_box(
+        self, box: tuple[float, float, float, float]
+    ) -> tuple[float, float, float, float]:
+        x, y, bw, bh = box
+        cx, cy = x + bw / 2.0, y + bh / 2.0
+        a = 1.0 - self.smooth if self.smooth > 0.0 else 1.0
+        if self._roi_f is None:
+            ncx, ncy = cx, cy
         else:
-            box = found
+            px, py, pw, ph = self._roi_f
+            pcx, pcy = px + pw / 2.0, py + ph / 2.0
+            dist = float(np.hypot(cx - pcx, cy - pcy))
+            diag = float(np.hypot(max(pw, 1.0), max(ph, 1.0)))
+            a_pos = 1.0 if diag > 1.0 and dist > 0.25 * diag else a
+            ncx = pcx + a_pos * (cx - pcx)
+            ncy = pcy + a_pos * (cy - pcy)
+        nw, nh = self._box_size()
+        return (ncx - nw / 2.0, ncy - nh / 2.0, nw, nh)
 
-        self._tracker = create_raw_tracker(self.kind)
-        self._tracker.init(img_bgr, box)
-        self._roi_f = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
-        if self._init_size is not None and self._init_size[0] > 0:
-            self._scale = float(box[2]) / self._init_size[0]
-        self.roi = box
-        self.ok = True
-        self._fail_streak = 0
+    def _mark_lost(self) -> tuple[bool, Roi | None]:
+        self.ok = False
         self._lost_frames = 0
-        if adopt_size:
-            self._save_template(img_bgr, box)
-            self._locked_size = (float(box[2]), float(box[3]))
-        if self.last_score is not None and np.isfinite(self.last_score):
-            self._score_ema = float(self.last_score)
+        self._since_reacquire = 0
+        return False, self.roi
 
-    def _attempt_reacquire(self, img_bgr: np.ndarray) -> bool:
-        """Пробует найти объект. True — успешно переинициализирован."""
-        if not self.reacquire:
-            return False
-        found = self._try_reacquire(img_bgr)
-        if found is None:
-            return False
+    def _fail(
+        self,
+        img: np.ndarray | None = None,
+        raw: np.ndarray | None = None,
+        *,
+        weight: int = 1,
+        chase: tuple[float, float, float, float] | None = None,
+        score: float = 0.0,
+    ) -> tuple[bool, Roi | None]:
+        self._fail_streak += max(1, int(weight))
+        if self._fail_streak >= self.lost_patience:
+            return self._mark_lost()
+        if chase is not None and img is not None and raw is not None:
+            # Chase только если тепловая сигнатура ещё похожа.
+            croi = clamp_roi(chase, img.shape[1], img.shape[0])
+            if self._intensity_ok(raw, croi):
+                self._accept(
+                    img, raw, None, chase, score, update_template=False, clear_fail=False
+                )
+                return True, self.roi
+        self.ok = True
+        return True, self.roi
+
+    def _accept(
+        self,
+        img: np.ndarray,
+        raw: np.ndarray,
+        enh: np.ndarray | None,
+        box: tuple[float, float, float, float],
+        score: float,
+        *,
+        update_template: bool = True,
+        clear_fail: bool = True,
+    ) -> None:
+        prev = self._roi_f
+        smoothed = self._smooth_box(box)
+        self._roi_f = smoothed
+        self.roi = clamp_roi(smoothed, img.shape[1], img.shape[0])
+        self.ok = True
+        if clear_fail:
+            self._fail_streak = 0
+        self._lost_frames = 0
+        self.last_score = float(score)
+        if prev is not None:
+            pcx = prev[0] + prev[2] / 2.0
+            pcy = prev[1] + prev[3] / 2.0
+            ncx = smoothed[0] + smoothed[2] / 2.0
+            ncy = smoothed[1] + smoothed[3] / 2.0
+            dx, dy = ncx - pcx, ncy - pcy
+            vx, vy = self._vel
+            self._vel = (0.55 * vx + 0.45 * dx, 0.35 * vy + 0.25 * dy)
+        if self._score_ema is None:
+            self._score_ema = float(score)
+        else:
+            self._score_ema = 0.88 * self._score_ema + 0.12 * float(score)
+
         if (
-            self.last_score is None
-            or not np.isfinite(self.last_score)
-            or self.last_score < self.reacquire_threshold
+            update_template
+            and enh is not None
+            and score >= max(0.50, self.verify_threshold + 0.12)
+            and self.template_update > 0
+            and self.roi is not None
+        ):
+            patch_e = _extract_patch(enh, self.roi)
+            patch_r = _extract_patch(raw, self.roi)
+            if patch_e is not None and self._template is not None:
+                if patch_e.shape == self._template.shape:
+                    a = self.template_update
+                    self._template = cv2.addWeighted(
+                        patch_e, a, self._template, 1.0 - a, 0
+                    )
+                else:
+                    self._template = patch_e.copy()
+                if self._template0 is not None and self._init_size is not None:
+                    w0, h0 = int(self._init_size[0]), int(self._init_size[1])
+                    canon = _resize_templ(patch_e, w0, h0)
+                    if canon.shape == self._template0.shape:
+                        a = min(0.03, self.template_update)
+                        self._template0 = cv2.addWeighted(
+                            canon, a, self._template0, 1.0 - a, 0
+                        )
+            if patch_r is not None and self._mean_i is not None:
+                m = float(np.mean(patch_r))
+                self._mean_i = 0.92 * self._mean_i + 0.08 * m
+                self._std_i = float(np.std(patch_r))
+
+    def _reinit_tracker(self, img: np.ndarray, roi: Roi) -> None:
+        self._tracker = create_raw_tracker(self.kind)
+        self._tracker.init(img, roi)
+
+    def _attempt_reacquire(
+        self, img: np.ndarray, raw: np.ndarray, enh: np.ndarray
+    ) -> bool:
+        if not self.reacquire or self._template0 is None or self._roi_f is None:
+            return False
+        if self._lost_frames < 1:
+            return False
+
+        px, py, pw, ph = self._roi_f
+        pcx, pcy = px + pw / 2.0, py + ph / 2.0
+        if self._locked_size is not None:
+            pw, ph = self._locked_size
+        vx, vy = self._vel
+        # Ищем впереди по траектории (типично L→R на ТВ).
+        search_cx = pcx + vx * min(4.0, 0.6 * self._lost_frames)
+        search_cy = pcy + 0.2 * vy * min(4.0, 0.6 * self._lost_frames)
+
+        base_r = max(pw, ph) * self.reacquire_radius
+        grow = 1.0 + 0.28 * min(max(0, self._lost_frames - 1), 12)
+        radius_x = base_r * grow
+        radius_y = base_r * grow * 0.45
+        if self.reacquire_global:
+            radius_x = max(radius_x, float(max(enh.shape[:2])))
+            radius_y = max(radius_y, float(max(enh.shape[:2])) * 0.5)
+
+        # Масштабы относительно текущего (приближение/удаление).
+        scales = np.linspace(
+            max(self.scale_min, self._scale * self.reacquire_scale_min),
+            min(self.scale_max, self._scale * self.reacquire_scale_max),
+            7,
+        )
+
+        best_roi: Roi | None = None
+        best_score = -1.0
+        best_ratio = 0.0
+        best_scale = self._scale
+        for s in scales:
+            templ = self._templ_at_scale(float(s))
+            if templ is None:
+                continue
+            # Не ищем крошечными шаблонами — на ТВ ловят шум.
+            if templ.size < 64:
+                continue
+            roi, score, ratio = _match_template_local(
+                enh,
+                templ,
+                (search_cx, search_cy),
+                max_shift_x=radius_x,
+                max_shift_y=radius_y,
+            )
+            if roi is None:
+                continue
+            # Штраф неоднозначным пикам.
+            adj = score - (0.08 if ratio < self.min_peak_ratio else 0.0)
+            if adj > best_score:
+                best_score = score
+                best_roi = roi
+                best_ratio = ratio
+                best_scale = float(s)
+
+        self.last_score = best_score
+        if (
+            best_roi is None
+            or best_score < self.reacquire_threshold
+            or best_ratio < self.min_peak_ratio
         ):
             return False
 
-        # Сильное изменение размера — только при очень уверенном match.
-        if self._roi_f is not None or self._locked_size is not None:
-            if self._locked_size is not None:
-                rw, rh = self._locked_size
-            else:
-                rw, rh = self._roi_f[2], self._roi_f[3]
-            old_a = max(float(rw) * float(rh), 1.0)
-            new_a = max(float(found[2]) * float(found[3]), 1.0)
-            ratio = new_a / old_a
-            if ratio < 0.55 or ratio > 1.9:
-                if self.last_score < max(0.72, self.reacquire_threshold + 0.12):
-                    return False
+        ncx = best_roi[0] + best_roi[2] / 2.0
+        ncy = best_roi[1] + best_roi[3] / 2.0
+        far = self._jump_too_far(ncx, ncy)
+        if far and not self.reacquire_global:
+            # Дальний прыжок только при очень похожем объекте.
+            if (
+                best_score < max(0.68, self.reacquire_threshold + 0.12)
+                or best_ratio < 1.20
+                or self._lost_frames < 5
+            ):
+                return False
 
-        self._reinit_on(img_bgr, found)
+        self._apply_scale(best_scale, hard=True)
+        lw, lh = self._box_size()
+        roi = clamp_roi(
+            (ncx - lw / 2.0, ncy - lh / 2.0, lw, lh),
+            img.shape[1],
+            img.shape[0],
+        )
+        if not self._intensity_ok(raw, roi):
+            return False
+        # Финальный confirm NCC.
+        templ = self._template
+        if templ is None:
+            return False
+        th, tw = templ.shape[:2]
+        confirm = _score_at(enh, templ, (roi[0], roi[1]))
+        if confirm < self.reacquire_threshold * 0.95:
+            return False
+
+        patch = _extract_patch(enh, roi)
+        if patch is not None:
+            self._template = patch
+        self._reinit_tracker(img, roi)
+        self._roi_f = (float(roi[0]), float(roi[1]), float(roi[2]), float(roi[3]))
+        self.roi = roi
+        self.ok = True
+        self._fail_streak = 0
+        self._lost_frames = 0
         self.reacquired = True
+        self._score_ema = float(best_score)
+        self.last_score = float(confirm)
         return True
 
     def update(self, frame: np.ndarray) -> tuple[bool, Roi | None]:
-        """Обновляет положение объекта на новом кадре.
-
-        Если трекер «перепрыгнул» на другой объект/фон (слабое сходство с эталоном
-        или слишком большой прыжок рамки), кадр считается неудачным. После
-        lost_patience подряд неудач объявляется потеря цели; затем возможен
-        повторный захват по эталону (не каждый кадр — см. reacquire_interval).
-        """
         if not self.initialized or self._tracker is None:
             raise RuntimeError("ObjectTracker не инициализирован: вызовите init().")
-        img = _as_tracker_input(frame)
+        img = _as_bgr(frame)
+        raw = _as_gray(img)
+        enh = _enhance_thermal(raw)
+        h, w = raw.shape[:2]
+        self._frame_wh = (w, h)
         self.reacquired = False
 
-        # Быстрый путь при уже объявленной потере: CSRT не гоняем каждый кадр.
         if not self.ok:
             self._lost_frames += 1
             self._since_reacquire += 1
             if self._since_reacquire >= self.reacquire_interval:
                 self._since_reacquire = 0
-                if self._attempt_reacquire(img):
-                    return self.ok, self.roi
-            return self.ok, self.roi
+                if self._attempt_reacquire(img, raw, enh):
+                    return True, self.roi
+            return False, self.roi
 
         raw_ok, box = self._tracker.update(img)
-        accepted = False
-        if raw_ok:
-            h_img, w_img = img.shape[:2]
-            box_f = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
-            # Фиксированный размер + локальная подстройка центра по эталону
-            # (CSRT при движении часто уводит центр в сторону).
-            box_f = self._apply_locked_size(box_f, w_img, h_img)
-            box_f, refined_score = self._refine_center(img, box_f)
-            if refined_score is not None and np.isfinite(refined_score):
-                self.last_score = float(refined_score)
-            valid, _score = self._validate_box(img, box_f)
-            if valid:
-                self._accept_box(img, box_f)
-                accepted = True
-                # Синхронизируем CSRT с исправленной рамкой, иначе дрейф копится.
-                if self.roi is not None and self._roi_f is not None:
-                    diag = float(
-                        np.hypot(max(self._roi_f[2], 1.0), max(self._roi_f[3], 1.0))
-                    )
-                    rcx = box_f[0] + box_f[2] / 2.0
-                    rcy = box_f[1] + box_f[3] / 2.0
-                    raw_cx = float(box[0]) + float(box[2]) / 2.0
-                    raw_cy = float(box[1]) + float(box[3]) / 2.0
-                    corr = float(np.hypot(rcx - raw_cx, rcy - raw_cy))
-                    if corr > 0.06 * diag:
-                        self._tracker = create_raw_tracker(self.kind)
-                        self._tracker.init(img, self.roi)
-            else:
-                # Не двигаем рамку к ложной цели. Откат CSRT на старую ROI —
-                # только при явно плохом score; иначе при движении объекта
-                # мы сами «откатываем» трекер и рамка начинает отставать.
-                self._fail_streak += 1
-                if (
-                    self.roi is not None
-                    and self._fail_streak == 1
-                    and (
-                        self.last_score is None
-                        or not np.isfinite(self.last_score)
-                        or self.last_score < self.verify_threshold
-                    )
-                ):
-                    self._tracker = create_raw_tracker(self.kind)
-                    self._tracker.init(img, self.roi)
-        else:
-            self._fail_streak += 1
+        bw, bh = self._box_size()
+
+        if not raw_ok:
             self.last_score = None
+            if self._roi_f is not None:
+                px, py, pw, ph = self._roi_f
+                vx, vy = self._vel
+                pred = (px + vx, py + 0.25 * vy, pw, ph)
+                return self._fail(img, raw, weight=1, chase=pred, score=0.0)
+            return self._fail(weight=1)
 
-        if accepted:
-            return self.ok, self.roi
+        cx = float(box[0]) + float(box[2]) / 2.0
+        cy = float(box[1]) + float(box[3]) / 2.0
+        bx = (cx - bw / 2.0, cy - bh / 2.0, bw, bh)
 
-        # Пока не набрали patience — рамка остаётся на последней хорошей позиции.
-        if self._fail_streak < self.lost_patience and self.roi is not None:
+        if self._visible_fraction(bx, w, h) < self.min_visible:
+            return self._fail(img, raw, weight=2, chase=bx, score=0.0)
+
+        if not self.verify or self._template0 is None:
+            if self._jump_too_far(cx, cy):
+                return self._fail(img, raw, weight=1, chase=bx, score=0.0)
+            self._accept(img, raw, enh, bx, 1.0)
             return True, self.roi
 
-        # Объявляем потерю.
-        self.ok = False
-        self._since_reacquire = 0
-        self._lost_frames = max(self._lost_frames, 1)
-        # Один поиск сразу при потере; дальше — по interval.
-        self._attempt_reacquire(img)
-        return self.ok, self.roi
+        # Якорь + предсказание (X свободнее, Y почти фиксирован).
+        if self._roi_f is not None:
+            px, py, pw, ph = self._roi_f
+            pcx, pcy = px + pw / 2.0, py + ph / 2.0
+            vx, vy = self._vel
+            pred_cx = pcx + vx
+            search_cx = 0.55 * cx + 0.45 * pred_cx
+            search_cy = 0.88 * pcy + 0.12 * cy
+        else:
+            pcx, pcy = cx, cy
+            search_cx, search_cy = cx, cy
 
-    def reset(self) -> None:
-        """Сбрасывает состояние (для повторного выбора объекта)."""
-        self._tracker = None
-        self.roi = None
-        self._roi_f = None
-        self._locked_size = None
-        self._init_size = None
-        self._scale = 1.0
-        self._template = None
-        self._template_size = None
-        self._fail_streak = 0
-        self._since_reacquire = 0
-        self._lost_frames = 0
-        self._score_ema = None
-        self.ok = False
-        self.initialized = False
-        self.reacquired = False
-        self.last_score = None
+        max_shift_x = max(
+            12.0, self.refine_radius * 2.0 * bw, 0.65 * abs(self._vel[0]) + 8.0
+        )
+        max_shift_y = max(3.0, self.refine_radius * 0.25 * bh)
+
+        # Score на якоре.
+        anchor_t = self._templ_at_scale(self._scale)
+        if anchor_t is not None:
+            ath, atw = anchor_t.shape[:2]
+            anchor = _score_at(enh, anchor_t, (pcx - atw / 2.0, pcy - ath / 2.0))
+            if not np.isfinite(anchor):
+                anchor = -1.0
+        else:
+            anchor = -1.0
+
+        best = -1.0
+        best_roi: Roi | None = None
+        best_scale = self._scale
+        best_peak = False
+        for s in self._search_scales():
+            templ = self._templ_at_scale(s)
+            if templ is None:
+                continue
+            th, tw = templ.shape[:2]
+            at = _score_at(enh, templ, (search_cx - tw / 2.0, search_cy - th / 2.0))
+            ncc_roi, ncc_score, peak_ratio = _match_template_local(
+                enh,
+                templ,
+                (search_cx, search_cy),
+                max_shift_x=max_shift_x,
+                max_shift_y=max_shift_y,
+            )
+            cand = float(at) if np.isfinite(at) else -1.0
+            cand_roi = (
+                int(round(search_cx - tw / 2.0)),
+                int(round(search_cy - th / 2.0)),
+                tw,
+                th,
+            )
+            used_peak = False
+            if (
+                ncc_roi is not None
+                and np.isfinite(ncc_score)
+                and ncc_score + 0.015 >= cand
+                and peak_ratio >= self.min_peak_ratio
+            ):
+                ncx = ncc_roi[0] + ncc_roi[2] / 2.0
+                ncy = ncc_roi[1] + ncc_roi[3] / 2.0
+                if abs(ncy - pcy) <= 0.18 * bh:
+                    cand = float(ncc_score)
+                    cand_roi = ncc_roi
+                    used_peak = True
+
+            # Штрафы: чужой масштаб и диагональный уход.
+            tcx = cand_roi[0] + cand_roi[2] / 2.0
+            tcy = cand_roi[1] + cand_roi[3] / 2.0
+            adj = cand
+            adj -= 0.025 * abs(s - self._scale) / max(self._scale, 0.2)
+            adj -= 0.05 * (abs(tcy - pcy) / max(bh, 1.0))
+            # Intensity gate на кандидате.
+            probe = clamp_roi(
+                (tcx - bw / 2.0, tcy - bh / 2.0, bw, bh), w, h
+            )
+            dI = self._intensity_delta(raw, probe)
+            if dI > self.intensity_tol * 1.35:
+                adj -= 0.12
+
+            if adj > best:
+                best = cand
+                best_roi = cand_roi
+                best_scale = s
+                best_peak = used_peak
+
+        self.last_score = best
+        soft = self.verify_threshold * 0.68
+
+        if best_roi is not None and best >= soft:
+            ncx = best_roi[0] + best_roi[2] / 2.0
+            ncy = best_roi[1] + best_roi[3] / 2.0
+            ncx, ncy = self._stabilize(
+                ncx, ncy, cand=best, anchor=float(anchor), bw=bw, bh=bh
+            )
+            if (
+                abs(best_scale - self._scale) > 0.03
+                and not self.lock_size
+                and best >= float(anchor) + 0.04
+                and (best_peak or best >= self.verify_threshold + 0.05)
+            ):
+                bw, bh = self._apply_scale(best_scale, hard=False)
+            else:
+                bw, bh = self._box_size()
+            refined = (ncx - bw / 2.0, ncy - bh / 2.0, bw, bh)
+        else:
+            # Держим якорь по Y, слегка к KCF по X.
+            ncx = 0.55 * cx + 0.45 * pcx
+            ncy = pcy
+            refined = (ncx - bw / 2.0, ncy - bh / 2.0, bw, bh)
+
+        chase = (cx - bw / 2.0, pcy - bh / 2.0, bw, bh)
+
+        if self._jump_too_far(cx, cy) and best < soft:
+            return self._fail(img, raw, weight=1, chase=chase, score=best)
+        if best < 0.0 or not np.isfinite(best):
+            return self._fail(img, raw, weight=1, chase=chase, score=0.0)
+        if best < soft:
+            return self._fail(img, raw, weight=1, chase=chase, score=best)
+
+        croi = clamp_roi(refined, w, h)
+        if not self._intensity_ok(raw, croi) and best < self.verify_threshold + 0.08:
+            return self._fail(img, raw, weight=1, chase=chase, score=best)
+
+        if best < self.verify_threshold:
+            self._fail_streak += 1
+            if self._fail_streak >= self.lost_patience:
+                return self._mark_lost()
+            self._accept(
+                img, raw, enh, refined, best, update_template=False, clear_fail=False
+            )
+            return True, self.roi
+
+        self._accept(img, raw, enh, refined, best)
+        # Гасим вертикальную скорость.
+        vx, vy = self._vel
+        self._vel = (vx, 0.45 * vy)
+        if self.roi is not None:
+            rcx = refined[0] + refined[2] / 2.0
+            if abs(rcx - cx) > 0.40 * max(bw, 1.0):
+                self._reinit_tracker(img, self.roi)
+        return True, self.roi
 
 
 def draw_tracking(
     frame_bgr: np.ndarray,
     roi: Roi | None,
     ok: bool,
-    frame_idx: int = 0,
+    *,
+    score: float | None = None,
 ) -> np.ndarray:
-    """Рисует рамку ROI и статус трекинга (для отладки/тестов)."""
-    out = frame_bgr.copy() if frame_bgr.ndim == 3 else cv2.cvtColor(frame_bgr, cv2.COLOR_GRAY2BGR)
-    color = (0, 220, 0) if ok else (0, 0, 255)
+    out = frame_bgr.copy()
     if roi is not None:
         x, y, rw, rh = roi
+        color = (0, 220, 0) if ok else (0, 0, 255)
         cv2.rectangle(out, (x, y), (x + rw, y + rh), color, 2)
-        cx, cy = roi_center(roi)
-        cv2.drawMarker(out, (cx, cy), color, cv2.MARKER_CROSS, 14, 2)
-    if roi is None:
-        state = "SELECT (R)"
-    else:
-        state = "OK" if ok else "LOST"
-    status = f"frame {frame_idx}  {state}"
-    cv2.putText(out, status, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 4, cv2.LINE_AA)
-    cv2.putText(out, status, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+    label = "OK" if ok else "LOST"
+    if score is not None and np.isfinite(score):
+        label += f"  ncc={score:.2f}"
+    cv2.putText(
+        out, label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3, cv2.LINE_AA
+    )
+    cv2.putText(
+        out,
+        label,
+        (12, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
     return out
 
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Изолированный тест захвата и трекинга объекта по одному видео.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="Тест ObjectTracker для thermal IR (KCF+CLAHE-NCC)."
     )
-    p.add_argument("--video", required=True, help="Видео для теста трекинга.")
-    p.add_argument(
-        "--tracker", choices=list(TRACKER_KINDS), default="csrt", help="Тип трекера."
-    )
-    p.add_argument(
-        "--roi",
-        type=int,
-        nargs=4,
-        metavar=("X", "Y", "W", "H"),
-        default=None,
-        help="ROI без интерактивного выбора (иначе выбор мышью).",
-    )
-    p.add_argument(
-        "--smooth",
-        type=float,
-        default=0.3,
-        help="Сглаживание рамки [0..1): 0 = без сглаживания, ближе к 1 = плавнее (больше лаг).",
-    )
-    p.add_argument(
-        "--lock-size",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Фиксировать размер рамки (двигается только центр). Резкое сжатие → LOST.",
-    )
-    p.add_argument(
-        "--keep-aspect",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Масштабировать рамку равномерно, сохраняя исходные пропорции.",
-    )
-    p.add_argument(
-        "--max-scale-step",
-        type=float,
-        default=0.05,
-        help="Макс. относительное изменение масштаба рамки за кадр (0 = без лимита).",
-    )
-    p.add_argument(
-        "--max-size-ratio",
-        type=float,
-        default=1.6,
-        help="Макс. изменение площади рамки за кадр (1.6 ≈ ±60%%); иначе LOST.",
-    )
-    p.add_argument(
-        "--verify",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Отклонять дрейф рамки на другой объект/фон (сходство с эталоном + прыжок).",
-    )
-    p.add_argument(
-        "--verify-threshold",
-        type=float,
-        default=0.45,
-        help="Мин. сходство с эталоном [0..1], ниже — считаем кадр плохим.",
-    )
-    p.add_argument(
-        "--max-jump",
-        type=float,
-        default=1.0,
-        help="Макс. прыжок центра за кадр в долях диагонали ROI (0 = без лимита).",
-    )
-    p.add_argument(
-        "--verify-rel",
-        type=float,
-        default=0.75,
-        help="Отклонять кадр, если score < EMA*verify-rel (дрейф на соседний объект).",
-    )
-    p.add_argument(
-        "--min-iou",
-        type=float,
-        default=0.35,
-        help="Мин. IoU с предыдущей рамкой (отсекает перескок на пересекающийся объект).",
-    )
-    p.add_argument(
-        "--lost-patience",
-        type=int,
-        default=2,
-        help="Сколько подряд плохих кадров нужно, чтобы объявить потерю цели.",
-    )
-    p.add_argument(
-        "--reacquire",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Повторно захватывать объект после потери по эталону.",
-    )
-    p.add_argument(
-        "--reacquire-threshold",
-        type=float,
-        default=0.62,
-        help="Порог совпадения для повторного захвата [0..1].",
-    )
-    p.add_argument(
-        "--reacquire-radius",
-        type=float,
-        default=2.5,
-        help="Окно поиска при перезахвате (доли max(w,h) ROI вокруг последней позиции).",
-    )
-    p.add_argument(
-        "--reacquire-global",
-        action="store_true",
-        help="Искать объект по всему кадру при перезахвате (может хватать похожий фон).",
-    )
-    p.add_argument(
-        "--reacquire-interval",
-        type=int,
-        default=5,
-        help="Искать объект при потере каждые N кадров (1 = каждый кадр, тяжелее).",
-    )
-    p.add_argument(
-        "--reacquire-scale-min",
-        type=float,
-        default=0.35,
-        help="Мин. масштаб эталона при перезахвате (меньше = искать более далёкий/мелкий объект).",
-    )
-    p.add_argument(
-        "--reacquire-scale-max",
-        type=float,
-        default=1.4,
-        help="Макс. масштаб эталона при перезахвате.",
-    )
-    p.add_argument(
-        "--click-tolerance",
-        type=int,
-        default=16,
-        help="Допуск цвета при авто-выделении кликом (клавиша C).",
-    )
-    p.add_argument(
-        "--no-grabcut",
-        action="store_true",
-        help="Не уточнять границы объекта GrabCut'ом при выборе кликом.",
-    )
-    p.add_argument("--max-display", type=int, default=1200, help="Макс. сторона окна.")
-    p.add_argument(
-        "--max-frames", type=int, default=0, help="Ограничить число кадров (0 = все)."
-    )
-    p.add_argument(
-        "--no-show",
-        action="store_true",
-        help="Без окна (для нагрузочных/CI тестов): печатает ROI по кадрам.",
-    )
+    p.add_argument("--video", required=True)
+    p.add_argument("--tracker", choices=TRACKER_KINDS, default="kcf")
+    p.add_argument("--max-display", type=int, default=1200)
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
-
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
-        sys.exit(f"Ошибка: не удалось открыть видео '{args.video}'.")
-
+        sys.exit(f"Не удалось открыть '{args.video}'.")
     ok, frame = cap.read()
     if not ok:
-        sys.exit("Ошибка: не удалось прочитать первый кадр.")
-
-    tracker = ObjectTracker(
-        kind=args.tracker,
-        smooth=args.smooth,
-        lock_size=args.lock_size,
-        keep_aspect=args.keep_aspect,
-        max_scale_step=args.max_scale_step,
-        max_size_ratio=args.max_size_ratio,
-        verify=args.verify,
-        verify_threshold=args.verify_threshold,
-        max_jump=args.max_jump,
-        lost_patience=args.lost_patience,
-        verify_rel=args.verify_rel,
-        min_iou=args.min_iou,
-        reacquire=args.reacquire,
-        reacquire_threshold=args.reacquire_threshold,
-        reacquire_radius=args.reacquire_radius,
-        reacquire_global=args.reacquire_global,
-        reacquire_interval=args.reacquire_interval,
-        reacquire_scale_min=args.reacquire_scale_min,
-        reacquire_scale_max=args.reacquire_scale_max,
-    )
-    if args.roi is not None:
-        roi = tracker.init(frame, tuple(args.roi))
-        print(f"Старт трекинга ({args.tracker}), ROI={roi}")
-    elif args.no_show:
-        sys.exit("В режиме --no-show укажите --roi (интерактивный выбор недоступен).")
-    else:
-        print("R — выбор рамкой, C — выбор кликом (авто-границы), Q — выход.")
-
-    window = "Object tracking test (R=box, C=click, Q=quit)"
-    if not args.no_show:
-        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-
-    frame_idx = 0
-    lost_count = 0
-    while True:
-        if frame_idx > 0:
-            ok, frame = cap.read()
-            if not ok:
-                print("Конец видео.")
-                break
-            if args.max_frames > 0 and frame_idx >= args.max_frames:
-                print("Достигнут --max-frames.")
-                break
+        sys.exit("Пустое видео.")
+    tracker = ObjectTracker(kind=args.tracker)
+    window = "ObjectTracker thermal (R=box, C=click, Q=quit)"
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    print("R — рамка, C — клик, Q — выход.")
+    try:
+        while True:
             if tracker.initialized:
-                track_ok, roi = tracker.update(frame)
-                if not track_ok:
-                    lost_count += 1
-
-        if args.no_show:
-            print(f"frame {frame_idx}: ok={tracker.ok} roi={tracker.roi}")
-        else:
-            vis = draw_tracking(frame, tracker.roi, tracker.ok, frame_idx)
+                tracking_ok, roi = tracker.update(frame)
+            else:
+                tracking_ok, roi = False, None
+            vis = draw_tracking(
+                _as_bgr(frame), roi, tracking_ok, score=tracker.last_score
+            )
             scale = display_scale(vis.shape, args.max_display)
             cv2.imshow(window, fit_for_display(vis, scale))
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
             if key in (ord("r"), ord("R")):
-                print("Выбор объекта рамкой на текущем кадре...")
                 tracker.init_interactive(frame, args.max_display)
             if key in (ord("c"), ord("C")):
-                print("Выбор объекта кликом на текущем кадре...")
-                tracker.init_by_click(
-                    frame,
-                    args.max_display,
-                    tolerance=args.click_tolerance,
-                    grabcut_refine=not args.no_grabcut,
-                )
-        frame_idx += 1
-
-    cap.release()
-    cv2.destroyAllWindows()
-    print(f"Готово: обработано {frame_idx} кадров, потерь трекинга: {lost_count}.")
+                tracker.init_by_click(frame, args.max_display)
+            ok, frame = cap.read()
+            if not ok:
+                print("Конец видео.")
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

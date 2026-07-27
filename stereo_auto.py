@@ -124,15 +124,23 @@ def estimate_disparity_range_bounds(
     margin: float = 0.15,
     image_width: int | None = None,
     keep_far_at_zero: bool = True,
+    long_range: bool | None = None,
 ) -> tuple[int, int, str]:
     """Подбирает min/num_disparities под заданный диапазон дистанций (метры).
 
     Ближе объект → больше диспаритет: z_near задаёт верхнюю границу поиска,
     z_far — нижнюю. При keep_far_at_zero min_disparity=0, чтобы дальние объекты
     не обрезались.
+
+    long_range (или z_far>=800): жёстко ограничивает num_disparities сверху
+    значением ~d(z_near). Иначе SGBM находит ложные большие d и «приближает»
+    объекты с 1000 м до десятков метров.
     """
     if z_near_m <= 0 or z_far_m <= 0 or z_near_m >= z_far_m:
         raise ValueError("Нужно 0 < z_near_m < z_far_m (дистанции в метрах).")
+
+    if long_range is None:
+        long_range = z_far_m >= 800.0
 
     focal, baseline = extract_calib_geometry(calib)
     z_near_mm = z_near_m * 1000.0
@@ -144,24 +152,33 @@ def estimate_disparity_range_bounds(
         min_disp = 0
     else:
         min_disp = max(0, int(np.floor(d_far * (1.0 - margin))))
-    span = d_near * (1.0 + margin) - float(min_disp)
-    num_disp = round_num_disparities(max(span, 32.0), min_val=32, max_val=512)
 
-    if image_width is not None:
-        # Для дальних сцен (10–40 м) нужна широкая полоса поиска — не режем жёстко.
-        max_invalid = 0.42 if z_far_m >= 15.0 else 0.28
-        min_working = 0.35 if z_far_m >= 15.0 else 0.45
-        min_disp, num_disp = constrain_disparity_range(
-            min_disp,
-            num_disp,
-            image_width,
-            scene_upper_px=d_near * (1.0 + margin),
-            max_invalid_fraction=max_invalid,
-            min_working_fraction=min_working,
-        )
-        min_disp, num_disp = clamp_sgbm_range(
-            min_disp, num_disp, image_width, max_num=512
-        )
+    if long_range:
+        # Только поиск «дальней» полосы: d <= d(z_near). Большие d запрещены.
+        span = max(d_near * (1.0 + margin), d_far * 4.0, 16.0)
+        num_disp = round_num_disparities(span, min_val=16, max_val=96)
+        if image_width is not None:
+            min_disp, num_disp = clamp_sgbm_range(
+                min_disp, num_disp, image_width, max_num=96
+            )
+    else:
+        span = d_near * (1.0 + margin) - float(min_disp)
+        num_disp = round_num_disparities(max(span, 32.0), min_val=32, max_val=512)
+
+        if image_width is not None:
+            max_invalid = 0.42 if z_far_m >= 15.0 else 0.28
+            min_working = 0.35 if z_far_m >= 15.0 else 0.45
+            min_disp, num_disp = constrain_disparity_range(
+                min_disp,
+                num_disp,
+                image_width,
+                scene_upper_px=d_near * (1.0 + margin),
+                max_invalid_fraction=max_invalid,
+                min_working_fraction=min_working,
+            )
+            min_disp, num_disp = clamp_sgbm_range(
+                min_disp, num_disp, image_width, max_num=512
+            )
 
     z_cov_near = focal * baseline / max(float(min_disp + num_disp), 1.0)
     z_cov_far = (
@@ -170,10 +187,11 @@ def estimate_disparity_range_bounds(
         else float("inf")
     )
     far_txt = f"{z_cov_far / 1000.0:.1f}" if np.isfinite(z_cov_far) else "inf"
+    mode = "long-range" if long_range else "standard"
     log = (
-        f"Авто-диапазон под {z_near_m:.1f}-{z_far_m:.1f} м "
+        f"Авто-диапазон [{mode}] под {z_near_m:.1f}-{z_far_m:.1f} м "
         f"(f={focal:.1f} px, B={baseline:.1f} мм): "
-        f"d~{d_far:.1f}..{d_near:.1f} px -> "
+        f"d~{d_far:.2f}..{d_near:.1f} px -> "
         f"min_disparity={min_disp}, num_disparities={num_disp} "
         f"(покрытие ~{z_cov_near / 1000.0:.1f}-{far_txt} м)."
     )

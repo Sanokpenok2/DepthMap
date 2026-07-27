@@ -17,7 +17,8 @@
 
 Управление:
     пробел  — пауза/продолжить
-    r       — заново выбрать объект
+    r / c   — выбрать объект (рамка / клик)
+    d       — вкл/выкл отладку диспаритета (L↔R соответствия)
     q / Esc — выход
 """
 
@@ -39,10 +40,12 @@ from depth_map import (
     build_sgbm,
     calibration_quality_warnings,
     display_scale,
+    draw_disparity_debug,
     fit_for_display,
     load_calibration,
     measure_roi_distance,
     split_sbs,
+    DisparityDebugInfo,
 )
 from object_tracker import ObjectTracker
 from calib_quality import format_quality_report
@@ -51,6 +54,7 @@ from stereo_auto import (
     disparity_from_depth,
     estimate_disparity_range_bounds,
     extract_calib_geometry,
+    round_num_disparities,
 )
 
 
@@ -96,7 +100,12 @@ def parse_args() -> argparse.Namespace:
         default=128,
         help="Диапазон диспаритетов (кратен 16). При --auto-disparity — стартовое значение.",
     )
-    p.add_argument("--block-size", type=int, default=5)
+    p.add_argument(
+        "--block-size",
+        type=int,
+        default=7,
+        help="Размер блока SGBM/BM (нечётный). 7–9 лучше для мелких дальних объектов.",
+    )
     p.add_argument(
         "--min-disparity",
         type=int,
@@ -116,35 +125,62 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--z-near",
         type=float,
-        default=5.0,
-        help="Ближняя дистанция сцены, м (для --auto-disparity).",
+        default=200.0,
+        help="Ближняя граница сцены, м. Для 1000+ м: 150–300 (потолок поиска SGBM).",
     )
     p.add_argument(
         "--z-far",
         type=float,
-        default=40.0,
-        help="Дальняя дистанция сцены, м (для --auto-disparity).",
+        default=2500.0,
+        help="Дальняя граница сцены, м. Для шоссе/1000+ м: 1500–3000.",
+    )
+    p.add_argument(
+        "--long-range",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Режим дальних дистанций: жёсткий потолок num_disparities ~d(z-near), "
+            "без авто-расширения к ближней зоне (иначе ложные большие d → 20–50 м)."
+        ),
     )
     p.add_argument("--wls", action="store_true", help="WLS-фильтр (медленнее).")
     p.add_argument("--wls-lambda", type=float, default=8000.0)
     p.add_argument("--wls-sigma", type=float, default=1.5)
     p.add_argument(
+        "--clahe",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="CLAHE на ректифицированном gray (важно для низкоконтрастного ТВ/ИК).",
+    )
+    p.add_argument(
         "--tracker",
-        choices=["csrt", "kcf", "mosse"],
-        default="csrt",
-        help="Тип OpenCV-трекера.",
+        choices=["csrt", "kcf", "mosse", "ncc"],
+        default="kcf",
+        help=(
+            "Базовый трекер под гибрид + NCC-refine: "
+            "kcf/csrt/mosse (OpenCV) или ncc (template/NCC как в DepthMapKornia)."
+        ),
+    )
+    p.add_argument(
+        "--kornia-tracker",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Использовать базовый трекинг как в DepthMapKornia "
+            "(NCC template вместо KCF). Эквивалент --tracker ncc."
+        ),
     )
     p.add_argument(
         "--roi-smooth",
         type=float,
-        default=0.3,
-        help="Сглаживание рамки трекинга [0..1): 0 = без сглаживания, ближе к 1 = плавнее (больше лаг).",
+        default=0.0,
+        help="Сглаживание рамки трекинга [0..1): 0 = без лага, ближе к 1 = плавнее (отстаёт от объекта).",
     )
     p.add_argument(
         "--lock-size",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Фиксировать размер рамки трекинга (двигается только центр). Резкое сжатие -> LOST.",
+        default=False,
+        help="Фиксировать размер рамки. Выкл. (по умолчанию) — scale по NCC при приближении/удалении.",
     )
     p.add_argument(
         "--keep-aspect",
@@ -155,14 +191,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--max-scale-step",
         type=float,
-        default=0.05,
+        default=0.08,
         help="Макс. относительное изменение масштаба рамки за кадр (0 = без лимита).",
     )
     p.add_argument(
         "--max-size-ratio",
         type=float,
-        default=1.6,
-        help="Макс. изменение площади рамки за кадр (1.6 ~ +/-60%%); иначе LOST.",
+        default=2.5,
+        help="Макс. изменение площади рамки за кадр; иначе LOST.",
     )
     p.add_argument(
         "--verify",
@@ -173,32 +209,32 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--verify-threshold",
         type=float,
-        default=0.45,
-        help="Мин. сходство с эталоном [0..1], ниже — считаем кадр плохим.",
+        default=0.30,
+        help="Мин. NCC (CLAHE) [0..1]; ниже soft-полосы — копим LOST.",
     )
     p.add_argument(
         "--max-jump",
         type=float,
-        default=1.0,
-        help="Макс. прыжок центра за кадр в долях диагонали ROI (0 = без лимита).",
+        default=4.0,
+        help="Макс. прыжок центра (доли ширины ROI по X; для быстрых L→R ≥3).",
     )
     p.add_argument(
         "--verify-rel",
         type=float,
-        default=0.75,
-        help="Отклонять кадр, если score < EMA*verify-rel (дрейф на соседний объект).",
+        default=0.0,
+        help="Отклонять кадр, если score < EMA*verify-rel (0 = выкл.).",
     )
     p.add_argument(
         "--min-iou",
         type=float,
-        default=0.35,
-        help="Мин. IoU с предыдущей рамкой (отсекает перескок на пересекающийся объект).",
+        default=0.0,
+        help="Мин. IoU с предыдущей рамкой (0 = выкл.; для быстрого движения лучше 0).",
     )
     p.add_argument(
         "--lost-patience",
         type=int,
-        default=2,
-        help="Сколько подряд плохих кадров нужно, чтобы объявить потерю цели.",
+        default=14,
+        help="Сколько подряд плохих кадров нужно, чтобы объявить LOST.",
     )
     p.add_argument(
         "--reacquire",
@@ -209,13 +245,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--reacquire-threshold",
         type=float,
-        default=0.62,
-        help="Порог совпадения для повторного захвата [0..1].",
+        default=0.55,
+        help="Порог NCC для повторного захвата [0..1] (выше = меньше ложных прыжков).",
     )
     p.add_argument(
         "--reacquire-radius",
         type=float,
-        default=2.5,
+        default=3.5,
         help="Окно поиска при перезахвате (доли max(w,h) ROI вокруг последней позиции).",
     )
     p.add_argument(
@@ -226,26 +262,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--reacquire-interval",
         type=int,
-        default=5,
+        default=2,
         help="Искать объект при потере каждые N кадров (1 = каждый кадр, тяжелее).",
     )
     p.add_argument(
         "--reacquire-scale-min",
         type=float,
-        default=0.35,
-        help="Мин. масштаб эталона при перезахвате (меньше = искать более далёкий/мелкий объект).",
+        default=0.50,
+        help="Мин. масштаб эталона при перезахвате (удаление).",
     )
     p.add_argument(
         "--reacquire-scale-max",
         type=float,
-        default=1.4,
-        help="Макс. масштаб эталона при перезахвате.",
+        default=2.0,
+        help="Макс. масштаб эталона при перезахвате (приближение).",
     )
     p.add_argument(
         "--click-tolerance",
         type=int,
         default=16,
-        help="Допуск цвета при авто-выделении объекта кликом (клавиша C).",
+        help="Допуск яркости при авто-выделении кликом (C); после клика +/- подстраивает.",
     )
     p.add_argument(
         "--no-grabcut",
@@ -256,13 +292,64 @@ def parse_args() -> argparse.Namespace:
         "--sgbm-interval",
         type=int,
         default=2,
-        help="Считать SGBM каждые N кадров (1 = каждый кадр).",
+        help="Считать SGBM каждые N кадров (1 = каждый кадр; больше = выше FPS трекинга).",
     )
     p.add_argument(
         "--smooth",
         type=int,
-        default=5,
-        help="Окно медианы по последним N измерениям расстояния (0 = без сглаживания).",
+        default=21,
+        help="Окно медианы по расстоянию/диспаритету (кадры). 0 = без сглаживания.",
+    )
+    p.add_argument(
+        "--smooth-max-ratio",
+        type=float,
+        default=1.8,
+        help=(
+            "Отбрасывать измерение, если Z или disp скачет сильнее чем в N раз "
+            "относительно текущего сглаженного."
+        ),
+    )
+    p.add_argument(
+        "--smooth-ema",
+        type=float,
+        default=0.25,
+        help="Доп. EMA после медианы [0..1]: меньше = плавнее (больше инерция).",
+    )
+    p.add_argument(
+        "--smooth-disp-jump",
+        type=float,
+        default=1.2,
+        help="Макс. скачок диспаритета (px) за кадр без отбраковки; 0 = не учитывать.",
+    )
+    p.add_argument(
+        "--roi-inset",
+        type=float,
+        default=0.32,
+        help="Доля обрезки краёв ROI при измерении дистанции (0 = весь бокс).",
+    )
+    p.add_argument(
+        "--surface",
+        choices=["far", "near", "median"],
+        default="median",
+        help=(
+            "Поверхность в ROI: median=стабильнее; far=чуть дальше "
+            "(осторожно: шум малого d завышает Z); near=ближе."
+        ),
+    )
+    p.add_argument(
+        "--debug-disparity",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Окно отладки: пиксели ROI на L и соответствия x-d на R "
+            "(клавиша D переключает)."
+        ),
+    )
+    p.add_argument(
+        "--debug-disp-samples",
+        type=int,
+        default=48,
+        help="Сколько линий L→R рисовать в --debug-disparity.",
     )
     p.add_argument(
         "--threads",
@@ -308,6 +395,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Ограничить число кадров (0 = до конца).",
+    )
+    p.add_argument(
+        "--max-fps",
+        type=float,
+        default=0.0,
+        help="Ограничить скорость обработки (кадр/с). 0 = без ограничения.",
     )
     return p.parse_args()
 
@@ -385,6 +478,15 @@ def to_gray(frame: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
 
+def enhance_gray(gray: np.ndarray, clahe: bool = True) -> np.ndarray:
+    """Поднять локальный контраст на низкоконтрастном gray (ТВ/ИК)."""
+    if not clahe or gray.ndim != 2:
+        return gray
+    # clipLimit умеренный: сильнее — шумит диспаритет.
+    clahe_f = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    return clahe_f.apply(gray)
+
+
 def resize_to_calib(img: np.ndarray, size: tuple[int, int] | None) -> np.ndarray:
     if size is None:
         return img
@@ -400,11 +502,14 @@ def prepare_side(
     map1: np.ndarray,
     map2: np.ndarray,
     calib_size: tuple[int, int] | None,
+    *,
+    clahe: bool = True,
 ) -> np.ndarray:
-    """Gray → resize → remap для одной камеры (удобно гонять в ThreadPool)."""
+    """Gray → resize → remap (+CLAHE) для одной камеры."""
     gray = to_gray(frame)
     gray = resize_to_calib(gray, calib_size)
-    return cv2.remap(gray, map1, map2, cv2.INTER_LINEAR)
+    gray = cv2.remap(gray, map1, map2, cv2.INTER_LINEAR)
+    return enhance_gray(gray, clahe=clahe)
 
 
 def prepare_pair(
@@ -412,25 +517,34 @@ def prepare_pair(
     frame_r: np.ndarray,
     calib: dict | None,
     pool: ThreadPoolExecutor | None,
+    *,
+    clahe: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     # Без калибровки ректификация невозможна: только gray (для трекинга этого хватает).
     if calib is None:
-        return to_gray(frame_l), to_gray(frame_r)
+        return (
+            enhance_gray(to_gray(frame_l), clahe=clahe),
+            enhance_gray(to_gray(frame_r), clahe=clahe),
+        )
 
     calib_size = None
     if "image_size" in calib:
         calib_size = (int(calib["image_size"][0]), int(calib["image_size"][1]))
 
     if pool is None:
-        rect_l = prepare_side(frame_l, calib["map1_l"], calib["map2_l"], calib_size)
-        rect_r = prepare_side(frame_r, calib["map1_r"], calib["map2_r"], calib_size)
+        rect_l = prepare_side(
+            frame_l, calib["map1_l"], calib["map2_l"], calib_size, clahe=clahe
+        )
+        rect_r = prepare_side(
+            frame_r, calib["map1_r"], calib["map2_r"], calib_size, clahe=clahe
+        )
         return rect_l, rect_r
 
     fut_l = pool.submit(
-        prepare_side, frame_l, calib["map1_l"], calib["map2_l"], calib_size
+        prepare_side, frame_l, calib["map1_l"], calib["map2_l"], calib_size, clahe=clahe
     )
     fut_r = pool.submit(
-        prepare_side, frame_r, calib["map1_r"], calib["map2_r"], calib_size
+        prepare_side, frame_r, calib["map1_r"], calib["map2_r"], calib_size, clahe=clahe
     )
     return fut_l.result(), fut_r.result()
 
@@ -451,10 +565,23 @@ def compute_disparity(
 
 
 def make_stereo_matcher(
-    method: str, min_disparity: int, num_disparities: int, block_size: int
+    method: str,
+    min_disparity: int,
+    num_disparities: int,
+    block_size: int,
+    *,
+    uniqueness_ratio: int = 5,
+    speckle_window_size: int = 50,
 ):
+    """Stereo matcher. Для long-range лучше uniqueness_ratio≈12–15."""
     if method == "sgbm":
-        return build_sgbm(min_disparity, num_disparities, block_size)
+        return build_sgbm(
+            min_disparity,
+            num_disparities,
+            block_size,
+            uniqueness_ratio=uniqueness_ratio,
+            speckle_window_size=speckle_window_size,
+        )
     return build_bm(num_disparities, block_size)
 
 
@@ -468,33 +595,51 @@ def adapt_disparity_range(
     cur_num: int,
     distance_mm: float | None,
     disparity_px: float | None,
+    long_range: bool | None = None,
 ) -> tuple[int, int, str | None]:
-    """Расширяет диапазон, если объект приблизился или диспаритет упёрся в потолок."""
+    """Расширяет диапазон, если объект приблизился или диспаритет упёрся в потолок.
+
+    В long-range (z_far>=800) НЕ сужаем сцену по «ложному» ближнему Z —
+    иначе SGBM начинает искать большие d и дистанция падает до десятков метров.
+    """
     width = max(int(image_width), 32)
+    if long_range is None:
+        long_range = z_far_m >= 800.0
+
     upper = float(cur_min + cur_num)
     saturating = (
         disparity_px is not None
         and np.isfinite(disparity_px)
-        and disparity_px > 0.75 * upper
+        and disparity_px > 0.90 * upper
     )
 
     z_m = None
     if distance_mm is not None and np.isfinite(distance_mm) and distance_mm > 0:
         z_m = float(distance_mm) / 1000.0
 
+    # Дальняя сцена: игнорируем «приближение», пока d не упёрся в потолок поиска.
+    if long_range and not saturating:
+        return cur_min, cur_num, None
+
     if not saturating and z_m is None:
         return cur_min, cur_num, None
 
+    # Ложное «близко»: Z заметно меньше z_near — не открываем ближнюю полосу.
+    if long_range and z_m is not None and z_m < 0.85 * z_near_m and not saturating:
+        return cur_min, cur_num, None
+
     focal, baseline = extract_calib_geometry(calib)
-    if z_m is not None:
-        # Запас «ближе текущего»: иначе при подходе d выходит за num_disparities.
+    if z_m is not None and not long_range:
         z_lo = max(min(z_near_m, z_m * 0.45), 0.5)
         z_hi = min(z_far_m, max(z_m * 1.8, z_m + 5.0))
+    elif saturating and long_range:
+        # Только чуть расширяем ближнюю границу (не ниже ~0.6*z_near).
+        z_lo = max(z_near_m * 0.6, 20.0)
+        z_hi = z_far_m
     else:
         z_lo, z_hi = z_near_m, z_far_m
 
-    if saturating:
-        # Форсируем более ближнюю зону.
+    if saturating and not long_range:
         z_lo = max(0.5, min(z_lo, z_near_m))
         if z_m is not None:
             z_lo = max(0.5, min(z_lo, z_m * 0.35))
@@ -503,23 +648,20 @@ def adapt_disparity_range(
         z_lo, z_hi = z_near_m, z_far_m
 
     new_min, new_num, _ = estimate_disparity_range_bounds(
-        calib, z_lo, z_hi, image_width=width
+        calib, z_lo, z_hi, image_width=width, long_range=long_range
     )
-    new_min, new_num = clamp_sgbm_range(new_min, new_num, width, max_num=512)
+    max_num = 96 if long_range else 512
+    new_min, new_num = clamp_sgbm_range(new_min, new_num, width, max_num=max_num)
 
-    # При насыщении гарантированно расширяем верхнюю границу.
-    if saturating and disparity_px is not None:
+    if saturating and disparity_px is not None and not long_range:
         need_upper = float(disparity_px) * 1.35 + 16.0
         if new_min + new_num < need_upper:
             span = need_upper - float(new_min)
-            from stereo_auto import round_num_disparities
-
             new_num = round_num_disparities(span, min_val=64, max_val=512)
             new_min, new_num = clamp_sgbm_range(new_min, new_num, width, max_num=512)
 
     if new_min == cur_min and new_num == cur_num:
         return cur_min, cur_num, None
-    # Не сужаем сильно, пока объект может ещё подойти ближе.
     if new_min + new_num < cur_min + cur_num and not saturating:
         d_need = disparity_from_depth(focal, baseline, max(z_lo, 0.5) * 1000.0)
         if d_need <= 0.9 * upper:
@@ -530,9 +672,43 @@ def adapt_disparity_range(
         f"(было {cur_min}+{cur_num}"
         + (f", Z~{z_m:.1f} м" if z_m is not None else "")
         + (", насыщение" if saturating else "")
+        + (", long-range" if long_range else "")
         + ")."
     )
     return new_min, new_num, log
+
+
+def _flush_waitkey_buffer(max_ms: float = 250.0) -> None:
+    """Сбрасывает очередь клавиш HighGUI (после selectROI / click-UI)."""
+    t0 = time.perf_counter()
+    while (time.perf_counter() - t0) * 1000.0 < max_ms:
+        if int(cv2.waitKey(1)) < 0:
+            break
+
+
+def _annotate_debug_flag(frame_bgr: np.ndarray) -> np.ndarray:
+    out = frame_bgr
+    cv2.putText(
+        out,
+        "DISP DEBUG",
+        (out.shape[1] - 160, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 0, 0),
+        3,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        out,
+        "DISP DEBUG",
+        (out.shape[1] - 160, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return out
 
 
 def draw_overlay(
@@ -599,6 +775,7 @@ def draw_overlay(
 
 
 def smoothed_value(history: deque[float], value: float | None, window: int) -> float | None:
+    """Устаревшая простая медиана — предпочтите DistanceSmoother."""
     if value is None or not np.isfinite(value) or value <= 0:
         return float(np.median(history)) if history else None
     history.append(float(value))
@@ -607,6 +784,169 @@ def smoothed_value(history: deque[float], value: float | None, window: int) -> f
     if window <= 0:
         return float(value)
     return float(np.median(history))
+
+
+class DistanceSmoother:
+    """Робастное сглаживание дистанции для дальнего стерео.
+
+    Медиана по окну + отсев выбросов (скачок Z/disp в N раз) + лёгкий EMA.
+    При устойчивом новом уровне (outlier_patience кадров) принимаем смену.
+    """
+
+    def __init__(
+        self,
+        *,
+        window: int = 21,
+        max_ratio: float = 2.0,
+        ema_alpha: float = 0.2,
+        max_disp_jump: float = 1.2,
+        outlier_patience: int = 5,
+        max_distance_mm: float | None = None,
+    ) -> None:
+        self.window = max(0, int(window))
+        self.max_ratio = max(1.01, float(max_ratio))
+        self.ema_alpha = float(np.clip(ema_alpha, 0.0, 1.0))
+        self.max_disp_jump = float(max_disp_jump)
+        self.outlier_patience = max(1, int(outlier_patience))
+        self.max_distance_mm = (
+            float(max_distance_mm) if max_distance_mm is not None else None
+        )
+        self._dist_hist: deque[float] = deque()
+        self._disp_hist: deque[float] = deque()
+        self._ema_dist: float | None = None
+        self._ema_disp: float | None = None
+        self._outlier_streak = 0
+        self._pending_dist: deque[float] = deque(maxlen=self.outlier_patience)
+        self._pending_disp: deque[float] = deque(maxlen=self.outlier_patience)
+
+    def reset(self) -> None:
+        self._dist_hist.clear()
+        self._disp_hist.clear()
+        self._ema_dist = None
+        self._ema_disp = None
+        self._outlier_streak = 0
+        self._pending_dist.clear()
+        self._pending_disp.clear()
+
+    def _ref_dist(self) -> float | None:
+        if self._ema_dist is not None and self._ema_dist > 0:
+            return float(self._ema_dist)
+        if self._dist_hist:
+            return float(np.median(self._dist_hist))
+        return None
+
+    def _ref_disp(self) -> float | None:
+        if self._ema_disp is not None and self._ema_disp > 0:
+            return float(self._ema_disp)
+        if self._disp_hist:
+            return float(np.median(self._disp_hist))
+        return None
+
+    def _is_outlier(
+        self, distance_mm: float, disparity_px: float | None
+    ) -> bool:
+        if self.max_distance_mm is not None and distance_mm > self.max_distance_mm:
+            return True
+        ref_z = self._ref_dist()
+        if ref_z is not None and ref_z > 0:
+            ratio = float(distance_mm) / ref_z
+            if ratio > self.max_ratio or ratio < 1.0 / self.max_ratio:
+                return True
+        if disparity_px is not None and np.isfinite(disparity_px) and disparity_px > 0:
+            ref_d = self._ref_disp()
+            if ref_d is not None and ref_d > 0:
+                d_ratio = float(disparity_px) / ref_d
+                if d_ratio > self.max_ratio or d_ratio < 1.0 / self.max_ratio:
+                    return True
+                if self.max_disp_jump > 0 and abs(float(disparity_px) - ref_d) > self.max_disp_jump:
+                    if abs(np.log(d_ratio)) > np.log(1.35):
+                        return True
+        return False
+
+    def _commit(self, distance_mm: float, disparity_px: float | None) -> None:
+        if self.window <= 0:
+            self._ema_dist = float(distance_mm)
+            if disparity_px is not None and np.isfinite(disparity_px) and disparity_px > 0:
+                self._ema_disp = float(disparity_px)
+            return
+        self._dist_hist.append(float(distance_mm))
+        while len(self._dist_hist) > self.window:
+            self._dist_hist.popleft()
+        med_z = float(np.median(self._dist_hist))
+        if self._ema_dist is None or self.ema_alpha >= 1.0:
+            self._ema_dist = med_z
+        else:
+            a = self.ema_alpha
+            self._ema_dist = (1.0 - a) * self._ema_dist + a * med_z
+
+        if disparity_px is not None and np.isfinite(disparity_px) and disparity_px > 0:
+            self._disp_hist.append(float(disparity_px))
+            while len(self._disp_hist) > self.window:
+                self._disp_hist.popleft()
+            med_d = float(np.median(self._disp_hist))
+            if self._ema_disp is None or self.ema_alpha >= 1.0:
+                self._ema_disp = med_d
+            else:
+                a = self.ema_alpha
+                self._ema_disp = (1.0 - a) * self._ema_disp + a * med_d
+
+    def update(
+        self,
+        distance_mm: float | None,
+        disparity_px: float | None = None,
+    ) -> tuple[float | None, float | None]:
+        """Принимает сырое измерение, возвращает (Z_mm, disp) после сглаживания."""
+        if distance_mm is None or not np.isfinite(distance_mm) or distance_mm <= 0:
+            return self._ema_dist, self._ema_disp
+        # Жёсткий потолок сцены — не даём шумному малому d «улететь» за z_far.
+        if self.max_distance_mm is not None and float(distance_mm) > self.max_distance_mm:
+            return self._ema_dist, self._ema_disp
+
+        if self.window <= 0:
+            self._commit(float(distance_mm), disparity_px)
+            return self._ema_dist, self._ema_disp
+
+        # Первые точки — набираем без отсева (но уже с потолком z_far выше).
+        if len(self._dist_hist) < 3 and self._ema_dist is None:
+            self._commit(float(distance_mm), disparity_px)
+            self._outlier_streak = 0
+            return self._ema_dist, self._ema_disp
+
+        if self._is_outlier(float(distance_mm), disparity_px):
+            self._outlier_streak += 1
+            self._pending_dist.append(float(distance_mm))
+            if disparity_px is not None and np.isfinite(disparity_px):
+                self._pending_disp.append(float(disparity_px))
+            if self._outlier_streak >= self.outlier_patience and len(self._pending_dist) >= 3:
+                pend_med = float(np.median(self._pending_dist))
+                if (
+                    self.max_distance_mm is not None
+                    and pend_med > self.max_distance_mm
+                ):
+                    self._pending_dist.clear()
+                    self._pending_disp.clear()
+                    self._outlier_streak = 0
+                    return self._ema_dist, self._ema_disp
+                self._dist_hist.clear()
+                self._disp_hist.clear()
+                self._ema_dist = None
+                self._ema_disp = None
+                for z in self._pending_dist:
+                    self._commit(z, None)
+                if self._pending_disp:
+                    for d in self._pending_disp:
+                        self._disp_hist.append(d)
+                    self._ema_disp = float(np.median(self._disp_hist))
+                self._pending_dist.clear()
+                self._pending_disp.clear()
+                self._outlier_streak = 0
+            return self._ema_dist, self._ema_disp
+
+        self._outlier_streak = 0
+        self._pending_dist.clear()
+        self._pending_disp.clear()
+        self._commit(float(distance_mm), disparity_px)
+        return self._ema_dist, self._ema_disp
 
 
 def configure_threads(n: int) -> int:
@@ -622,6 +962,97 @@ def configure_threads(n: int) -> int:
     except Exception:
         pass
     return actual
+
+
+def _measure_and_smooth(
+    *,
+    disp_float: np.ndarray | None,
+    roi: tuple[int, int, int, int] | None,
+    Q,
+    args: argparse.Namespace,
+    max_disp_cap: float | None,
+    min_disp_floor: float,
+    max_distance_mm: float | None,
+    dist_smoother: DistanceSmoother,
+    collect_debug: bool = False,
+) -> tuple[float | None, float | None, float | None, DisparityDebugInfo | None]:
+    """ROI → сырая дистанция → сглаживание.
+
+    Возвращает (dist_s, disp_s_or_raw, raw_dist, debug|None).
+    """
+    if roi is None or disp_float is None:
+        dist_s, disp_s = dist_smoother.update(None, None)
+        return dist_s, disp_s, None, None
+    if collect_debug:
+        dist, disp_val, dbg = measure_roi_distance(
+            disp_float,
+            roi,
+            Q=Q,
+            inset_fraction=args.roi_inset,
+            surface=args.surface,
+            max_disparity=max_disp_cap,
+            min_disparity=min_disp_floor,
+            max_distance_mm=max_distance_mm,
+            collect_debug=True,
+        )
+    else:
+        dist, disp_val = measure_roi_distance(
+            disp_float,
+            roi,
+            Q=Q,
+            inset_fraction=args.roi_inset,
+            surface=args.surface,
+            max_disparity=max_disp_cap,
+            min_disparity=min_disp_floor,
+            max_distance_mm=max_distance_mm,
+        )
+        dbg = None
+    dist_s, disp_s = dist_smoother.update(dist, disp_val)
+    out_disp = disp_s if disp_s is not None else disp_val
+    return dist_s, out_disp, dist, dbg
+
+
+def _maybe_adapt_matcher(
+    *,
+    auto_disp: bool,
+    calib: dict | None,
+    args: argparse.Namespace,
+    rect_w: int,
+    disp_min: int,
+    disp_num: int,
+    dist_s: float | None,
+    dist: float | None,
+    disp_val: float | None,
+    long_range: bool,
+    uniqueness: int,
+    matcher,
+) -> tuple[int, int, object]:
+    """При необходимости расширяет диапазон SGBM и пересоздаёт matcher."""
+    if not auto_disp or calib is None:
+        return disp_min, disp_num, matcher
+    new_min, new_num, adapt_log = adapt_disparity_range(
+        calib=calib,
+        image_width=rect_w,
+        z_near_m=args.z_near,
+        z_far_m=args.z_far,
+        cur_min=disp_min,
+        cur_num=disp_num,
+        distance_mm=dist_s if dist_s is not None else dist,
+        disparity_px=disp_val,
+        long_range=long_range,
+    )
+    if adapt_log is None:
+        return disp_min, disp_num, matcher
+    matcher = make_stereo_matcher(
+        args.method,
+        new_min,
+        new_num,
+        args.block_size,
+        uniqueness_ratio=uniqueness,
+        speckle_window_size=40 if long_range else 50,
+    )
+    print(adapt_log)
+    return new_min, new_num, matcher
 
 
 def main() -> None:
@@ -641,6 +1072,21 @@ def main() -> None:
         sys.exit("Ошибка: --reacquire-threshold должен быть в диапазоне [0.0, 1.0].")
     if args.z_near <= 0 or args.z_far <= 0 or args.z_near >= args.z_far:
         sys.exit("Ошибка: нужно 0 < --z-near < --z-far (дистанции в метрах).")
+    if args.max_fps < 0:
+        sys.exit("Ошибка: --max-fps должен быть >= 0 (0 = без ограничения).")
+    if not (0.0 <= args.roi_inset < 0.45):
+        sys.exit("Ошибка: --roi-inset должен быть в диапазоне [0.0, 0.45).")
+    long_range = bool(args.long_range) or args.z_far >= 800.0
+    if long_range and args.z_near < 80:
+        print(
+            "Предупреждение: для 1000+ м лучше --z-near 150..300 "
+            f"(сейчас {args.z_near}). Иначе SGBM ищет слишком большие d."
+        )
+
+    if args.smooth_max_ratio < 1.01:
+        sys.exit("Ошибка: --smooth-max-ratio должен быть >= 1.01.")
+    if not 0.0 <= args.smooth_ema <= 1.0:
+        sys.exit("Ошибка: --smooth-ema должен быть в диапазоне [0.0, 1.0].")
 
     use_sbs = args.video is not None
     use_dual = args.left_video is not None or args.right_video is not None
@@ -683,6 +1129,26 @@ def main() -> None:
         calib = load_calibration(args.calib)
         for line in format_quality_report(calibration_quality_warnings(calib)):
             print(line)
+        try:
+            focal, baseline = extract_calib_geometry(calib)
+            d1000 = focal * baseline / 1_000_000.0
+            d200 = focal * baseline / 200_000.0
+            d50 = focal * baseline / 50_000.0
+            print(
+                f"Геометрия: f={focal:.1f}px, B={baseline:.1f}mm → "
+                f"disp@1000м≈{d1000:.2f}px, @200м≈{d200:.2f}px, @50м≈{d50:.2f}px"
+            )
+            if d1000 < 1.2:
+                print(
+                    "Предупреждение: на 1000 м диспаритет < 1.2 px — нужна калибровка "
+                    "с большим f·B (teplo_*), иначе дистанция будет нестабильной."
+                )
+            print(
+                "Ожидание: при 1000+ м disp должен быть малым (единицы px). "
+                "Большой disp = ложное совпадение / ближняя поверхность."
+            )
+        except Exception:
+            pass
     elif track_only:
         print("Калибровка не задана — трекинг по «сырым» кадрам без ректификации.")
 
@@ -706,20 +1172,31 @@ def main() -> None:
         f"Источник кадров: {'SBS ' + args.video if use_sbs else f'L={args.left_video}, R={args.right_video}'}"
     )
 
-    rect_l, rect_r = prepare_pair(frame_l, frame_r, calib, prep_pool)
+    rect_l, rect_r = prepare_pair(
+        frame_l, frame_r, calib, prep_pool, clahe=args.clahe
+    )
     rect_l_bgr = cv2.cvtColor(rect_l, cv2.COLOR_GRAY2BGR)
 
+    max_disp_cap: float | None = None
+    min_disp_floor = 0.75
+    max_distance_mm: float | None = None
+    uniqueness = 5
     if not track_only:
         Q = calib["Q"]
+        if long_range:
+            uniqueness = 12
+            print(f"Режим long-range: z={args.z_near:.0f}–{args.z_far:.0f} м, uniqueness={uniqueness}")
         if auto_disp and calib is not None:
             disp_min, disp_num, range_log = estimate_disparity_range_bounds(
                 calib,
                 args.z_near,
                 args.z_far,
                 image_width=int(rect_l.shape[1]),
+                long_range=long_range,
             )
+            max_num = 96 if long_range else 512
             disp_min, disp_num = clamp_sgbm_range(
-                disp_min, disp_num, int(rect_l.shape[1]), max_num=512
+                disp_min, disp_num, int(rect_l.shape[1]), max_num=max_num
             )
             print(range_log)
         else:
@@ -733,13 +1210,42 @@ def main() -> None:
                 f"Фиксированный диапазон диспаритета: "
                 f"min={disp_min}, num={disp_num}."
             )
+        try:
+            focal, baseline = extract_calib_geometry(calib)
+            # Потолок d: чуть выше d(z_near), всё большее — мусор для дальней сцены.
+            max_disp_cap = disparity_from_depth(
+                focal, baseline, args.z_near * 1000.0
+            ) * 1.05
+            # Пол d: не ниже ~0.75*d(z_far) — иначе шум 0.4px даёт Z в тысячи км.
+            d_far = disparity_from_depth(focal, baseline, args.z_far * 1000.0)
+            min_disp_floor = max(0.85, float(d_far) * 0.75)
+            max_distance_mm = float(args.z_far) * 1000.0 * 1.15
+            print(
+                f"Потолок d ≤ {max_disp_cap:.2f} px (z_near={args.z_near:.0f} м); "
+                f"пол d ≥ {min_disp_floor:.2f} px; Z ≤ {max_distance_mm/1000:.0f} м"
+            )
+        except Exception:
+            max_disp_cap = float(disp_min + disp_num)
+            max_distance_mm = float(args.z_far) * 1000.0 * 1.15
         matcher = make_stereo_matcher(
-            args.method, disp_min, disp_num, args.block_size
+            args.method,
+            disp_min,
+            disp_num,
+            args.block_size,
+            uniqueness_ratio=uniqueness,
+            speckle_window_size=40 if long_range else 50,
         )
 
     # ROI можно выбрать в любой момент клавишей R — на старте объекта нет.
+    # Thermal IR: base (KCF или NCC/Kornia) + CLAHE-NCC + intensity + reacquire.
+    tracker_kind = "ncc" if args.kornia_tracker else args.tracker
+    if args.kornia_tracker and args.tracker not in ("ncc", "kcf"):
+        print(
+            f"Предупреждение: --kornia-tracker включает NCC; "
+            f"--tracker {args.tracker} игнорируется."
+        )
     tracker = ObjectTracker(
-        kind=args.tracker,
+        kind=tracker_kind,
         smooth=args.roi_smooth,
         lock_size=args.lock_size,
         keep_aspect=args.keep_aspect,
@@ -764,33 +1270,52 @@ def main() -> None:
 
     disp_float: np.ndarray | None = None
     dist = disp_val = None
-    history: deque[float] = deque()
+    dist_smoother = DistanceSmoother(
+        window=args.smooth,
+        max_ratio=args.smooth_max_ratio,
+        ema_alpha=args.smooth_ema,
+        max_disp_jump=args.smooth_disp_jump,
+        outlier_patience=max(4, args.smooth // 3),
+        max_distance_mm=max_distance_mm,
+    )
     dist_s = None
+    disp_s = None
 
     writer = None
     if args.output:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out_fps = float(args.max_fps) if args.max_fps > 0 else source.fps
         writer = cv2.VideoWriter(
             args.output,
             fourcc,
-            source.fps,
+            out_fps,
             (rect_l_bgr.shape[1], rect_l_bgr.shape[0]),
         )
 
-    window = "Track + distance (Space=pause, R=box, C=click, Q=quit)"
+    window = "Track + distance (Space=pause, R/C=select, D=disp debug, Q=quit)"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    debug_window = "Disparity debug (L | R correspondences)"
+    debug_disparity = bool(args.debug_disparity) and not track_only
+    disp_debug: DisparityDebugInfo | None = None
+    overlay: np.ndarray | None = None
     paused = False
     frame_idx = 0
     t_prev = time.perf_counter()
     fps = 0.0
 
     print("R — выбрать объект рамкой, C — кликом (авто-границы). В любой момент.")
+    base_label = tracker_kind.upper()
+    if tracker_kind == "ncc":
+        base_label = "NCC(Kornia-style)"
+    print(f"Трекер: гибрид {base_label}+refine (reacquire={args.reacquire}).")
     if track_only:
-        print(f"Готово к трекингу (только трекинг, трекер={args.tracker}).")
+        print("Режим --track-only: без SGBM и расстояния.")
     else:
-        print(
-            f"Готово. SGBM каждые {args.sgbm_interval} кадр(ов), трекер={args.tracker}."
-        )
+        print(f"SGBM каждые {args.sgbm_interval} кадр(ов).")
+        if debug_disparity:
+            print("Отладка диспаритета ВКЛ (клавиша D — переключить).")
+        else:
+            print("Клавиша D — окно соответствий L↔R по диспаритету ROI.")
 
     try:
         while True:
@@ -804,15 +1329,18 @@ def main() -> None:
                         print("Достигнут --max-frames.")
                         break
 
-                    rect_l, rect_r = prepare_pair(frame_l, frame_r, calib, prep_pool)
+                    # 1) prepare
+                    rect_l, rect_r = prepare_pair(
+                        frame_l, frame_r, calib, prep_pool, clahe=args.clahe
+                    )
                     rect_l_bgr = cv2.cvtColor(rect_l, cv2.COLOR_GRAY2BGR)
 
+                    # 2) track
                     if tracker.initialized:
                         tracking_ok, roi = tracker.update(rect_l_bgr)
 
-                    # SGBM только при живом треке — иначе при LOST зря жрёт FPS.
+                    # 3) depth (только при живом треке)
                     if not track_only and tracker.initialized and tracking_ok:
-                        # Забираем готовый асинхронный диспаритет, если есть.
                         if sgbm_future is not None and sgbm_future.done():
                             disp_float = sgbm_future.result()
                             sgbm_future = None
@@ -820,7 +1348,6 @@ def main() -> None:
                         need_sgbm = frame_idx % args.sgbm_interval == 0
                         if need_sgbm:
                             if sgbm_pool is not None:
-                                # Не ставим новый SGBM, пока предыдущий считается.
                                 if sgbm_future is None or sgbm_future.done():
                                     if sgbm_future is not None and sgbm_future.done():
                                         disp_float = sgbm_future.result()
@@ -844,41 +1371,61 @@ def main() -> None:
                                 )
 
                         if roi is not None and disp_float is not None:
-                            dist, disp_val = measure_roi_distance(disp_float, roi, Q=Q)
-                            dist_s = smoothed_value(history, dist, args.smooth)
-                            # При приближении объекта расширяем диапазон SGBM.
-                            if auto_disp and calib is not None and (
+                            if sgbm_future is not None and sgbm_future.done():
+                                disp_float = sgbm_future.result()
+                                sgbm_future = None
+                            dist_s, disp_val, dist, disp_debug = _measure_and_smooth(
+                                disp_float=disp_float,
+                                roi=roi,
+                                Q=Q,
+                                args=args,
+                                max_disp_cap=max_disp_cap,
+                                min_disp_floor=min_disp_floor,
+                                max_distance_mm=max_distance_mm,
+                                dist_smoother=dist_smoother,
+                                collect_debug=debug_disparity,
+                            )
+                            if auto_disp and (
                                 sgbm_future is None or sgbm_future.done()
                             ):
-                                if sgbm_future is not None and sgbm_future.done():
-                                    disp_float = sgbm_future.result()
-                                    sgbm_future = None
-                                new_min, new_num, adapt_log = adapt_disparity_range(
+                                disp_min, disp_num, matcher = _maybe_adapt_matcher(
+                                    auto_disp=auto_disp,
                                     calib=calib,
-                                    image_width=int(rect_l.shape[1]),
-                                    z_near_m=args.z_near,
-                                    z_far_m=args.z_far,
-                                    cur_min=disp_min,
-                                    cur_num=disp_num,
-                                    distance_mm=dist_s if dist_s is not None else dist,
-                                    disparity_px=disp_val,
+                                    args=args,
+                                    rect_w=int(rect_l.shape[1]),
+                                    disp_min=disp_min,
+                                    disp_num=disp_num,
+                                    dist_s=dist_s,
+                                    dist=dist,
+                                    disp_val=disp_val,
+                                    long_range=long_range,
+                                    uniqueness=uniqueness,
+                                    matcher=matcher,
                                 )
-                                if adapt_log is not None:
-                                    disp_min, disp_num = new_min, new_num
-                                    matcher = make_stereo_matcher(
-                                        args.method,
-                                        disp_min,
-                                        disp_num,
-                                        args.block_size,
-                                    )
-                                    print(adapt_log)
                         else:
-                            dist_s = smoothed_value(history, None, args.smooth)
-                            disp_val = None
+                            dist_s, disp_val, _, disp_debug = _measure_and_smooth(
+                                disp_float=None,
+                                roi=None,
+                                Q=Q,
+                                args=args,
+                                max_disp_cap=max_disp_cap,
+                                min_disp_floor=min_disp_floor,
+                                max_distance_mm=max_distance_mm,
+                                dist_smoother=dist_smoother,
+                            )
                     elif not track_only and tracker.initialized and not tracking_ok:
-                        dist_s = smoothed_value(history, None, args.smooth)
-                        disp_val = None
+                        dist_s, disp_val, _, disp_debug = _measure_and_smooth(
+                            disp_float=None,
+                            roi=None,
+                            Q=Q,
+                            args=args,
+                            max_disp_cap=max_disp_cap,
+                            min_disp_floor=min_disp_floor,
+                            max_distance_mm=max_distance_mm,
+                            dist_smoother=dist_smoother,
+                        )
 
+                # 4) draw
                 sgbm_busy = sgbm_future is not None and not sgbm_future.done()
                 overlay = draw_overlay(
                     rect_l_bgr,
@@ -891,10 +1438,35 @@ def main() -> None:
                     sgbm_busy=sgbm_busy,
                     disp_range=(disp_min, disp_num) if not track_only else None,
                 )
+                if debug_disparity:
+                    overlay = _annotate_debug_flag(overlay)
                 if writer is not None:
                     writer.write(overlay)
 
+                if debug_disparity and disp_debug is not None and rect_r is not None:
+                    rect_r_bgr = cv2.cvtColor(rect_r, cv2.COLOR_GRAY2BGR)
+                    dbg_vis = draw_disparity_debug(
+                        rect_l_bgr,
+                        rect_r_bgr,
+                        disp_debug,
+                        max_samples=max(8, int(args.debug_disp_samples)),
+                        track_roi=roi,
+                    )
+                    cv2.namedWindow(debug_window, cv2.WINDOW_NORMAL)
+                    dbg_scale = display_scale(dbg_vis.shape, max(args.max_display, 1600))
+                    cv2.imshow(debug_window, fit_for_display(dbg_vis, dbg_scale))
+                elif not debug_disparity:
+                    try:
+                        cv2.destroyWindow(debug_window)
+                    except cv2.error:
+                        pass
+
                 now = time.perf_counter()
+                if args.max_fps > 0:
+                    remaining = (1.0 / float(args.max_fps)) - (now - t_prev)
+                    if remaining > 0:
+                        time.sleep(remaining)
+                        now = time.perf_counter()
                 dt = now - t_prev
                 t_prev = now
                 if dt > 0:
@@ -904,11 +1476,23 @@ def main() -> None:
                 cv2.imshow(window, fit_for_display(overlay, scale))
                 frame_idx += 1
 
-            key = cv2.waitKey(1 if not paused else 50) & 0xFF
+            # 5) keys — при нагрузке ждём чуть дольше, чтобы HighGUI успевал забирать ввод
+            key = cv2.waitKey(10 if not paused else 50) & 0xFF
             if key in (ord("q"), 27):
                 break
             if key == ord(" "):
                 paused = not paused
+            if key in (ord("d"), ord("D")) and not track_only:
+                debug_disparity = not debug_disparity
+                print(
+                    "Отладка диспаритета: "
+                    + ("ВКЛ" if debug_disparity else "ВЫКЛ")
+                )
+                if not debug_disparity:
+                    try:
+                        cv2.destroyWindow(debug_window)
+                    except cv2.error:
+                        pass
             if key in (ord("r"), ord("R"), ord("c"), ord("C")):
                 by_click = key in (ord("c"), ord("C"))
                 print(
@@ -919,6 +1503,9 @@ def main() -> None:
                 if sgbm_future is not None:
                     sgbm_future.result()
                     sgbm_future = None
+                # Пауза чтения видео на время UI, чтобы окно получало фокус/клавиши.
+                was_paused = paused
+                paused = True
                 if by_click:
                     new_roi = tracker.init_by_click(
                         rect_l_bgr,
@@ -928,11 +1515,23 @@ def main() -> None:
                     )
                 else:
                     new_roi = tracker.init_interactive(rect_l_bgr, args.max_display)
+                # selectROI / click-UI часто оставляют 'c'/'r' в очереди OpenCV —
+                # без сброса снова открывается выбор (петля) и «клавиши не работают».
+                _flush_waitkey_buffer()
+                cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+                vis = overlay if overlay is not None else rect_l_bgr
+                cv2.imshow(
+                    window,
+                    fit_for_display(vis, display_scale(vis.shape, args.max_display)),
+                )
+                paused = was_paused
                 if new_roi is not None:
                     roi = new_roi
                     tracking_ok = True
-                    history.clear()
-                    if not track_only:
+                    dist_smoother.reset()
+                    dist_s = None
+                    disp_s = None
+                    if not track_only and matcher is not None:
                         disp_float = compute_disparity(
                             rect_l,
                             rect_r,
@@ -941,28 +1540,31 @@ def main() -> None:
                             wls_lambda=args.wls_lambda,
                             wls_sigma=args.wls_sigma,
                         )
-                        dist, disp_val = measure_roi_distance(disp_float, roi, Q=Q)
-                        dist_s = smoothed_value(history, dist, args.smooth)
-                        if auto_disp and calib is not None:
-                            new_min, new_num, adapt_log = adapt_disparity_range(
-                                calib=calib,
-                                image_width=int(rect_l.shape[1]),
-                                z_near_m=args.z_near,
-                                z_far_m=args.z_far,
-                                cur_min=disp_min,
-                                cur_num=disp_num,
-                                distance_mm=dist_s if dist_s is not None else dist,
-                                disparity_px=disp_val,
-                            )
-                            if adapt_log is not None:
-                                disp_min, disp_num = new_min, new_num
-                                matcher = make_stereo_matcher(
-                                    args.method,
-                                    disp_min,
-                                    disp_num,
-                                    args.block_size,
-                                )
-                                print(adapt_log)
+                        dist_s, disp_val, dist, disp_debug = _measure_and_smooth(
+                            disp_float=disp_float,
+                            roi=roi,
+                            Q=Q,
+                            args=args,
+                            max_disp_cap=max_disp_cap,
+                            min_disp_floor=min_disp_floor,
+                            max_distance_mm=max_distance_mm,
+                            dist_smoother=dist_smoother,
+                            collect_debug=debug_disparity,
+                        )
+                        disp_min, disp_num, matcher = _maybe_adapt_matcher(
+                            auto_disp=auto_disp,
+                            calib=calib,
+                            args=args,
+                            rect_w=int(rect_l.shape[1]),
+                            disp_min=disp_min,
+                            disp_num=disp_num,
+                            dist_s=dist_s,
+                            dist=dist,
+                            disp_val=disp_val,
+                            long_range=long_range,
+                            uniqueness=uniqueness,
+                            matcher=matcher,
+                        )
     finally:
         if sgbm_future is not None:
             try:
