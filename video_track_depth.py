@@ -747,7 +747,9 @@ def draw_overlay(
     if roi is None:
         lines.append("press R (box) or C (click) to select")
     elif not tracking_ok:
-        lines.append("TRACK LOST — searching / press R")
+        lines.append("TRACK LOST — searching / X=cancel, R=reselect")
+    else:
+        lines.append("tracking — X=cancel")
 
     y0 = 28
     for i, text in enumerate(lines):
@@ -1292,7 +1294,7 @@ def main() -> None:
             (rect_l_bgr.shape[1], rect_l_bgr.shape[0]),
         )
 
-    window = "Track + distance (Space=pause, R/C=select, D=disp debug, Q=quit)"
+    window = "Track + distance (Space=pause, R/C=select, X=cancel, D=disp, Q=quit)"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     debug_window = "Disparity debug (L | R correspondences)"
     debug_disparity = bool(args.debug_disparity) and not track_only
@@ -1304,6 +1306,7 @@ def main() -> None:
     fps = 0.0
 
     print("R — выбрать объект рамкой, C — кликом (авто-границы). В любой момент.")
+    print("X — отменить трекинг (во время трека и при потере цели).")
     base_label = tracker_kind.upper()
     if tracker_kind == "ncc":
         base_label = "NCC(Kornia-style)"
@@ -1482,6 +1485,36 @@ def main() -> None:
                 break
             if key == ord(" "):
                 paused = not paused
+            if key in (ord("x"), ord("X"), 8):  # X или Backspace — сброс трека
+                if tracker.initialized or roi is not None:
+                    tracker.reset()
+                    roi = None
+                    tracking_ok = False
+                    dist_smoother.reset()
+                    dist_s = None
+                    disp_s = None
+                    disp_val = None
+                    disp_debug = None
+                    print("Трекинг отменён. R/C — выбрать объект заново.")
+                    base = rect_l_bgr if rect_l_bgr is not None else overlay
+                    if base is not None:
+                        overlay = draw_overlay(
+                            base,
+                            None,
+                            None,
+                            None,
+                            False,
+                            frame_idx,
+                            fps,
+                            sgbm_busy=False,
+                            disp_range=(disp_min, disp_num) if not track_only else None,
+                        )
+                        cv2.imshow(
+                            window,
+                            fit_for_display(
+                                overlay, display_scale(overlay.shape, args.max_display)
+                            ),
+                        )
             if key in (ord("d"), ord("D")) and not track_only:
                 debug_disparity = not debug_disparity
                 print(

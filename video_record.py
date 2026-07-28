@@ -8,9 +8,6 @@
 
 Зависимости:
     pip install PySide6 numpy opencv-python
-
-Запуск:
-    python p139_stereo_single_mono_swap_roles.py
 """
 from __future__ import annotations
 
