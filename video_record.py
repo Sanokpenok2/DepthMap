@@ -2,9 +2,11 @@
 # -*- coding: utf-8 -*-
 """П139Н-1: прием одного или двух монохромных UDP-видеопотоков, просмотр и запись MP4.
 
-Рабочий режим фиксирован: обработанное MONO16, 640x512 (команда 0x02).
-Файлы стереопары получают метки ``left`` и ``right`` в имени.
-Роли камер можно инвертировать кнопкой между окнами предпросмотра.
+Команда 0x0101 задаёт тип видео (младшие биты):
+  b00 — сырое с сенсора 648×520 MONO16;
+  b10 — обработанное 640×512 MONO16 (по умолчанию);
+  b11 — с наложением графики 960×512 RGB888 (в стартовом пакете fmt=3).
+Кадры больше 640×512 обрезаются по центру до 640×512 для превью/записи/стерео.
 
 Зависимости:
     pip install PySide6 numpy opencv-python
@@ -30,7 +32,41 @@ class PacketType(IntEnum):
 
 class VideoFormat(IntEnum):
     MONO16 = 0
+    RGB888 = 1
+    # В стартовом пакете камера часто пишет тот же код, что в 0x0101:
+    # 2 = обработанное mono, 3 = графика RGB888.
+    STREAM_PROCESSED = 2
+    STREAM_OVERLAY_RGB = 3
 
+
+def is_rgb_video_format(fmt: int) -> bool:
+    return fmt in (
+        int(VideoFormat.RGB888),
+        int(VideoFormat.STREAM_OVERLAY_RGB),
+    )
+
+
+def row_bytes_hint(width: int, video_format: int, expected: VideoFormat) -> int:
+    """Ожидаемый размер строки по fmt стартового пакета / режиму 0x0101."""
+    w = max(int(width), 1)
+    if is_rgb_video_format(video_format) or expected == VideoFormat.RGB888:
+        return w * 3
+    return w * 2
+
+
+class StreamMode(IntEnum):
+    """Младшие биты значения команды 0x0101 (тип видео на ПК)."""
+
+    RAW_MONO16 = 0b00  # сырое с сенсора 648×520 mono16
+    PROCESSED_MONO16 = 0b10  # обработанное 640×512 mono16
+    OVERLAY_RGB888 = 0b11  # с наложением графики 960×512 rgb888
+
+
+STREAM_MODE_SPECS: dict[StreamMode, tuple[int, int, VideoFormat, str]] = {
+    StreamMode.RAW_MONO16: (648, 520, VideoFormat.MONO16, "сырое 648×520 MONO16"),
+    StreamMode.PROCESSED_MONO16: (640, 512, VideoFormat.MONO16, "обработанное 640×512 MONO16"),
+    StreamMode.OVERLAY_RGB888: (960, 512, VideoFormat.RGB888, "графика 960×512 RGB888"),
+}
 
 @dataclass(frozen=True)
 class StartFramePacket:
@@ -175,7 +211,9 @@ def build_telemetry_packet(temperature_code: int, video_port: int, camera_ip: st
 # ========================= frame.py =========================
 import threading
 import queue
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
 
 import cv2
@@ -185,8 +223,55 @@ import numpy as np
 
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 512
-# Значение команды 0x0101 для обработанного монохромного потока 640x512.
-MONO_STREAM_MODE = 0x02
+# Сырой сенсор / RGB с графикой больше обработанного кадра.
+RAW_FRAME_WIDTH = 648
+RAW_FRAME_HEIGHT = 520
+OVERLAY_FRAME_WIDTH = 960
+OVERLAY_FRAME_HEIGHT = 512
+# По умолчанию — обработанное MONO16 (команда 0x0101 = 0b10).
+DEFAULT_STREAM_MODE = StreamMode.PROCESSED_MONO16
+MONO_STREAM_MODE = int(DEFAULT_STREAM_MODE)  # совместимость со старым именем
+
+# AGC для просмотра: отсекаем хвосты гистограммы (горячие точки иначе
+# «съедают» весь динамический диапазон при NORM_MINMAX → улица чёрная).
+# 1–99% недостаточно: человек ~1–2% кадра уже попадает в верхний хвост.
+DISPLAY_PERCENTILE_LO = 2.0
+DISPLAY_PERCENTILE_HI = 98.0
+_DISPLAY_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+
+def mono16_to_display8(mono16: np.ndarray) -> np.ndarray:
+    """MONO16 → 8-бит для превью/MP4 (процентили + CLAHE, как экранный AGC)."""
+    if mono16.dtype != np.uint16 and mono16.dtype != np.float32:
+        mono16 = mono16.astype(np.uint16, copy=False)
+    flat = mono16.reshape(-1)
+    # subsample for speed on 640x512
+    sample = flat[::8] if flat.size > 4096 else flat
+    lo = float(np.percentile(sample, DISPLAY_PERCENTILE_LO))
+    hi = float(np.percentile(sample, DISPLAY_PERCENTILE_HI))
+    if hi <= lo + 1.0:
+        # Запасной вариант: вокруг медианы сцены (устойчиво к точечным нагревам).
+        s = sample.astype(np.float32)
+        med = float(np.median(s))
+        mad = float(np.median(np.abs(s - med))) + 1.0
+        lo, hi = med - 5.0 * mad, med + 5.0 * mad
+    if hi <= lo:
+        return np.zeros(mono16.shape, dtype=np.uint8)
+    scale = 255.0 / (hi - lo)
+    out = np.clip((mono16.astype(np.float32) - lo) * scale, 0, 255).astype(np.uint8)
+    return _DISPLAY_CLAHE.apply(out)
+
+
+def crop_to_processed_size(frame: np.ndarray) -> np.ndarray:
+    """Центральная обрезка до 640×512 (сырое 648×520, графика 960×512)."""
+    h, w = frame.shape[:2]
+    if (w, h) == (FRAME_WIDTH, FRAME_HEIGHT):
+        return np.ascontiguousarray(frame)
+    if w < FRAME_WIDTH or h < FRAME_HEIGHT:
+        return np.ascontiguousarray(frame)
+    x0 = (w - FRAME_WIDTH) // 2
+    y0 = (h - FRAME_HEIGHT) // 2
+    return np.ascontiguousarray(frame[y0 : y0 + FRAME_HEIGHT, x0 : x0 + FRAME_WIDTH])
 
 
 @dataclass(frozen=True)
@@ -249,14 +334,17 @@ class LatestFrameStore:
 class FrameAssembler:
     """Собирает кадры с минимальным числом выделений памяти.
 
-    Приемный поток не создает объект на каждый UDP-пакет и не склеивает 512
-    объектов ``bytes``. Строки сразу копируются в заранее выделенный буфер.
-    Полные кадры передаются декодеру через очередь длиной один: устаревший кадр
-    заменяется новым, поэтому задержка не накапливается.
+    Приемный поток не создает объект на каждый UDP-пакет и не склеивает строки
+    в список ``bytes``. Строки сразу копируются в заранее выделенный буфер.
+    Полные кадры передаются декодеру через очередь длиной один.
     """
 
-    _ZERO_ROWS = bytes(FRAME_HEIGHT)
-    _MAX_FRAME_BYTES = FRAME_WIDTH * FRAME_HEIGHT * 3
+    _MAX_HEIGHT = max(RAW_FRAME_HEIGHT, OVERLAY_FRAME_HEIGHT, FRAME_HEIGHT)
+    _MAX_FRAME_BYTES = max(
+        RAW_FRAME_WIDTH * RAW_FRAME_HEIGHT * 2,
+        OVERLAY_FRAME_WIDTH * OVERLAY_FRAME_HEIGHT * 3,
+        FRAME_WIDTH * FRAME_HEIGHT * 3,
+    )
     _BUFFER_COUNT = 4
 
     def __init__(
@@ -264,19 +352,42 @@ class FrameAssembler:
         camera_ip: str,
         on_frame: Callable[[str, np.ndarray, FrameMeta], None],
         on_status: Callable[[str, str], None],
+        *,
+        stream_mode: StreamMode = DEFAULT_STREAM_MODE,
     ) -> None:
         self.camera_ip = camera_ip
         self.on_frame = on_frame
         self.on_status = on_status
+        self.stream_mode = StreamMode(stream_mode)
+        exp_w, exp_h, exp_fmt, _ = STREAM_MODE_SPECS[self.stream_mode]
+        self._expected_width = exp_w
+        self._expected_height = exp_h
+        self._expected_format = exp_fmt
 
         self._start: Optional[StartFramePacket] = None
         self._received_count = 0
-        self._row_seen = bytearray(FRAME_HEIGHT)
+        self._row_seen = bytearray(self._MAX_HEIGHT)
+        self._row_bytes = 0  # целевой размер полной строки
+        self._row_bytes_hint = 0
+        self._row_frags: dict[int, bytearray] = {}
         self._current_buffer = bytearray(self._MAX_FRAME_BYTES)
 
         self._incomplete_frames = 0
         self._invalid_packets = 0
         self._dropped_decode_frames = 0
+        self._logged_row_layout = False
+        self._logged_start = False
+        self._diag_packets = 0
+        self._row_packets = 0
+        self._feed_packets = 0
+        self._feed_by_type: dict[int, int] = {}
+        self._feed_sizes: list[int] = []
+        self._last_stats_at = 0.0
+        self._diag_path = Path(__file__).resolve().parent / "video_udp_diag.log"
+        try:
+            self._diag_path.write_text("", encoding="utf-8")
+        except OSError:
+            pass
 
         self._buffer_pool: queue.LifoQueue[bytearray] = queue.LifoQueue(
             maxsize=self._BUFFER_COUNT - 1
@@ -285,7 +396,7 @@ class FrameAssembler:
             self._buffer_pool.put_nowait(bytearray(self._MAX_FRAME_BYTES))
 
         self._decode_queue: queue.Queue[
-            Optional[tuple[StartFramePacket, bytearray]]
+            Optional[tuple[StartFramePacket, bytearray, int]]
         ] = queue.Queue(maxsize=1)
         self._decode_stop = threading.Event()
         self._decode_thread = threading.Thread(
@@ -311,11 +422,50 @@ class FrameAssembler:
         """Быстрый путь разбора стартовых и строчных видеопакетов."""
         view = payload if isinstance(payload, memoryview) else memoryview(payload)
         size = len(view)
-        if size < 4 or view[0] != 0 or view[1] != 0:
+        self._feed_packets += 1
+
+        preamble_ok = size >= 4 and view[0] == 0 and view[1] == 0
+        packet_type = self._u16(view, 2) if preamble_ok else -1
+        if packet_type >= 0:
+            self._feed_by_type[packet_type] = self._feed_by_type.get(packet_type, 0) + 1
+        if len(self._feed_sizes) < 40:
+            self._feed_sizes.append(size)
+
+        # Первые пакеты и периодическая сводка — в статус и в video_udp_diag.log
+        if self._feed_packets <= 25 or (
+            packet_type != int(PacketType.START_FRAME) and self._diag_packets < 15
+        ):
+            head = bytes(view[: min(16, size)]).hex()
+            msg = (
+                f"UDP#{self._feed_packets} size={size} "
+                f"type=0x{packet_type & 0xFFFF:04X} head={head}"
+            )
+            self._diag_log(msg)
+            self.on_status(self.camera_ip, msg)
+            if packet_type == int(PacketType.VIDEO_ROW) or (
+                packet_type > 0 and packet_type != int(PacketType.START_FRAME)
+            ):
+                self._diag_packets += 1
+
+        now = time.monotonic()
+        if now - self._last_stats_at >= 2.0:
+            self._last_stats_at = now
+            type_summary = ", ".join(
+                f"0x{t:04X}:{c}" for t, c in sorted(self._feed_by_type.items())
+            )
+            sizes = self._feed_sizes[-8:] if self._feed_sizes else []
+            stats = (
+                f"UDP итого {self._feed_packets} | типы [{type_summary}] | "
+                f"размеры {sizes} | строк {self._row_packets} | "
+                f"incomplete {self._incomplete_frames}"
+            )
+            self._diag_log(stats)
+            self.on_status(self.camera_ip, stats)
+
+        if not preamble_ok:
             self._invalid_packets += 1
             return
 
-        packet_type = self._u16(view, 2)
         if packet_type == PacketType.START_FRAME:
             if size < 14:
                 self._invalid_packets += 1
@@ -336,71 +486,138 @@ class FrameAssembler:
                 self._invalid_packets += 1
                 return
             self._add_row_fast(self._u16(view, 4), view[6:])
+            return
+
+        # После старта RGB некоторые прошивки шлют строки с другим type.
+        if (
+            self._start is not None
+            and size >= 6
+            and packet_type not in (
+                int(PacketType.TELEMETRY),
+                int(PacketType.CONTROL),
+            )
+        ):
+            self._add_row_fast(self._u16(view, 4), view[6:])
+
+    def _diag_log(self, message: str) -> None:
+        try:
+            with open(self._diag_path, "a", encoding="utf-8") as fh:
+                fh.write(f"{time.strftime('%H:%M:%S')} {self.camera_ip} {message}\n")
+        except OSError:
+            pass
 
     def _begin_frame(self, packet: StartFramePacket) -> None:
         if self._start is not None and self._received_count != self._start.height:
             self._incomplete_frames += 1
 
-        if packet.width != FRAME_WIDTH or packet.height != FRAME_HEIGHT:
+        if (
+            packet.width != self._expected_width
+            or packet.height != self._expected_height
+        ):
             self._start = None
             self._received_count = 0
             self.on_status(
                 self.camera_ip,
-                f"Отклонен кадр {packet.width}x{packet.height}; требуется 640x512",
-            )
-            return
-
-        if packet.video_format != VideoFormat.MONO16:
-            self._start = None
-            self._received_count = 0
-            self.on_status(
-                self.camera_ip,
-                f"Отклонен немонохромный формат видео: {packet.video_format}",
+                f"Отклонен кадр {packet.width}x{packet.height}; "
+                f"ожидается {self._expected_width}x{self._expected_height} "
+                f"(0x0101=0b{int(self.stream_mode):02b})",
             )
             return
 
         self._start = packet
         self._received_count = 0
-        self._row_seen[:] = self._ZERO_ROWS
+        self._row_frags.clear()
+        # Не фиксируем 960×3 заранее: камера в fmt=3 часто шлёт те же
+        # mono-строки 1280 байт (640×2), что и в b10.
+        if self._row_bytes <= 0:
+            self._row_bytes = 0
+        self._row_bytes_hint = row_bytes_hint(
+            packet.width, packet.video_format, self._expected_format
+        )
+        for i in range(packet.height):
+            self._row_seen[i] = 0
+        if not self._logged_start:
+            self._logged_start = True
+            kind = "RGB888" if is_rgb_video_format(packet.video_format) or (
+                self._expected_format == VideoFormat.RGB888
+            ) else "MONO16"
+            self.on_status(
+                self.camera_ip,
+                f"Старт кадра {packet.width}x{packet.height} fmt={packet.video_format} "
+                f"({kind}), ожидание строк…",
+            )
 
-    def _add_row_fast(self, row_number: int, row_data: memoryview) -> None:
+    def _row_size_candidates(self, width: int) -> tuple[int, ...]:
+        """Возможные длины полной строки (байты). RGB часто режется по MTU."""
+        w = max(int(width), 1)
+        # 640×3 на случай, если в 960-кадре полезны только 640 px RGB.
+        extra = (FRAME_WIDTH * 3, FRAME_WIDTH * 2)
+        if self._expected_format == VideoFormat.RGB888 or is_rgb_video_format(
+            self._start.video_format if self._start else 0
+        ):
+            return (w * 3, w * 2, w * 4, *extra)
+        return (w * 2, w * 3, w * 4, *extra)
+
+    def _match_row_size(self, width: int, nbytes: int) -> int:
+        """Точное совпадение с кандидатом bpp, иначе 0."""
+        for need in self._row_size_candidates(width):
+            if nbytes == need:
+                return need
+        return 0
+
+    def _map_row_number(self, row_number: int, height: int) -> tuple[int, int]:
+        """(номер_строки, байтовый_сдвиг_во_фрагменте).
+
+        Обычный случай: несколько UDP с одним row_number → сдвиг 0, клеим в frag.
+        Если нумерация 0..2H-1 (по два пакета на строку) — строка = n//2.
+        """
+        if row_number < height:
+            return row_number, 0
+        # Старший бит — флаг «вторая половина строки».
+        if row_number & 0x8000:
+            return row_number & 0x7FFF, 0
+        if row_number < height * 2:
+            return row_number // 2, 0
+        if (height & (height - 1)) == 0:
+            return row_number & (height - 1), 0
+        return row_number % height, 0
+
+    def _commit_full_row(self, row_number: int, row_data: memoryview) -> None:
         start = self._start
         if start is None:
             return
-        if row_number >= FRAME_HEIGHT:
-            self._invalid_packets += 1
+        expected = self._row_bytes
+        if expected <= 0 or self._row_seen[row_number]:
             return
-
-        expected = self._expected_row_bytes(start.video_format, FRAME_WIDTH)
-        if expected <= 0 or len(row_data) < expected:
-            self._invalid_packets += 1
-            return
-        if self._row_seen[row_number]:
-            return
-
         offset = row_number * expected
         self._current_buffer[offset : offset + expected] = row_data[:expected]
         self._row_seen[row_number] = 1
         self._received_count += 1
 
-        if self._received_count != FRAME_HEIGHT:
+        # Нужна полная высота из старта; для mono-строк 1280 при старте 960
+        # высота всё ещё 512.
+        need_rows = start.height
+        if self._row_bytes == FRAME_WIDTH * 2 and start.height > FRAME_HEIGHT:
+            need_rows = FRAME_HEIGHT
+        if self._received_count != need_rows:
             return
 
         completed_start = start
         completed_buffer = self._current_buffer
+        completed_row_bytes = expected
         self._start = None
         self._received_count = 0
+        # _row_bytes сохраняем между кадрами (fmt уже известен).
+        self._row_frags.clear()
 
         try:
             next_buffer = self._buffer_pool.get_nowait()
         except queue.Empty:
-            # Декодер не успевает. Текущий буфер сразу переиспользуется, а
-            # завершенный кадр сознательно пропускается ради минимальной задержки.
             self._dropped_decode_frames += 1
             return
 
         self._current_buffer = next_buffer
-        item = (completed_start, completed_buffer)
+        item = (completed_start, completed_buffer, completed_row_bytes)
         try:
             self._decode_queue.put_nowait(item)
         except queue.Full:
@@ -410,16 +627,114 @@ class FrameAssembler:
                 stale = None
             if stale is not None:
                 self._return_buffer(stale[1])
-            self._dropped_decode_frames += 1
+                self._dropped_decode_frames += 1
             try:
                 self._decode_queue.put_nowait(item)
             except queue.Full:
                 self._return_buffer(completed_buffer)
                 self._dropped_decode_frames += 1
 
-    def _return_buffer(self, buffer: bytearray) -> None:
+    def _finish_row_bytes(self, row_number: int, data: memoryview, how: str) -> None:
+        start = self._start
+        if start is None:
+            return
+        if not self._logged_row_layout:
+            self._logged_row_layout = True
+            eff_w = self._effective_width(start.width, self._row_bytes)
+            bpp = self._row_bytes // max(eff_w, 1)
+            self.on_status(
+                self.camera_ip,
+                f"Строка видео: {self._row_bytes} байт ({bpp} байт/пикс), "
+                f"эффект. {eff_w}x{start.height} (старт {start.width}x{start.height}), {how}",
+            )
+        self._commit_full_row(row_number, data)
+
+    @staticmethod
+    def _effective_width(start_width: int, row_bytes: int) -> int:
+        """Ширина пикселей по длине строки (старт может врать: 960 при данных 640)."""
+        for w in (int(start_width), FRAME_WIDTH, OVERLAY_FRAME_WIDTH, RAW_FRAME_WIDTH):
+            if w > 0 and row_bytes % w == 0:
+                bpp = row_bytes // w
+                if bpp in (2, 3, 4):
+                    return w
+        return int(start_width)
+
+    def _add_row_fast(self, row_number: int, row_data: memoryview) -> None:
+        start = self._start
+        if start is None:
+            return
+        row_number, _ = self._map_row_number(row_number, start.height)
+        if row_number >= start.height:
+            self._invalid_packets += 1
+            return
+
+        self._row_packets += 1
+        if self._row_packets in (100, 500, 1000) and not self._logged_row_layout:
+            self.on_status(
+                self.camera_ip,
+                f"Видеопакетов {self._row_packets}, строк собрано "
+                f"{self._received_count}/{start.height}, "
+                f"incomplete={self._incomplete_frames}",
+            )
+
+        # Сначала смотрим фактическую длину (камера в fmt=3 может слать 1280).
+        matched_one = self._match_row_size(start.width, len(row_data))
+        if self._row_bytes <= 0:
+            if matched_one > 0:
+                self._row_bytes = matched_one
+            else:
+                self._row_bytes = getattr(self, "_row_bytes_hint", 0) or row_bytes_hint(
+                    start.width, start.video_format, self._expected_format
+                )
+        elif matched_one > 0 and matched_one != self._row_bytes and not self._logged_row_layout:
+            # Первые строки уточняют bpp/ширину полезных данных.
+            self._row_bytes = matched_one
+
+        expected = self._row_bytes
+
+        # Одна датаграмма = целая строка (типично mono 1280).
+        if len(row_data) >= expected:
+            self._finish_row_bytes(row_number, row_data, "целиком")
+            return
+
+        # Фрагменты одной строки (RGB 960×3=2880 > MTU).
+        frag = self._row_frags.get(row_number)
+        if frag is None:
+            frag = bytearray()
+            self._row_frags[row_number] = frag
+        frag.extend(row_data)
+
+        matched = self._match_row_size(start.width, len(frag))
+        if matched > 0 and (matched == expected or not self._logged_row_layout):
+            if matched != expected:
+                self._row_bytes = matched
+                expected = matched
+            full = memoryview(frag)[:expected]
+            del self._row_frags[row_number]
+            self._finish_row_bytes(row_number, full, "из фрагментов")
+            return
+
+        if len(frag) >= expected:
+            full = memoryview(frag)[:expected]
+            del self._row_frags[row_number]
+            self._finish_row_bytes(row_number, full, "из фрагментов")
+            return
+
+        if len(frag) > max(self._row_size_candidates(start.width)) + 64:
+            del self._row_frags[row_number]
+            self._invalid_packets += 1
+            if not self._logged_row_layout:
+                self._logged_row_layout = True
+                self.on_status(
+                    self.camera_ip,
+                    f"Строка видео: не удалось собрать "
+                    f"(накоплено {len(frag)} байт, ширина {start.width}, "
+                    f"кусок {len(row_data)} байт)",
+                )
+
+    def _return_buffer(self, buf: bytearray) -> None:
         try:
-            self._buffer_pool.put_nowait(buffer)
+            self._buffer_pool.put_nowait(buf)
         except queue.Full:
             pass
 
@@ -449,9 +764,10 @@ class FrameAssembler:
                 continue
             if item is None:
                 break
-            start, raw_buffer = item
+            start, raw_buffer, row_bytes = item
             try:
-                frame = self._decode(start, raw_buffer)
+                frame = self._decode(start, raw_buffer, row_bytes)
+                frame = crop_to_processed_size(frame)
                 self.on_frame(
                     self.camera_ip,
                     frame,
@@ -470,21 +786,45 @@ class FrameAssembler:
                 self._return_buffer(raw_buffer)
 
     @staticmethod
-    def _expected_row_bytes(video_format: int, width: int) -> int:
-        if video_format != VideoFormat.MONO16:
-            return 0
-        return width * 2
+    def _decode(
+        start: StartFramePacket,
+        raw_buffer: bytearray,
+        row_bytes: int,
+    ) -> np.ndarray:
+        height = start.height
+        width = FrameAssembler._effective_width(start.width, row_bytes)
+        bpp = int(row_bytes) // max(int(width), 1)
+        if bpp == 3:
+            count = height * width * 3
+            rgb = np.frombuffer(raw_buffer, dtype=np.uint8, count=count).reshape(
+                height, width, 3
+            )
+            return np.ascontiguousarray(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        if bpp == 4:
+            count = height * width * 4
+            rgba = np.frombuffer(raw_buffer, dtype=np.uint8, count=count).reshape(
+                height, width, 4
+            )
+            return np.ascontiguousarray(cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR))
+        if bpp == 2:
+            count = height * width
+            # RGB565 только если старт реально «цветной» и ширина совпала с overlay.
+            if is_rgb_video_format(start.video_format) and width >= 800:
+                u16 = np.frombuffer(raw_buffer, dtype="<u2", count=count).reshape(
+                    height, width
+                )
+                r = ((u16 >> 11) & 0x1F).astype(np.uint8) * np.uint8(8)
+                g = ((u16 >> 5) & 0x3F).astype(np.uint8) * np.uint8(4)
+                b = (u16 & 0x1F).astype(np.uint8) * np.uint8(8)
+                return np.ascontiguousarray(np.dstack([b, g, r]))
+            mono16 = np.frombuffer(raw_buffer, dtype=">u2", count=count).reshape(
+                height, width
+            )
+            return mono16_to_display8(mono16)
+        raise ValueError(
+            f"Неподдерживаемый bpp={bpp} (row_bytes={row_bytes}, width={width})"
+        )
 
-    @staticmethod
-    def _decode(start: StartFramePacket, raw_buffer: bytearray) -> np.ndarray:
-        if start.video_format != VideoFormat.MONO16:
-            raise ValueError(f"Ожидался MONO16, получен формат {start.video_format}")
-
-        height, width = start.height, start.width
-        count = height * width
-        mono16 = np.frombuffer(raw_buffer, dtype=">u2", count=count).reshape(height, width)
-        # Для просмотра и MP4 преобразуем 16-битный монохромный кадр в 8 бит.
-        return cv2.normalize(mono16, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
 
 
 # ========================= network.py =========================
@@ -635,8 +975,10 @@ class PortReceiver:
                 self._socket.close()
             except OSError:
                 pass
+            self._socket = None
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.5)
+        self._thread = None
 
     def _run(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -676,11 +1018,12 @@ class PortReceiver:
             source_ip = source[0]
             with self._lock:
                 callback = self._callbacks.get(source_ip)
-                if callback is None and len(self._callbacks) == 1:
+                if callback is None and self._callbacks:
+                    # Один/несколько потоков на порту: не теряем пакеты из‑за IP.
                     callback = next(iter(self._callbacks.values()))
             if callback is not None:
-                # Callback обязан синхронно скопировать нужные данные до следующего recv.
                 callback(view[:size])
+            # Без сессий — нормально (камера ещё шлёт после Stop); не спамим QMessageBox.
 
 
 class CameraSession:
@@ -691,12 +1034,19 @@ class CameraSession:
         on_frame: Callable[[str, np.ndarray, FrameMeta], None],
         on_status: Callable[[str, str], None],
         local_ip: str = "0.0.0.0",
+        stream_mode: StreamMode = DEFAULT_STREAM_MODE,
     ) -> None:
         self.info = info
         self.receiver = receiver
         self.local_ip = local_ip
         self.on_status = on_status
-        self.assembler = FrameAssembler(info.camera_ip, on_frame=on_frame, on_status=on_status)
+        self.stream_mode = StreamMode(stream_mode)
+        self.assembler = FrameAssembler(
+            info.camera_ip,
+            on_frame=on_frame,
+            on_status=on_status,
+            stream_mode=self.stream_mode,
+        )
         self._started = False
 
     def start(self) -> None:
@@ -704,11 +1054,15 @@ class CameraSession:
             return
         self.receiver.register(self.info.camera_ip, self.assembler.feed)
         self._started = True
-        # 0x0101 фиксирует обработанный MONO16 640x512; 0x0100 включает поток.
-        self._send_control(0x0101, MONO_STREAM_MODE)
+        # 0x0101: младшие биты = тип видео; 0x0100 включает поток.
+        self._send_control(0x0101, int(self.stream_mode))
         time.sleep(0.05)
         self._send_control(0x0100, 1)
-        self.on_status(self.info.camera_ip, "Поток запрошен")
+        _, _, _, label = STREAM_MODE_SPECS[self.stream_mode]
+        self.on_status(
+            self.info.camera_ip,
+            f"Поток запрошен ({label}, 0x0101=0b{int(self.stream_mode):02b})",
+        )
 
     def stop(self) -> None:
         if not self._started:
@@ -750,7 +1104,11 @@ class CameraManager:
         self.cameras: dict[str, CameraInfo] = {}
         self.receivers: dict[int, PortReceiver] = {}
         self.sessions: dict[str, CameraSession] = {}
+        self.stream_mode: StreamMode = DEFAULT_STREAM_MODE
         self._lock = threading.RLock()
+
+    def set_stream_mode(self, mode: StreamMode) -> None:
+        self.stream_mode = StreamMode(mode)
 
     def start_discovery(self) -> None:
         self.discovery.start()
@@ -781,6 +1139,7 @@ class CameraManager:
                 on_frame=self.on_frame,
                 on_status=self.on_status,
                 local_ip=self.bind_ip,
+                stream_mode=self.stream_mode,
             )
             self.sessions[camera_ip] = session
         session.start()
@@ -1141,12 +1500,13 @@ from typing import Optional
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QImage, QPixmap
+from PySide6.QtCore import QObject, QPoint, QRect, Qt, QTimer, Signal
+from PySide6.QtGui import QCloseEvent, QImage, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -1157,6 +1517,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QRubberBand,
     QSpinBox,
     QStatusBar,
     QTableWidget,
@@ -1195,6 +1556,8 @@ class VideoLabel(QLabel):
             image_format = QImage.Format.Format_BGR888
         else:
             return
+        # Обрезка 648×520→640×512 даёт view без C-contiguous — QImage падает.
+        frame = np.ascontiguousarray(frame)
         self._image = QImage(
             frame.data, w, h, int(frame.strides[0]), image_format
         ).copy()
@@ -1209,6 +1572,43 @@ class VideoLabel(QLabel):
         super().resizeEvent(event)
         self._update_pixmap()
 
+    def image_size(self) -> Optional[tuple[int, int]]:
+        if self._image is None:
+            return None
+        return self._image.width(), self._image.height()
+
+    def widget_to_image(self, pos: QPoint) -> Optional[tuple[int, int]]:
+        """Координаты виджета → пиксели кадра (с учётом letterbox KeepAspectRatio)."""
+        if self._image is None:
+            return None
+        iw, ih = self._image.width(), self._image.height()
+        ww, wh = max(self.width(), 1), max(self.height(), 1)
+        scale = min(ww / iw, wh / ih)
+        dw, dh = iw * scale, ih * scale
+        x0 = (ww - dw) * 0.5
+        y0 = (wh - dh) * 0.5
+        x = (pos.x() - x0) / scale
+        y = (pos.y() - y0) / scale
+        if 0 <= x < iw and 0 <= y < ih:
+            return int(x), int(y)
+        return None
+
+    def image_rect_to_widget(self, x: int, y: int, w: int, h: int) -> QRect:
+        if self._image is None:
+            return QRect()
+        iw, ih = self._image.width(), self._image.height()
+        ww, wh = max(self.width(), 1), max(self.height(), 1)
+        scale = min(ww / iw, wh / ih)
+        dw, dh = iw * scale, ih * scale
+        x0 = (ww - dw) * 0.5
+        y0 = (wh - dh) * 0.5
+        return QRect(
+            int(round(x0 + x * scale)),
+            int(round(y0 + y * scale)),
+            max(1, int(round(w * scale))),
+            max(1, int(round(h * scale))),
+        )
+
     def _update_pixmap(self) -> None:
         if self._image is None:
             return
@@ -1218,6 +1618,162 @@ class VideoLabel(QLabel):
             Qt.TransformationMode.FastTransformation,
         )
         self.setPixmap(pixmap)
+
+
+class InteractiveVideoLabel(VideoLabel):
+    """Превью с кликом (цель) и drag-ROI (режим рамки)."""
+
+    clicked = Signal(int, int)  # x, y в координатах кадра
+    roi_dragged = Signal(int, int, int, int)  # x, y, w, h
+    box_mode_changed = Signal(bool)
+
+    def __init__(self, title: str) -> None:
+        super().__init__(title)
+        self.setMouseTracking(True)
+        self._box_mode = False
+        self._drag_origin: Optional[QPoint] = None
+        self._rubber: Optional[QRubberBand] = None
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setToolTip(
+            "Клик — выбрать объект сразу.\n"
+            "R — режим рамки (drag), Esc — отмена рамки."
+        )
+
+    @property
+    def box_mode(self) -> bool:
+        return self._box_mode
+
+    def set_box_mode(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._box_mode == enabled:
+            return
+        self._box_mode = enabled
+        self._cancel_drag()
+        if enabled:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.unsetCursor()
+        self.box_mode_changed.emit(enabled)
+
+    def _cancel_drag(self) -> None:
+        self._drag_origin = None
+        if self._rubber is not None:
+            self._rubber.hide()
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        if self._box_mode:
+            self._drag_origin = event.position().toPoint()
+            if self._rubber is None:
+                self._rubber = QRubberBand(QRubberBand.Shape.Rectangle, self)
+            self._rubber.setGeometry(QRect(self._drag_origin, self._drag_origin))
+            self._rubber.show()
+            return
+        pt = self.widget_to_image(event.position().toPoint())
+        if pt is not None:
+            self.clicked.emit(pt[0], pt[1])
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self._box_mode and self._drag_origin is not None and self._rubber is not None:
+            rect = QRect(self._drag_origin, event.position().toPoint()).normalized()
+            self._rubber.setGeometry(rect)
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._box_mode
+            and self._drag_origin is not None
+        ):
+            rect = QRect(self._drag_origin, event.position().toPoint()).normalized()
+            self._cancel_drag()
+            p0 = self.widget_to_image(rect.topLeft())
+            p1 = self.widget_to_image(rect.bottomRight())
+            if p0 is not None and p1 is not None:
+                x0, y0 = p0
+                x1, y1 = p1
+                w, h = max(1, x1 - x0), max(1, y1 - y0)
+                if w >= 8 and h >= 8:
+                    self.roi_dragged.emit(x0, y0, w, h)
+                    self.set_box_mode(False)
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        key = event.key()
+        if key == Qt.Key.Key_R:
+            self.set_box_mode(not self._box_mode)
+            return
+        if key == Qt.Key.Key_Escape:
+            if self._box_mode:
+                self.set_box_mode(False)
+                return
+        super().keyPressEvent(event)
+
+
+class TrackViewWindow(QMainWindow):
+    """Отдельное окно левой камеры с overlay и live-выбором ROI."""
+
+    closed = Signal()
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Трекинг / дистанция — левая камера")
+        self.resize(960, 720)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        self.hint = QLabel(
+            "Клик по объекту — трекинг сразу. "
+            "R — выделить рамкой (drag). Esc — отмена режима рамки. X — сброс трекера."
+        )
+        self.hint.setWordWrap(True)
+        layout.addWidget(self.hint)
+        self.video = InteractiveVideoLabel("Ожидание кадра…")
+        self.video.setMinimumSize(640, 512)
+        layout.addWidget(self.video, 1)
+        self.status = QLabel("—")
+        layout.addWidget(self.status)
+        self.setCentralWidget(root)
+        self.setStatusBar(QStatusBar())
+        self.statusBar().showMessage("Клик = цель | R = рамка")
+
+        self.video.box_mode_changed.connect(self._on_box_mode)
+        QShortcut(QKeySequence("R"), self, activated=self._toggle_box_mode)
+        QShortcut(QKeySequence("Escape"), self, activated=self._cancel_box_mode)
+
+    def _toggle_box_mode(self) -> None:
+        self.video.set_box_mode(not self.video.box_mode)
+        self.video.setFocus()
+
+    def _cancel_box_mode(self) -> None:
+        if self.video.box_mode:
+            self.video.set_box_mode(False)
+
+    def _on_box_mode(self, enabled: bool) -> None:
+        if enabled:
+            self.statusBar().showMessage("Режим рамки: зажмите ЛКМ и выделите область")
+            self.hint.setText("Режим рамки активен — тяните прямоугольник. Esc — отмена.")
+        else:
+            self.statusBar().showMessage("Клик = цель | R = рамка")
+            self.hint.setText(
+                "Клик по объекту — трекинг сразу. "
+                "R — выделить рамкой (drag). Esc — отмена режима рамки. X — сброс трекера."
+            )
+
+    def set_frame(self, frame: np.ndarray) -> None:
+        self.video.set_frame(frame)
+
+    def set_status(self, text: str) -> None:
+        self.status.setText(text)
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
+        self.closed.emit()
+        super().closeEvent(event)
 
 
 class MainWindow(QMainWindow):
@@ -1244,8 +1800,14 @@ class MainWindow(QMainWindow):
         self.recorder = MultiCameraRecorder()
         self.annotated_recorder = AnnotatedRecorder()
         self.latest_store = LatestFrameStore()
-        self.live_track = LiveTrackDepthController(on_log=self._on_live_log)
+        self.live_track = LiveTrackDepthController(
+            z_near_m=10.0,
+            z_far_m=100.0,
+            long_range=None,
+            on_log=self._on_live_log,
+        )
         self._live_overlay: Optional[np.ndarray] = None
+        self._track_window: Optional[TrackViewWindow] = None
         self.camera_rows: dict[str, int] = {}
         self.camera_info: dict[str, CameraInfo] = {}
         self.active_slots: dict[str, int] = {}
@@ -1290,9 +1852,27 @@ class MainWindow(QMainWindow):
         self.discovery_btn.clicked.connect(self._restart_discovery)
         net.addWidget(self.discovery_btn, 0, 2)
 
-        mono_note = QLabel("Режим: обработанное MONO16, 640x512")
-        mono_note.setToolTip("Режим фиксирован; тепловизорам отправляется команда 0x02.")
-        net.addWidget(mono_note, 1, 0, 1, 3)
+        net.addWidget(QLabel("Тип видео (0x0101):"), 1, 0)
+        self.stream_mode_box = QComboBox()
+        self.stream_mode_box.setToolTip(
+            "Младшие биты команды 0x0101:\n"
+            "b00 — сырое 648×520 MONO16\n"
+            "b10 — обработанное 640×512 MONO16\n"
+            "b11 — с графикой 960×512 RGB888\n"
+            "Кадры шире/выше обрезаются по центру до 640×512."
+        )
+        for mode in (
+            StreamMode.PROCESSED_MONO16,
+            StreamMode.RAW_MONO16,
+            StreamMode.OVERLAY_RGB888,
+        ):
+            _, _, _, label = STREAM_MODE_SPECS[mode]
+            self.stream_mode_box.addItem(
+                f"0b{int(mode):02b} — {label}",
+                int(mode),
+            )
+        self.stream_mode_box.setCurrentIndex(0)
+        net.addWidget(self.stream_mode_box, 1, 1, 1, 2)
         layout.addWidget(network_box)
 
         cameras_box = QGroupBox("Обнаруженные тепловизоры (выберите один или два)")
@@ -1394,17 +1974,47 @@ class MainWindow(QMainWindow):
         self.annotate_record = QCheckBox("Писать аннотированное видео (отдельный MP4)")
         track.addWidget(self.annotate_record, 1, 2, 1, 2)
 
-        self.roi_box_btn = QPushButton("ROI рамкой")
-        self.roi_box_btn.clicked.connect(self._select_roi_box)
-        track.addWidget(self.roi_box_btn, 2, 0)
-        self.roi_click_btn = QPushButton("ROI кликом")
-        self.roi_click_btn.clicked.connect(self._select_roi_click)
-        track.addWidget(self.roi_click_btn, 2, 1)
+        track.addWidget(QLabel("z-near (м):"), 2, 0)
+        self.z_near_spin = QDoubleSpinBox()
+        self.z_near_spin.setRange(1.0, 5000.0)
+        self.z_near_spin.setDecimals(1)
+        self.z_near_spin.setSingleStep(1.0)
+        self.z_near_spin.setValue(10.0)
+        self.z_near_spin.setToolTip("Ближняя граница сцены для SGBM/дистанции.")
+        track.addWidget(self.z_near_spin, 2, 1)
+        track.addWidget(QLabel("z-far (м):"), 2, 2)
+        self.z_far_spin = QDoubleSpinBox()
+        self.z_far_spin.setRange(2.0, 10000.0)
+        self.z_far_spin.setDecimals(1)
+        self.z_far_spin.setSingleStep(5.0)
+        self.z_far_spin.setValue(100.0)
+        self.z_far_spin.setToolTip("Дальняя граница сцены для SGBM/дистанции.")
+        track.addWidget(self.z_far_spin, 2, 3)
+
+        self.long_range_cb = QCheckBox("Long-range")
+        self.long_range_cb.setToolTip(
+            "Параметры SGBM для дальних сцен. Имеет смысл при z-far ≥ 800 м "
+            "(при меньшем z-far режим принудительно выключен)."
+        )
+        track.addWidget(self.long_range_cb, 3, 0, 1, 2)
+        self.scene_apply_btn = QPushButton("Применить диапазон")
+        self.scene_apply_btn.clicked.connect(lambda: self._apply_scene_range())
+        track.addWidget(self.scene_apply_btn, 3, 2, 1, 2)
+
+        self.roi_box_btn = QPushButton("ROI рамкой (окно)")
+        self.roi_box_btn.setToolTip("Либо клавиша R в окне трекинга и drag мышью.")
+        self.roi_box_btn.clicked.connect(self._select_roi_box_live)
+        track.addWidget(self.roi_box_btn, 4, 0)
+        self.roi_click_btn = QPushButton("Показать окно трекинга")
+        self.roi_click_btn.clicked.connect(self._show_track_window)
+        track.addWidget(self.roi_click_btn, 4, 1)
         self.track_reset_btn = QPushButton("Сброс трекинга")
         self.track_reset_btn.clicked.connect(self._reset_tracking)
-        track.addWidget(self.track_reset_btn, 2, 2)
-        self.track_status = QLabel("Трекинг выключен")
-        track.addWidget(self.track_status, 3, 0, 1, 4)
+        track.addWidget(self.track_reset_btn, 4, 2)
+        self.track_status = QLabel(
+            "Трекинг выключен. В окне: клик = цель, R = рамка."
+        )
+        track.addWidget(self.track_status, 5, 0, 1, 4)
         layout.addWidget(track_box)
 
         self.setCentralWidget(root)
@@ -1576,6 +2186,9 @@ class MainWindow(QMainWindow):
         self._update_roles(selected)
         ordered = [ip for ip in self.role_order if ip in selected]
 
+        mode_val = int(self.stream_mode_box.currentData())
+        self.manager.set_stream_mode(StreamMode(mode_val))
+
         self._stop_streams()
         self.latest_store.clear()
         self.active_slots = {ip: index for index, ip in enumerate(ordered)}
@@ -1588,7 +2201,10 @@ class MainWindow(QMainWindow):
             except (KeyError, OSError) as exc:
                 self._show_error(f"Не удалось запустить {ip}: {exc}")
         self._update_swap_button_state()
-        self.statusBar().showMessage(f"Запрошено потоков: {len(ordered)}")
+        _, _, _, label = STREAM_MODE_SPECS[StreamMode(mode_val)]
+        self.statusBar().showMessage(
+            f"Запрошено потоков: {len(ordered)} | {label}"
+        )
 
     def _stop_streams(self) -> None:
         if self.recorder.active:
@@ -1629,7 +2245,12 @@ class MainWindow(QMainWindow):
                 f"декод пропущено {meta.dropped_decode_frames} | ошибок {meta.invalid_packets}"
             )
             if slot == 0:
-                if self.track_enable.isChecked() and self._live_overlay is not None:
+                # При активном окне трекинга левый превью в главном UI не рисуем
+                # (экономия CPU — кадр только в отдельном окне).
+                if self._track_window_active():
+                    if self.left_video.image_size() is not None:
+                        self.left_video.clear_frame("См. окно трекинга")
+                elif self.track_enable.isChecked() and self._live_overlay is not None:
                     self.left_video.set_frame(self._live_overlay)
                 else:
                     self.left_video.set_frame(frame)
@@ -1715,7 +2336,10 @@ class MainWindow(QMainWindow):
             return
         if overlay is not None:
             self._live_overlay = overlay
-            self.left_video.set_frame(overlay)
+            if self._track_window_active():
+                self._track_window.set_frame(overlay)
+            else:
+                self.left_video.set_frame(overlay)
             if self.annotated_recorder.active:
                 try:
                     self.annotated_recorder.write(overlay)
@@ -1724,6 +2348,8 @@ class MainWindow(QMainWindow):
                     self._stop_recording()
                     return
         self._update_track_status_label()
+        if self._track_window_active():
+            self._track_window.set_status(self.track_status.text())
 
     def _choose_calib_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -1747,6 +2373,95 @@ class MainWindow(QMainWindow):
             return
         self._update_track_status_label()
         self.statusBar().showMessage(f"Калибровка загружена: {path}", 5000)
+
+    def _apply_scene_range(self, *, quiet: bool = False) -> bool:
+        z_near = float(self.z_near_spin.value())
+        z_far = float(self.z_far_spin.value())
+        if z_near >= z_far:
+            if not quiet:
+                QMessageBox.warning(self, "Диапазон", "Нужно z-near < z-far.")
+            return False
+        long_range = bool(self.long_range_cb.isChecked())
+        try:
+            self.live_track.set_scene_range(
+                z_near, z_far, long_range=long_range
+            )
+        except ValueError as exc:
+            if not quiet:
+                QMessageBox.warning(self, "Диапазон", str(exc))
+            return False
+        if not quiet:
+            self.statusBar().showMessage(
+                f"Сцена: {z_near:.0f}–{z_far:.0f} м, "
+                f"long_range={self.live_track.long_range}",
+                5000,
+            )
+        self._update_track_status_label()
+        return True
+
+    def _track_window_active(self) -> bool:
+        return self._track_window is not None and self._track_window.isVisible()
+
+    def _ensure_track_window(self) -> TrackViewWindow:
+        if self._track_window is None:
+            win = TrackViewWindow(self)
+            win.video.clicked.connect(self._on_track_click)
+            win.video.roi_dragged.connect(self._on_track_roi_drag)
+            win.closed.connect(self._on_track_window_closed)
+            # X в окне трекинга — сброс ROI (как Backspace в CLI).
+            QShortcut(QKeySequence("X"), win, activated=self._reset_tracking)
+            self._track_window = win
+        return self._track_window
+
+    def _show_track_window(self) -> None:
+        if not self.track_enable.isChecked():
+            QMessageBox.information(self, "Трекинг", "Сначала включите трекинг.")
+            return
+        win = self._ensure_track_window()
+        if self._live_overlay is not None:
+            win.set_frame(self._live_overlay)
+        win.show()
+        win.raise_()
+        win.activateWindow()
+        win.video.setFocus()
+        self.left_video.clear_frame("См. окно трекинга")
+
+    def _on_track_window_closed(self) -> None:
+        # Закрытие окна не выключает трекинг — только возвращает превью в main.
+        if self.track_enable.isChecked() and self._live_overlay is not None:
+            self.left_video.set_frame(self._live_overlay)
+
+    def _on_track_click(self, x: int, y: int) -> None:
+        if not self.track_enable.isChecked():
+            return
+        ok = self.live_track.init_roi_at_point(x, y)
+        self._update_track_status_label()
+        if self._track_window_active():
+            self._track_window.set_status(
+                self.track_status.text()
+                if ok
+                else "Не удалось выбрать объект по клику"
+            )
+
+    def _on_track_roi_drag(self, x: int, y: int, w: int, h: int) -> None:
+        if not self.track_enable.isChecked():
+            return
+        ok = self.live_track.init_roi((x, y, w, h))
+        self._update_track_status_label()
+        if self._track_window_active():
+            self._track_window.set_status(
+                self.track_status.text() if ok else "ROI рамкой отклонён"
+            )
+
+    def _select_roi_box_live(self) -> None:
+        """Включить режим рамки в окне трекинга (без OpenCV selectROI)."""
+        if not self.track_enable.isChecked():
+            QMessageBox.information(self, "ROI", "Сначала включите трекинг.")
+            return
+        self._show_track_window()
+        assert self._track_window is not None
+        self._track_window.video.set_box_mode(True)
+        self._track_window.video.setFocus()
 
     def _on_track_enable_toggled(self, checked: bool) -> None:
         if checked:
@@ -1774,35 +2489,23 @@ class MainWindow(QMainWindow):
                     self.track_enable.blockSignals(False)
                     return
                 self.live_track.clear_calib()
+            self._apply_scene_range(quiet=True)
             self.live_track.set_enabled(True)
+            self._show_track_window()
         else:
             self.live_track.set_enabled(False)
             self._live_overlay = None
             self.track_status.setText("Трекинг выключен")
-        self._update_track_status_label()
-
-    def _select_roi_box(self) -> None:
-        if not self.track_enable.isChecked():
-            QMessageBox.information(self, "ROI", "Сначала включите трекинг.")
-            return
-        if not self.live_track.init_roi_box():
-            self._update_track_status_label()
-            return
-        self._update_track_status_label()
-
-    def _select_roi_click(self) -> None:
-        if not self.track_enable.isChecked():
-            QMessageBox.information(self, "ROI", "Сначала включите трекинг.")
-            return
-        if not self.live_track.init_roi_click():
-            self._update_track_status_label()
-            return
+            if self._track_window is not None:
+                self._track_window.hide()
         self._update_track_status_label()
 
     def _reset_tracking(self) -> None:
         self.live_track.reset()
         self._live_overlay = None
         self._update_track_status_label()
+        if self._track_window_active():
+            self._track_window.set_status("Трекер сброшен — кликните по объекту")
 
     def _on_camera_status(self, camera_ip: str, status: str) -> None:
         row = self.camera_rows.get(camera_ip)
@@ -1882,6 +2585,9 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
         self._stop_recording()
         self._stop_streams()
+        if self._track_window is not None:
+            self._track_window.close()
+            self._track_window = None
         if self.manager:
             self.manager.stop_all()
         self.live_track.shutdown()

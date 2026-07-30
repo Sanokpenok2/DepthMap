@@ -18,6 +18,7 @@
 Управление:
     пробел  — пауза/продолжить
     r / c   — выбрать объект (рамка / клик)
+    x       — отменить трекинг
     d       — вкл/выкл отладку диспаритета (L↔R соответствия)
     q / Esc — выход
 """
@@ -25,6 +26,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from collections import deque
@@ -125,13 +127,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--z-near",
         type=float,
-        default=200.0,
+        default=25.0,
         help="Ближняя граница сцены, м. Для 1000+ м: 150–300 (потолок поиска SGBM).",
     )
     p.add_argument(
         "--z-far",
         type=float,
-        default=2500.0,
+        default=600.0,
         help="Дальняя граница сцены, м. Для шоссе/1000+ м: 1500–3000.",
     )
     p.add_argument(
@@ -139,8 +141,8 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Режим дальних дистанций: жёсткий потолок num_disparities ~d(z-near), "
-            "без авто-расширения к ближней зоне (иначе ложные большие d → 20–50 м)."
+            "Режим дальних дистанций: жёсткий потолок num_disparities ~d(z-near). "
+            "Автоматически включается при --z-far >= 800."
         ),
     )
     p.add_argument("--wls", action="store_true", help="WLS-фильтр (медленнее).")
@@ -155,7 +157,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--tracker",
         choices=["csrt", "kcf", "mosse", "ncc"],
-        default="kcf",
+        default="ncc",
         help=(
             "Базовый трекер под гибрид + NCC-refine: "
             "kcf/csrt/mosse (OpenCV) или ncc (template/NCC как в DepthMapKornia)."
@@ -335,6 +337,54 @@ def parse_args() -> argparse.Namespace:
             "Поверхность в ROI: median=стабильнее; far=чуть дальше "
             "(осторожно: шум малого d завышает Z); near=ближе."
         ),
+    )
+    p.add_argument(
+        "--speed",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Оценивать скорость выбранного объекта по стерео-траектории (нужен --calib).",
+    )
+    p.add_argument(
+        "--speed-window",
+        type=float,
+        default=4.0,
+        help="Окно истории для оценки скорости, секунды (больше = стабильнее).",
+    )
+    p.add_argument(
+        "--speed-min-dt",
+        type=float,
+        default=1.5,
+        help="Минимальный интервал истории (с), прежде чем показывать скорость.",
+    )
+    p.add_argument(
+        "--speed-ema",
+        type=float,
+        default=0.04,
+        help="EMA сглаживание скорости [0..1]: меньше = плавнее (больше инерция).",
+    )
+    p.add_argument(
+        "--speed-max-z-ratio",
+        type=float,
+        default=1.18,
+        help="Отбросить дистанцию для скорости, если Z скачет сильнее чем в N раз.",
+    )
+    p.add_argument(
+        "--speed-max-z-jump",
+        type=float,
+        default=10.0,
+        help="Отбросить дистанцию для скорости при скачке |ΔZ| больше N метров.",
+    )
+    p.add_argument(
+        "--speed-min-dz",
+        type=float,
+        default=0.8,
+        help="Игнорировать изменения дистанции меньше N метров (шум стерео).",
+    )
+    p.add_argument(
+        "--speed-min",
+        type=float,
+        default=0.5,
+        help="Скорости ниже N м/с считать нулём (не тянуть оценку шумом).",
     )
     p.add_argument(
         "--debug-disparity",
@@ -721,6 +771,7 @@ def draw_overlay(
     fps: float,
     sgbm_busy: bool = False,
     disp_range: tuple[int, int] | None = None,
+    speed_mps: float | None = None,
 ) -> np.ndarray:
     out = frame_bgr.copy()
     if roi is not None:
@@ -738,6 +789,10 @@ def draw_overlay(
             lines.append(f"distance {distance_mm:.0f} mm")
     else:
         lines.append("distance n/a")
+    if speed_mps is not None and np.isfinite(speed_mps):
+        lines.append(f"speed {speed_mps * 3.6:.1f} km/h ({speed_mps:.1f} m/s)")
+    elif roi is not None and tracking_ok:
+        lines.append("speed n/a")
     if disparity is not None:
         lines.append(f"disp {disparity:.1f} px")
     if disp_range is not None:
@@ -786,6 +841,194 @@ def smoothed_value(history: deque[float], value: float | None, window: int) -> f
     if window <= 0:
         return float(value)
     return float(np.median(history))
+
+
+class SpeedEstimator:
+    """Скорость объекта относительно камеры по изменению дистанции Z.
+
+    Берём в основном |dZ/dt| (range-rate): боковое дрожание ROI на большой
+    дальности иначе постоянно «разгоняет» |v|. Сэмплы равномерные по времени;
+    выбросы Z в историю не пишутся; малый ΔZ за окно → скорость 0.
+    """
+
+    def __init__(
+        self,
+        *,
+        focal_px: float,
+        cx: float,
+        cy: float,
+        window_s: float = 4.0,
+        min_dt_s: float = 1.5,
+        ema_alpha: float = 0.04,
+        sample_interval_s: float = 0.20,
+        median_len: int = 11,
+        max_accel_mps2: float = 3.0,
+        max_z_ratio: float = 1.18,
+        max_z_jump_m: float = 10.0,
+        min_dz_m: float = 0.8,
+        min_speed_mps: float = 0.5,
+    ) -> None:
+        self.focal_px = max(float(focal_px), 1.0)
+        self.cx = float(cx)
+        self.cy = float(cy)
+        self.window_s = max(0.5, float(window_s))
+        self.min_dt_s = max(0.1, float(min_dt_s))
+        self.ema_alpha = float(np.clip(ema_alpha, 0.0, 1.0))
+        # Спуск быстрее подъёма — иначе шумовые пики «защёлкивают» скорость вверх.
+        self.ema_alpha_down = float(np.clip(max(self.ema_alpha * 3.0, 0.12), 0.0, 1.0))
+        self.sample_interval_s = max(0.05, float(sample_interval_s))
+        self.median_len = max(1, int(median_len))
+        self.max_accel_mps2 = max(0.5, float(max_accel_mps2))
+        self.max_z_ratio = max(1.01, float(max_z_ratio))
+        self.max_z_jump_mm = max(100.0, float(max_z_jump_m) * 1000.0)
+        self.min_dz_mm = max(50.0, float(min_dz_m) * 1000.0)
+        self.min_speed_mps = max(0.0, float(min_speed_mps))
+        # (t, z_mm) — только дистанция; боковой ROI для скорости не используем.
+        self._samples: deque[tuple[float, float]] = deque()
+        self._z_hist: deque[float] = deque(maxlen=21)
+        self._raw_speeds: deque[float] = deque(maxlen=self.median_len)
+        self._speed_mps: float | None = None
+        self._last_sample_t: float | None = None
+        self._last_emit_t: float | None = None
+        self._z_s: float | None = None
+
+    def reset(self) -> None:
+        self._samples.clear()
+        self._z_hist.clear()
+        self._raw_speeds.clear()
+        self._speed_mps = None
+        self._last_sample_t = None
+        self._last_emit_t = None
+        self._z_s = None
+
+    def _ref_z_mm(self) -> float | None:
+        if len(self._z_hist) >= 3:
+            return float(np.median(self._z_hist))
+        if self._z_s is not None:
+            return float(self._z_s)
+        return None
+
+    def _is_z_outlier(self, z_mm: float) -> bool:
+        ref = self._ref_z_mm()
+        if ref is None or ref <= 0:
+            return False
+        jump = abs(float(z_mm) - ref)
+        if jump > self.max_z_jump_mm:
+            return True
+        ratio = float(z_mm) / ref
+        return bool(ratio > self.max_z_ratio or ratio < 1.0 / self.max_z_ratio)
+
+    def _filter_z(self, z_mm: float) -> float | None:
+        """Сглаженный Z или None при выбросе (выброс не двигает фильтр)."""
+        z_mm = float(z_mm)
+        if self._is_z_outlier(z_mm):
+            return None
+        a_z = 0.15
+        if self._z_s is None:
+            self._z_s = z_mm
+        else:
+            self._z_s = (1.0 - a_z) * self._z_s + a_z * z_mm
+        self._z_hist.append(float(self._z_s))
+        return float(self._z_s)
+
+    @staticmethod
+    def _slope_mm_s(times: np.ndarray, values: np.ndarray) -> float:
+        t = times - float(times[0])
+        if float(t[-1] - t[0]) < 1e-6:
+            return 0.0
+        return float(np.polyfit(t, values, 1)[0])
+
+    def update(
+        self,
+        now: float,
+        distance_mm: float | None,
+        roi: tuple[int, int, int, int] | None,
+        *,
+        tracking_ok: bool,
+    ) -> float | None:
+        del roi  # боковой ROI намеренно не используем — источник ложного разгона
+        if (
+            not tracking_ok
+            or distance_mm is None
+            or not np.isfinite(distance_mm)
+            or distance_mm <= 0
+        ):
+            return self._speed_mps
+
+        now = float(now)
+        z_acc = self._filter_z(float(distance_mm))
+        if z_acc is None:
+            return self._speed_mps
+
+        # Равномерные сэмплы по времени (НЕ по порогу ΔZ — иначе «лесенка» и разгон).
+        if (
+            self._last_sample_t is not None
+            and (now - self._last_sample_t) < self.sample_interval_s
+        ):
+            return self._speed_mps
+
+        self._samples.append((now, z_acc))
+        self._last_sample_t = now
+        cutoff = now - self.window_s
+        while len(self._samples) > 2 and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+
+        if len(self._samples) < 3:
+            return self._speed_mps
+
+        t0 = self._samples[0][0]
+        t1 = self._samples[-1][0]
+        dt = t1 - t0
+        if dt < self.min_dt_s:
+            return self._speed_mps
+
+        times = np.asarray([s[0] for s in self._samples], dtype=np.float64)
+        zs = np.asarray([s[1] for s in self._samples], dtype=np.float64)
+
+        # Малый размах Z за окно → нет достоверного движения по дальности.
+        z_span = float(np.ptp(zs))  # max - min
+        if z_span < self.min_dz_mm:
+            speed = 0.0
+        else:
+            # |dZ/dt|: скорость сближения/удаления относительно камеры.
+            vz = abs(self._slope_mm_s(times, zs)) / 1000.0
+            # Доп. проверка: простая оценка по концам окна (устойчивее к краям).
+            vz_ends = abs(float(zs[-1] - zs[0])) / max(dt, 1e-3) / 1000.0
+            speed = float(min(vz, vz_ends * 1.25))  # не раздувать МНК сверх концов
+
+        if not np.isfinite(speed) or speed < 0:
+            return self._speed_mps
+        if speed < self.min_speed_mps:
+            speed = 0.0
+
+        self._raw_speeds.append(speed)
+        speed_med = float(np.median(self._raw_speeds))
+        if speed_med < self.min_speed_mps:
+            speed_med = 0.0
+
+        if self._speed_mps is None or self.ema_alpha >= 1.0:
+            smoothed = speed_med
+        else:
+            a = (
+                self.ema_alpha_down
+                if speed_med < self._speed_mps
+                else self.ema_alpha
+            )
+            smoothed = (1.0 - a) * self._speed_mps + a * speed_med
+
+        if self._speed_mps is not None and self._last_emit_t is not None:
+            dt_emit = max(now - self._last_emit_t, 1e-3)
+            max_step = self.max_accel_mps2 * dt_emit
+            delta = smoothed - self._speed_mps
+            if abs(delta) > max_step:
+                smoothed = self._speed_mps + math.copysign(max_step, delta)
+
+        if smoothed < self.min_speed_mps:
+            smoothed = 0.0
+
+        self._speed_mps = float(smoothed)
+        self._last_emit_t = now
+        return self._speed_mps
 
 
 class DistanceSmoother:
@@ -1282,6 +1525,38 @@ def main() -> None:
     )
     dist_s = None
     disp_s = None
+    speed_mps: float | None = None
+    speed_est: SpeedEstimator | None = None
+    if args.speed and not track_only and calib is not None:
+        focal_px, _baseline = extract_calib_geometry(calib)
+        if "P1" in calib:
+            p1 = np.asarray(calib["P1"], dtype=np.float64)
+            cam_cx = float(p1[0, 2])
+            cam_cy = float(p1[1, 2])
+            if abs(float(p1[0, 0])) > 1.0:
+                focal_px = float(p1[0, 0])
+        else:
+            mtx = np.asarray(calib["mtx_l"], dtype=np.float64)
+            cam_cx = float(mtx[0, 2])
+            cam_cy = float(mtx[1, 2])
+        speed_est = SpeedEstimator(
+            focal_px=focal_px,
+            cx=cam_cx,
+            cy=cam_cy,
+            window_s=args.speed_window,
+            min_dt_s=args.speed_min_dt,
+            ema_alpha=args.speed_ema,
+            max_z_ratio=args.speed_max_z_ratio,
+            max_z_jump_m=args.speed_max_z_jump,
+            min_dz_m=args.speed_min_dz,
+            min_speed_mps=args.speed_min,
+        )
+        print(
+            f"Скорость объекта: окно {args.speed_window:.2f} с, "
+            f"мин. {args.speed_min_dt:.2f} с, EMA={args.speed_ema:.2f}; "
+            f"отсев ΔZ>{args.speed_max_z_jump:.0f} м / ×{args.speed_max_z_ratio:.2f}, "
+            f"мин.ΔZ={args.speed_min_dz:.1f} м, мин.v={args.speed_min:.1f} м/с."
+        )
 
     writer = None
     if args.output:
@@ -1427,6 +1702,25 @@ def main() -> None:
                             max_distance_mm=max_distance_mm,
                             dist_smoother=dist_smoother,
                         )
+                        if speed_est is not None:
+                            speed_est.reset()
+                            speed_mps = None
+
+                if (
+                    speed_est is not None
+                    and tracker.initialized
+                    and tracking_ok
+                    and dist_s is not None
+                    and roi is not None
+                ):
+                    speed_mps = speed_est.update(
+                        time.perf_counter(),
+                        dist_s,
+                        roi,
+                        tracking_ok=True,
+                    )
+                elif speed_est is not None and not tracker.initialized:
+                    speed_mps = None
 
                 # 4) draw
                 sgbm_busy = sgbm_future is not None and not sgbm_future.done()
@@ -1440,6 +1734,7 @@ def main() -> None:
                     fps,
                     sgbm_busy=sgbm_busy,
                     disp_range=(disp_min, disp_num) if not track_only else None,
+                    speed_mps=speed_mps if speed_est is not None else None,
                 )
                 if debug_disparity:
                     overlay = _annotate_debug_flag(overlay)
@@ -1491,10 +1786,13 @@ def main() -> None:
                     roi = None
                     tracking_ok = False
                     dist_smoother.reset()
+                    if speed_est is not None:
+                        speed_est.reset()
                     dist_s = None
                     disp_s = None
                     disp_val = None
                     disp_debug = None
+                    speed_mps = None
                     print("Трекинг отменён. R/C — выбрать объект заново.")
                     base = rect_l_bgr if rect_l_bgr is not None else overlay
                     if base is not None:
@@ -1508,6 +1806,7 @@ def main() -> None:
                             fps,
                             sgbm_busy=False,
                             disp_range=(disp_min, disp_num) if not track_only else None,
+                            speed_mps=None,
                         )
                         cv2.imshow(
                             window,
@@ -1562,8 +1861,11 @@ def main() -> None:
                     roi = new_roi
                     tracking_ok = True
                     dist_smoother.reset()
+                    if speed_est is not None:
+                        speed_est.reset()
                     dist_s = None
                     disp_s = None
+                    speed_mps = None
                     if not track_only and matcher is not None:
                         disp_float = compute_disparity(
                             rect_l,

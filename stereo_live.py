@@ -54,8 +54,8 @@ class LiveTrackDepthController:
     def __init__(
         self,
         *,
-        z_near_m: float = 200.0,
-        z_far_m: float = 2500.0,
+        z_near_m: float = 10.0,
+        z_far_m: float = 100.0,
         auto_disparity: bool = True,
         sgbm_interval: int = 2,
         smooth_window: int = 21,
@@ -69,7 +69,7 @@ class LiveTrackDepthController:
         clahe: bool = True,
         roi_inset: float = 0.32,
         surface: str = "median",
-        long_range: bool = True,
+        long_range: bool | None = None,
         on_log: Callable[[str], None] | None = None,
     ) -> None:
         self.z_near_m = float(z_near_m)
@@ -87,7 +87,9 @@ class LiveTrackDepthController:
         self.clahe = bool(clahe)
         self.roi_inset = float(roi_inset)
         self.surface = str(surface)
-        self.long_range = bool(long_range) or self.z_far_m >= 800.0
+        # None = авто по z_far. Явный True при z_far<800 больше не форсирует long-range.
+        self._long_range_pref = long_range
+        self.long_range = self._resolve_long_range(long_range)
         self.max_disp_cap: float | None = None
         self.min_disp_floor = 0.85
         self.max_distance_mm: float | None = self.z_far_m * 1000.0 * 1.15
@@ -145,6 +147,42 @@ class LiveTrackDepthController:
         self._tracking_ok = False
         self._status_msg = ""
 
+    @staticmethod
+    def _resolve_long_range_flag(z_far_m: float, long_range: bool | None) -> bool:
+        """long-range только для дальних сцен (z_far>=800); иначе обычный SGBM."""
+        if z_far_m < 800.0:
+            return False
+        if long_range is None:
+            return True
+        return bool(long_range)
+
+    def _resolve_long_range(self, long_range: bool | None) -> bool:
+        return self._resolve_long_range_flag(self.z_far_m, long_range)
+
+    def set_scene_range(
+        self,
+        z_near_m: float,
+        z_far_m: float,
+        *,
+        long_range: bool | None = None,
+    ) -> None:
+        """Задать диапазон сцены (м) и пересобрать matcher при наличии калибровки."""
+        if z_near_m <= 0 or z_far_m <= 0 or z_near_m >= z_far_m:
+            raise ValueError("Нужно 0 < z_near_m < z_far_m.")
+        self.z_near_m = float(z_near_m)
+        self.z_far_m = float(z_far_m)
+        self._long_range_pref = long_range
+        self.long_range = self._resolve_long_range(long_range)
+        self.uniqueness = 12 if self.long_range else 5
+        self.max_distance_mm = self.z_far_m * 1000.0 * 1.15
+        self.dist_smoother.max_distance_mm = self.max_distance_mm
+        self._log(
+            f"Сцена: z={self.z_near_m:.0f}–{self.z_far_m:.0f} м "
+            f"(long_range={self.long_range})."
+        )
+        if self.calib is not None:
+            self._rebuild_matcher_from_calib("reconfigure")
+
     def _log(self, msg: str) -> None:
         self._status_msg = msg
         if self._on_log is not None:
@@ -164,12 +202,26 @@ class LiveTrackDepthController:
 
     def load_calib(self, path: str) -> None:
         calib = load_calibration(path)
+        self._rebuild_matcher_from_calib(path, calib=calib)
+        with self._lock:
+            self.calib = calib
+            self.Q = calib["Q"]
+            self.track_only = False
+        self._log(f"Калибровка загружена: {path}")
+
+    def _rebuild_matcher_from_calib(
+        self, path: str, calib: dict | None = None
+    ) -> None:
+        if calib is None:
+            calib = self.calib
+        if calib is None:
+            return
         width = 640
         if "image_size" in calib:
             width = int(calib["image_size"][0])
-        disp_min, disp_num = 0, 48
-        self.long_range = bool(self.long_range) or self.z_far_m >= 800.0
+        self.long_range = self._resolve_long_range(self._long_range_pref)
         self.uniqueness = 12 if self.long_range else 5
+        disp_min, disp_num = 0, 48
         if self.auto_disparity:
             disp_min, disp_num, range_log = estimate_disparity_range_bounds(
                 calib,
@@ -199,8 +251,6 @@ class LiveTrackDepthController:
             self.max_distance_mm = float(self.z_far_m) * 1000.0 * 1.15
             self.dist_smoother.max_distance_mm = self.max_distance_mm
         with self._lock:
-            self.calib = calib
-            self.Q = calib["Q"]
             self.disp_min = disp_min
             self.disp_num = disp_num
             self.matcher = make_stereo_matcher(
@@ -211,8 +261,11 @@ class LiveTrackDepthController:
                 uniqueness_ratio=self.uniqueness,
                 speckle_window_size=40 if self.long_range else 50,
             )
-            self.track_only = False
-        self._log(f"Калибровка загружена: {path}")
+        self._log(
+            f"Диапазон сцены {self.z_near_m:.0f}–{self.z_far_m:.0f} м → "
+            f"disp min={disp_min}, num={disp_num} "
+            f"(long_range={self.long_range})."
+        )
 
     def clear_calib(self) -> None:
         with self._lock:
@@ -319,6 +372,55 @@ class LiveTrackDepthController:
             self._disp_val = None
         self._log(f"ROI выбран кликом: {roi}")
         return True
+
+    def init_roi(self, roi: tuple[int, int, int, int]) -> bool:
+        """Инициализация трекера готовым ROI на последнем rectified left-кадре."""
+        snap = self._snapshot_rect_left()
+        if snap is None:
+            self._log("Нет кадра для выбора ROI.")
+            return False
+        try:
+            self.tracker.init(snap, roi)
+        except Exception as exc:
+            self._log(f"ROI отклонён: {exc}")
+            return False
+        with self._lock:
+            self.dist_smoother.reset()
+            self._tracking_ok = True
+            self._dist_s = None
+            self._disp_val = None
+        self._log(f"ROI задан: {self.tracker.roi}")
+        return True
+
+    def init_roi_at_point(
+        self,
+        x: int,
+        y: int,
+        *,
+        tolerance: int = 12,
+        grabcut_refine: bool = False,
+        fallback_box: int = 48,
+    ) -> bool:
+        """Клик по live-кадру: оценка ROI без отдельного OpenCV-окна."""
+        snap = self._snapshot_rect_left()
+        if snap is None:
+            self._log("Нет кадра для выбора ROI.")
+            return False
+        from object_tracker import estimate_roi_from_point
+
+        try:
+            roi = estimate_roi_from_point(
+                snap,
+                (int(x), int(y)),
+                tolerance=int(tolerance),
+                grabcut_refine=bool(grabcut_refine),
+            )
+        except Exception:
+            roi = None
+        if roi is None:
+            half = max(8, int(fallback_box) // 2)
+            roi = (int(x) - half, int(y) - half, int(fallback_box), int(fallback_box))
+        return self.init_roi(roi)
 
     def process(
         self,

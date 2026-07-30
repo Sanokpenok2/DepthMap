@@ -191,6 +191,29 @@ FRAME_HEIGHT = 512
 # Значение команды 0x0101 для обработанного монохромного потока 640x512.
 MONO_STREAM_MODE = 0x02
 
+DISPLAY_PERCENTILE_LO = 2.0
+DISPLAY_PERCENTILE_HI = 98.0
+_DISPLAY_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+
+def mono16_to_display8(mono16: np.ndarray) -> np.ndarray:
+    """MONO16 → 8-бит для превью/MP4 (процентили + CLAHE, как экранный AGC)."""
+    if mono16.dtype != np.uint16 and mono16.dtype != np.float32:
+        mono16 = mono16.astype(np.uint16, copy=False)
+    flat = mono16.reshape(-1)
+    sample = flat[::8] if flat.size > 4096 else flat
+    lo = float(np.percentile(sample, DISPLAY_PERCENTILE_LO))
+    hi = float(np.percentile(sample, DISPLAY_PERCENTILE_HI))
+    if hi <= lo + 1.0:
+        s = sample.astype(np.float32)
+        med = float(np.median(s))
+        mad = float(np.median(np.abs(s - med))) + 1.0
+        lo, hi = med - 5.0 * mad, med + 5.0 * mad
+    if hi <= lo:
+        return np.zeros(mono16.shape, dtype=np.uint8)
+    scale = 255.0 / (hi - lo)
+    out = np.clip((mono16.astype(np.float32) - lo) * scale, 0, 255).astype(np.uint8)
+    return _DISPLAY_CLAHE.apply(out)
 
 @dataclass(frozen=True)
 class FrameMeta:
@@ -487,7 +510,7 @@ class FrameAssembler:
         count = height * width
         mono16 = np.frombuffer(raw_buffer, dtype=">u2", count=count).reshape(height, width)
         # Для просмотра и MP4 преобразуем 16-битный монохромный кадр в 8 бит.
-        return cv2.normalize(mono16, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+        return mono16_to_display8(mono16)
 
 
 # ========================= network.py =========================
