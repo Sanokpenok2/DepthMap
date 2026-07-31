@@ -1892,6 +1892,8 @@ def main() -> None:
                             max_distance_mm=max_distance_mm,
                             dist_smoother=dist_smoother,
                             collect_debug=debug_disparity,
+                            left_gray=rect_l,
+                            right_gray=rect_r,
                         )
                         disp_min, disp_num, matcher = _maybe_adapt_matcher(
                             auto_disp=auto_disp,
