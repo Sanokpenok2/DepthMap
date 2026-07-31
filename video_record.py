@@ -209,6 +209,7 @@ def build_telemetry_packet(temperature_code: int, video_port: int, camera_ip: st
 
 
 # ========================= frame.py =========================
+import os
 import threading
 import queue
 import time
@@ -240,35 +241,65 @@ DISPLAY_PERCENTILE_HI = 98.0
 _DISPLAY_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 
-def mono16_to_display8(mono16: np.ndarray) -> np.ndarray:
-    """MONO16 → 8-бит для превью/MP4 (процентили + CLAHE, как экранный AGC)."""
-    if mono16.dtype != np.uint16 and mono16.dtype != np.float32:
-        mono16 = mono16.astype(np.uint16, copy=False)
-    flat = mono16.reshape(-1)
-    # subsample for speed on 640x512
-    sample = flat[::8] if flat.size > 4096 else flat
-    lo = float(np.percentile(sample, DISPLAY_PERCENTILE_LO))
-    hi = float(np.percentile(sample, DISPLAY_PERCENTILE_HI))
-    if hi <= lo + 1.0:
-        # Запасной вариант: вокруг медианы сцены (устойчиво к точечным нагревам).
-        s = sample.astype(np.float32)
-        med = float(np.median(s))
-        mad = float(np.median(np.abs(s - med))) + 1.0
-        lo, hi = med - 5.0 * mad, med + 5.0 * mad
-    if hi <= lo:
-        return np.zeros(mono16.shape, dtype=np.uint8)
-    scale = 255.0 / (hi - lo)
-    out = np.clip((mono16.astype(np.float32) - lo) * scale, 0, 255).astype(np.uint8)
-    return _DISPLAY_CLAHE.apply(out)
+class FastMonoAgc:
+    """Быстрый AGC: lo/hi обновляются редко, конвейер на каждом кадре одинаковый.
+
+    Раньше CLAHE включался раз в N кадров — из‑за этого картинка «моргала».
+    """
+
+    __slots__ = ("_lo", "_hi", "_frame_i")
+
+    def __init__(self) -> None:
+        self._lo = 0.0
+        self._hi = 1.0
+        self._frame_i = 0
+
+    def convert(self, mono16: np.ndarray, *, light: bool = False) -> np.ndarray:
+        if mono16.dtype != np.uint16:
+            mono16 = mono16.astype(np.uint16, copy=False)
+        self._frame_i += 1
+        # Пересчёт границ редко — экономия CPU без смены алгоритма кадр-к-кадру.
+        period = 16 if light else 8
+        if self._frame_i == 1 or self._frame_i % period == 0:
+            flat = mono16.reshape(-1)
+            sample = flat[::32] if flat.size > 8192 else flat[::8]
+            lo = float(np.percentile(sample, DISPLAY_PERCENTILE_LO))
+            hi = float(np.percentile(sample, DISPLAY_PERCENTILE_HI))
+            if hi <= lo + 1.0:
+                med = float(np.median(sample))
+                lo, hi = med - 400.0, med + 400.0
+            if hi <= lo:
+                hi = lo + 1.0
+            if self._frame_i == 1:
+                self._lo, self._hi = lo, hi
+            else:
+                self._lo = 0.85 * self._lo + 0.15 * lo
+                self._hi = 0.85 * self._hi + 0.15 * hi
+
+        scale = 255.0 / (self._hi - self._lo)
+        out = cv2.convertScaleAbs(mono16, alpha=scale, beta=-self._lo * scale)
+        # В light-режиме без CLAHE (нагрузка), иначе CLAHE на каждом кадре —
+        # стабильная яркость, без мерцания.
+        if light:
+            return out
+        return _DISPLAY_CLAHE.apply(out)
+
+
+_DEFAULT_MONO_AGC = FastMonoAgc()
+
+
+def mono16_to_display8(mono16: np.ndarray, *, light: bool = False) -> np.ndarray:
+    """MONO16 → 8-бит для превью/MP4 (быстрый AGC)."""
+    return _DEFAULT_MONO_AGC.convert(mono16, light=light)
 
 
 def crop_to_processed_size(frame: np.ndarray) -> np.ndarray:
     """Центральная обрезка до 640×512 (сырое 648×520, графика 960×512)."""
     h, w = frame.shape[:2]
     if (w, h) == (FRAME_WIDTH, FRAME_HEIGHT):
-        return np.ascontiguousarray(frame)
+        return frame if frame.flags["C_CONTIGUOUS"] else np.ascontiguousarray(frame)
     if w < FRAME_WIDTH or h < FRAME_HEIGHT:
-        return np.ascontiguousarray(frame)
+        return frame if frame.flags["C_CONTIGUOUS"] else np.ascontiguousarray(frame)
     x0 = (w - FRAME_WIDTH) // 2
     y0 = (h - FRAME_HEIGHT) // 2
     return np.ascontiguousarray(frame[y0 : y0 + FRAME_HEIGHT, x0 : x0 + FRAME_WIDTH])
@@ -305,6 +336,8 @@ class LatestFrameStore:
 
     def put(self, camera_ip: str, frame: np.ndarray, meta: FrameMeta) -> None:
         now = time.monotonic()
+        # Копия: приёмный поток не должен иметь шанс затронуть показанный кадр.
+        frame = np.ascontiguousarray(frame.copy())
         with self._lock:
             seq = self._sequences.get(camera_ip, 0) + 1
             total = self._totals.get(camera_ip, 0) + 1
@@ -383,11 +416,26 @@ class FrameAssembler:
         self._feed_by_type: dict[int, int] = {}
         self._feed_sizes: list[int] = []
         self._last_stats_at = 0.0
+        self._udp_diag = os.environ.get("VIDEO_UDP_DIAG", "").strip() not in (
+            "",
+            "0",
+            "false",
+            "False",
+        )
         self._diag_path = Path(__file__).resolve().parent / "video_udp_diag.log"
-        try:
-            self._diag_path.write_text("", encoding="utf-8")
-        except OSError:
-            pass
+        self._last_incomplete_warn = 0
+        self._agc = FastMonoAgc()
+        self._fast_row = False  # после определения layout — короткий путь
+        self._decode_width = 0
+        self._decode_bpp = 0
+        self._frame_t0 = 0.0
+        # Кадр ~40–80 мс; дольше — риск подмеса поздних строк прошлого кадра.
+        self._frame_timeout_s = 0.12
+        if self._udp_diag:
+            try:
+                self._diag_path.write_text("", encoding="utf-8")
+            except OSError:
+                pass
 
         self._buffer_pool: queue.LifoQueue[bytearray] = queue.LifoQueue(
             maxsize=self._BUFFER_COUNT - 1
@@ -424,47 +472,40 @@ class FrameAssembler:
         size = len(view)
         self._feed_packets += 1
 
-        preamble_ok = size >= 4 and view[0] == 0 and view[1] == 0
-        packet_type = self._u16(view, 2) if preamble_ok else -1
-        if packet_type >= 0:
-            self._feed_by_type[packet_type] = self._feed_by_type.get(packet_type, 0) + 1
-        if len(self._feed_sizes) < 40:
-            self._feed_sizes.append(size)
-
-        # Первые пакеты и периодическая сводка — в статус и в video_udp_diag.log
-        if self._feed_packets <= 25 or (
-            packet_type != int(PacketType.START_FRAME) and self._diag_packets < 15
-        ):
-            head = bytes(view[: min(16, size)]).hex()
-            msg = (
-                f"UDP#{self._feed_packets} size={size} "
-                f"type=0x{packet_type & 0xFFFF:04X} head={head}"
-            )
-            self._diag_log(msg)
-            self.on_status(self.camera_ip, msg)
-            if packet_type == int(PacketType.VIDEO_ROW) or (
-                packet_type > 0 and packet_type != int(PacketType.START_FRAME)
-            ):
-                self._diag_packets += 1
-
-        now = time.monotonic()
-        if now - self._last_stats_at >= 2.0:
-            self._last_stats_at = now
-            type_summary = ", ".join(
-                f"0x{t:04X}:{c}" for t, c in sorted(self._feed_by_type.items())
-            )
-            sizes = self._feed_sizes[-8:] if self._feed_sizes else []
-            stats = (
-                f"UDP итого {self._feed_packets} | типы [{type_summary}] | "
-                f"размеры {sizes} | строк {self._row_packets} | "
-                f"incomplete {self._incomplete_frames}"
-            )
-            self._diag_log(stats)
-            self.on_status(self.camera_ip, stats)
-
-        if not preamble_ok:
+        if size < 4 or view[0] != 0 or view[1] != 0:
             self._invalid_packets += 1
             return
+
+        packet_type = self._u16(view, 2)
+
+        if self._udp_diag:
+            self._feed_by_type[packet_type] = self._feed_by_type.get(packet_type, 0) + 1
+            if len(self._feed_sizes) < 40:
+                self._feed_sizes.append(size)
+            if self._feed_packets <= 25 or (
+                packet_type != int(PacketType.START_FRAME) and self._diag_packets < 15
+            ):
+                head = bytes(view[: min(16, size)]).hex()
+                msg = (
+                    f"UDP#{self._feed_packets} size={size} "
+                    f"type=0x{packet_type:04X} head={head}"
+                )
+                self._diag_log(msg)
+                self.on_status(self.camera_ip, msg)
+                if packet_type != int(PacketType.START_FRAME):
+                    self._diag_packets += 1
+            now = time.monotonic()
+            if now - self._last_stats_at >= 2.0:
+                self._last_stats_at = now
+                type_summary = ", ".join(
+                    f"0x{t:04X}:{c}" for t, c in sorted(self._feed_by_type.items())
+                )
+                stats = (
+                    f"UDP итого {self._feed_packets} | типы [{type_summary}] | "
+                    f"строк {self._row_packets} | incomplete {self._incomplete_frames}"
+                )
+                self._diag_log(stats)
+                self.on_status(self.camera_ip, stats)
 
         if packet_type == PacketType.START_FRAME:
             if size < 14:
@@ -509,6 +550,20 @@ class FrameAssembler:
     def _begin_frame(self, packet: StartFramePacket) -> None:
         if self._start is not None and self._received_count != self._start.height:
             self._incomplete_frames += 1
+            # На батарее часто не успеваем добрать строки — сразу сбрасываем
+            # фрагменты, чтобы не копить мусор и не отставать ещё сильнее.
+            self._row_frags.clear()
+            if (
+                self._incomplete_frames >= 5
+                and self._incomplete_frames - self._last_incomplete_warn >= 25
+            ):
+                self._last_incomplete_warn = self._incomplete_frames
+                self.on_status(
+                    self.camera_ip,
+                    f"Много неполных кадров ({self._incomplete_frames}): "
+                    f"на батарее включите схему «Высокая производительность» "
+                    f"или подключите питание",
+                )
 
         if (
             packet.width != self._expected_width
@@ -527,6 +582,7 @@ class FrameAssembler:
         self._start = packet
         self._received_count = 0
         self._row_frags.clear()
+        self._frame_t0 = time.monotonic()
         # Не фиксируем 960×3 заранее: камера в fmt=3 часто шлёт те же
         # mono-строки 1280 байт (640×2), что и в b10.
         if self._row_bytes <= 0:
@@ -534,7 +590,8 @@ class FrameAssembler:
         self._row_bytes_hint = row_bytes_hint(
             packet.width, packet.video_format, self._expected_format
         )
-        for i in range(packet.height):
+        h = packet.height
+        for i in range(h):
             self._row_seen[i] = 0
         if not self._logged_start:
             self._logged_start = True
@@ -565,22 +622,20 @@ class FrameAssembler:
                 return need
         return 0
 
-    def _map_row_number(self, row_number: int, height: int) -> tuple[int, int]:
-        """(номер_строки, байтовый_сдвиг_во_фрагменте).
+    def _map_row_number(self, row_number: int, height: int) -> int:
+        """Номер строки изображения или -1, если пакет нужно отбросить.
 
-        Обычный случай: несколько UDP с одним row_number → сдвиг 0, клеим в frag.
-        Если нумерация 0..2H-1 (по два пакета на строку) — строка = n//2.
+        Раньше row>=height сжимался через //2 или % — из‑за этого чужие
+        пакеты затирали чужие строки, а часть строк оставалась от прошлого
+        кадра → горизонтальные «помехи».
         """
-        if row_number < height:
-            return row_number, 0
-        # Старший бит — флаг «вторая половина строки».
+        if 0 <= row_number < height:
+            return row_number
+        # Только явный флаг 0x8000|row (вторая половина), без угадываний.
         if row_number & 0x8000:
-            return row_number & 0x7FFF, 0
-        if row_number < height * 2:
-            return row_number // 2, 0
-        if (height & (height - 1)) == 0:
-            return row_number & (height - 1), 0
-        return row_number % height, 0
+            idx = row_number & 0x7FFF
+            return idx if idx < height else -1
+        return -1
 
     def _commit_full_row(self, row_number: int, row_data: memoryview) -> None:
         start = self._start
@@ -589,25 +644,142 @@ class FrameAssembler:
         expected = self._row_bytes
         if expected <= 0 or self._row_seen[row_number]:
             return
+        # Только точная длина: лишние/битые байты дают «шумную» полосу.
+        if len(row_data) != expected:
+            if len(row_data) < expected:
+                return
+            row_data = row_data[:expected]
         offset = row_number * expected
-        self._current_buffer[offset : offset + expected] = row_data[:expected]
+        self._current_buffer[offset : offset + expected] = row_data
         self._row_seen[row_number] = 1
         self._received_count += 1
 
-        # Нужна полная высота из старта; для mono-строк 1280 при старте 960
-        # высота всё ещё 512.
         need_rows = start.height
         if self._row_bytes == FRAME_WIDTH * 2 and start.height > FRAME_HEIGHT:
             need_rows = FRAME_HEIGHT
         if self._received_count != need_rows:
             return
+        self._finish_assembled_frame(start, expected)
 
+    def _finish_row_bytes(self, row_number: int, data: memoryview, how: str) -> None:
+        start = self._start
+        if start is None:
+            return
+        if not self._logged_row_layout:
+            self._logged_row_layout = True
+            eff_w = self._effective_width(start.width, self._row_bytes)
+            bpp = self._row_bytes // max(eff_w, 1)
+            self._decode_width = eff_w
+            self._decode_bpp = bpp
+            self._fast_row = bpp == 2 and self._row_bytes == eff_w * 2
+            self.on_status(
+                self.camera_ip,
+                f"Строка видео: {self._row_bytes} байт ({bpp} байт/пикс), "
+                f"эффект. {eff_w}x{start.height} (старт {start.width}x{start.height}), {how}",
+            )
+        self._commit_full_row(row_number, data)
+
+    @staticmethod
+    def _effective_width(start_width: int, row_bytes: int) -> int:
+        """Ширина пикселей по длине строки (старт может врать: 960 при данных 640)."""
+        for w in (int(start_width), FRAME_WIDTH, OVERLAY_FRAME_WIDTH, RAW_FRAME_WIDTH):
+            if w > 0 and row_bytes % w == 0:
+                bpp = row_bytes // w
+                if bpp in (2, 3, 4):
+                    return w
+        return int(start_width)
+
+    def _add_row_fast(self, row_number: int, row_data: memoryview) -> None:
+        start = self._start
+        if start is None:
+            return
+
+        # Слишком долгая сборка — высок шанс подмеса хвоста прошлого кадра.
+        if self._frame_t0 and (time.monotonic() - self._frame_t0) > self._frame_timeout_s:
+            self._incomplete_frames += 1
+            self._start = None
+            self._received_count = 0
+            self._row_frags.clear()
+            return
+
+        row_number = self._map_row_number(row_number, start.height)
+        if row_number < 0:
+            self._invalid_packets += 1
+            return
+
+        # Горячий путь после стабилизации layout (типичный mono 640×2).
+        if self._fast_row and self._row_bytes > 0:
+            if self._row_seen[row_number]:
+                return
+            expected = self._row_bytes
+            if len(row_data) >= expected:
+                offset = row_number * expected
+                self._current_buffer[offset : offset + expected] = row_data[:expected]
+                self._row_seen[row_number] = 1
+                self._received_count += 1
+                if self._received_count == start.height:
+                    self._finish_assembled_frame(start, expected)
+                return
+            # Иначе короткие фрагменты — общий путь ниже.
+
+        self._row_packets += 1
+
+        matched_one = self._match_row_size(start.width, len(row_data))
+        if self._row_bytes <= 0:
+            if matched_one > 0:
+                self._row_bytes = matched_one
+            else:
+                self._row_bytes = getattr(self, "_row_bytes_hint", 0) or row_bytes_hint(
+                    start.width, start.video_format, self._expected_format
+                )
+        elif matched_one > 0 and matched_one != self._row_bytes and not self._logged_row_layout:
+            self._row_bytes = matched_one
+
+        expected = self._row_bytes
+        if expected <= 0:
+            return
+
+        if len(row_data) >= expected:
+            self._finish_row_bytes(row_number, row_data[:expected], "целиком")
+            return
+
+        frag = self._row_frags.get(row_number)
+        if frag is None:
+            frag = bytearray()
+            self._row_frags[row_number] = frag
+        frag.extend(row_data)
+
+        if len(frag) >= expected:
+            if not self._logged_row_layout:
+                matched = self._match_row_size(start.width, len(frag))
+                if matched > 0:
+                    self._row_bytes = matched
+                    expected = matched
+            full = memoryview(frag)[:expected]
+            del self._row_frags[row_number]
+            self._finish_row_bytes(
+                row_number, full, "из фрагментов" if len(row_data) < expected else "целиком"
+            )
+            return
+
+        if len(frag) > max(self._row_size_candidates(start.width)) + 64:
+            del self._row_frags[row_number]
+            self._invalid_packets += 1
+            if not self._logged_row_layout:
+                self._logged_row_layout = True
+                self.on_status(
+                    self.camera_ip,
+                    f"Строка видео: не удалось собрать "
+                    f"(накоплено {len(frag)} байт, ширина {start.width}, "
+                    f"кусок {len(row_data)} байт)",
+                )
+
+    def _finish_assembled_frame(self, start: StartFramePacket, expected: int) -> None:
         completed_start = start
         completed_buffer = self._current_buffer
         completed_row_bytes = expected
         self._start = None
         self._received_count = 0
-        # _row_bytes сохраняем между кадрами (fmt уже известен).
         self._row_frags.clear()
 
         try:
@@ -634,104 +806,6 @@ class FrameAssembler:
                 self._return_buffer(completed_buffer)
                 self._dropped_decode_frames += 1
 
-    def _finish_row_bytes(self, row_number: int, data: memoryview, how: str) -> None:
-        start = self._start
-        if start is None:
-            return
-        if not self._logged_row_layout:
-            self._logged_row_layout = True
-            eff_w = self._effective_width(start.width, self._row_bytes)
-            bpp = self._row_bytes // max(eff_w, 1)
-            self.on_status(
-                self.camera_ip,
-                f"Строка видео: {self._row_bytes} байт ({bpp} байт/пикс), "
-                f"эффект. {eff_w}x{start.height} (старт {start.width}x{start.height}), {how}",
-            )
-        self._commit_full_row(row_number, data)
-
-    @staticmethod
-    def _effective_width(start_width: int, row_bytes: int) -> int:
-        """Ширина пикселей по длине строки (старт может врать: 960 при данных 640)."""
-        for w in (int(start_width), FRAME_WIDTH, OVERLAY_FRAME_WIDTH, RAW_FRAME_WIDTH):
-            if w > 0 and row_bytes % w == 0:
-                bpp = row_bytes // w
-                if bpp in (2, 3, 4):
-                    return w
-        return int(start_width)
-
-    def _add_row_fast(self, row_number: int, row_data: memoryview) -> None:
-        start = self._start
-        if start is None:
-            return
-        row_number, _ = self._map_row_number(row_number, start.height)
-        if row_number >= start.height:
-            self._invalid_packets += 1
-            return
-
-        self._row_packets += 1
-        if self._row_packets in (100, 500, 1000) and not self._logged_row_layout:
-            self.on_status(
-                self.camera_ip,
-                f"Видеопакетов {self._row_packets}, строк собрано "
-                f"{self._received_count}/{start.height}, "
-                f"incomplete={self._incomplete_frames}",
-            )
-
-        # Сначала смотрим фактическую длину (камера в fmt=3 может слать 1280).
-        matched_one = self._match_row_size(start.width, len(row_data))
-        if self._row_bytes <= 0:
-            if matched_one > 0:
-                self._row_bytes = matched_one
-            else:
-                self._row_bytes = getattr(self, "_row_bytes_hint", 0) or row_bytes_hint(
-                    start.width, start.video_format, self._expected_format
-                )
-        elif matched_one > 0 and matched_one != self._row_bytes and not self._logged_row_layout:
-            # Первые строки уточняют bpp/ширину полезных данных.
-            self._row_bytes = matched_one
-
-        expected = self._row_bytes
-
-        # Одна датаграмма = целая строка (типично mono 1280).
-        if len(row_data) >= expected:
-            self._finish_row_bytes(row_number, row_data, "целиком")
-            return
-
-        # Фрагменты одной строки (RGB 960×3=2880 > MTU).
-        frag = self._row_frags.get(row_number)
-        if frag is None:
-            frag = bytearray()
-            self._row_frags[row_number] = frag
-        frag.extend(row_data)
-
-        matched = self._match_row_size(start.width, len(frag))
-        if matched > 0 and (matched == expected or not self._logged_row_layout):
-            if matched != expected:
-                self._row_bytes = matched
-                expected = matched
-            full = memoryview(frag)[:expected]
-            del self._row_frags[row_number]
-            self._finish_row_bytes(row_number, full, "из фрагментов")
-            return
-
-        if len(frag) >= expected:
-            full = memoryview(frag)[:expected]
-            del self._row_frags[row_number]
-            self._finish_row_bytes(row_number, full, "из фрагментов")
-            return
-
-        if len(frag) > max(self._row_size_candidates(start.width)) + 64:
-            del self._row_frags[row_number]
-            self._invalid_packets += 1
-            if not self._logged_row_layout:
-                self._logged_row_layout = True
-                self.on_status(
-                    self.camera_ip,
-                    f"Строка видео: не удалось собрать "
-                    f"(накоплено {len(frag)} байт, ширина {start.width}, "
-                    f"кусок {len(row_data)} байт)",
-                )
-
     def _return_buffer(self, buf: bytearray) -> None:
         try:
             self._buffer_pool.put_nowait(buf)
@@ -757,6 +831,7 @@ class FrameAssembler:
             self._decode_thread.join(timeout=1.0)
 
     def _decode_loop(self) -> None:
+        _set_current_thread_priority_high()
         while not self._decode_stop.is_set():
             try:
                 item = self._decode_queue.get(timeout=0.25)
@@ -766,7 +841,7 @@ class FrameAssembler:
                 break
             start, raw_buffer, row_bytes = item
             try:
-                frame = self._decode(start, raw_buffer, row_bytes)
+                frame = self._decode(start, raw_buffer, row_bytes, light=False)
                 frame = crop_to_processed_size(frame)
                 self.on_frame(
                     self.camera_ip,
@@ -785,15 +860,21 @@ class FrameAssembler:
             finally:
                 self._return_buffer(raw_buffer)
 
-    @staticmethod
     def _decode(
+        self,
         start: StartFramePacket,
         raw_buffer: bytearray,
         row_bytes: int,
+        *,
+        light: bool = False,
     ) -> np.ndarray:
         height = start.height
-        width = FrameAssembler._effective_width(start.width, row_bytes)
-        bpp = int(row_bytes) // max(int(width), 1)
+        width = self._decode_width or FrameAssembler._effective_width(
+            start.width, row_bytes
+        )
+        bpp = self._decode_bpp or (int(row_bytes) // max(int(width), 1))
+        if height > FRAME_HEIGHT and width == FRAME_WIDTH and bpp == 2:
+            height = FRAME_HEIGHT
         if bpp == 3:
             count = height * width * 3
             rgb = np.frombuffer(raw_buffer, dtype=np.uint8, count=count).reshape(
@@ -808,7 +889,6 @@ class FrameAssembler:
             return np.ascontiguousarray(cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR))
         if bpp == 2:
             count = height * width
-            # RGB565 только если старт реально «цветной» и ширина совпала с overlay.
             if is_rgb_video_format(start.video_format) and width >= 800:
                 u16 = np.frombuffer(raw_buffer, dtype="<u2", count=count).reshape(
                     height, width
@@ -820,7 +900,7 @@ class FrameAssembler:
             mono16 = np.frombuffer(raw_buffer, dtype=">u2", count=count).reshape(
                 height, width
             )
-            return mono16_to_display8(mono16)
+            return self._agc.convert(mono16, light=light)
         raise ValueError(
             f"Неподдерживаемый bpp={bpp} (row_bytes={row_bytes}, width={width})"
         )
@@ -828,7 +908,9 @@ class FrameAssembler:
 
 
 # ========================= network.py =========================
+import os
 import socket
+import sys
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -837,9 +919,129 @@ from typing import Callable, Optional
 import numpy as np
 
 
-
 TELEMETRY_PORT = 53000
 CAMERA_CONTROL_PORT = 52000
+
+
+def _enable_windows_capture_performance() -> list[str]:
+    """Снижает троттлинг Windows на батарее (EcoQoS), чтобы UDP не сыпался.
+
+    На AC обычно и так ок; на батареи Win11 часто уводит процесс в EcoQoS →
+    неполные кадры, рассинхрон и лаги записи.
+    """
+    notes: list[str] = []
+    if sys.platform != "win32":
+        return notes
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return notes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.SetPriorityClass.restype = wintypes.BOOL
+    kernel32.SetProcessInformation.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    kernel32.SetProcessInformation.restype = wintypes.BOOL
+    kernel32.SetThreadExecutionState.argtypes = [wintypes.DWORD]
+    kernel32.SetThreadExecutionState.restype = wintypes.DWORD
+
+    ProcessPowerThrottling = 4
+    PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1
+    PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
+    PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION = 0x4
+    ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+    ES_CONTINUOUS = 0x80000000
+    ES_SYSTEM_REQUIRED = 0x00000001
+    ES_AWAYMODE_REQUIRED = 0x00000040
+
+    class PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
+        _fields_ = [
+            ("Version", wintypes.ULONG),
+            ("ControlMask", wintypes.ULONG),
+            ("StateMask", wintypes.ULONG),
+        ]
+
+    handle = kernel32.GetCurrentProcess()
+
+    def _set_throttle(control: int, state_mask: int) -> bool:
+        st = PROCESS_POWER_THROTTLING_STATE()
+        st.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION
+        st.ControlMask = control
+        st.StateMask = state_mask
+        return bool(
+            kernel32.SetProcessInformation(
+                handle,
+                ProcessPowerThrottling,
+                ctypes.byref(st),
+                ctypes.sizeof(st),
+            )
+        )
+
+    # Выключаем EcoQoS (отдельные вызовы — на части сборок Win один фланг даёт ERROR_INVALID_PARAMETER).
+    if _set_throttle(PROCESS_POWER_THROTTLING_EXECUTION_SPEED, 0):
+        notes.append("EcoQoS выключен")
+    else:
+        err = ctypes.get_last_error()
+        if err not in (0, 87):
+            notes.append(f"EcoQoS err={err}")
+
+    if _set_throttle(PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, 0):
+        notes.append("timer resolution allowed")
+
+    if kernel32.SetPriorityClass(handle, ABOVE_NORMAL_PRIORITY_CLASS):
+        notes.append("priority=ABOVE_NORMAL")
+    else:
+        notes.append(f"SetPriorityClass err={ctypes.get_last_error()}")
+
+    # Не усыплять систему, пока идёт приём/запись.
+    kernel32.SetThreadExecutionState(
+        ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED
+    )
+    notes.append("sleep inhibited")
+
+    try:
+        winmm = ctypes.WinDLL("winmm")
+        if winmm.timeBeginPeriod(1) == 0:
+            notes.append("timer 1ms")
+    except OSError:
+        pass
+    return notes
+
+
+def _set_current_thread_priority_high() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentThread.restype = wintypes.HANDLE
+        kernel32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+        kernel32.SetThreadPriority.restype = wintypes.BOOL
+        THREAD_PRIORITY_HIGHEST = 2
+        kernel32.SetThreadPriority(kernel32.GetCurrentThread(), THREAD_PRIORITY_HIGHEST)
+    except OSError:
+        pass
+
+
+def _restore_windows_execution_state() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ES_CONTINUOUS = 0x80000000
+        ctypes.WinDLL("kernel32").SetThreadExecutionState(ES_CONTINUOUS)
+    except OSError:
+        pass
 
 
 @dataclass(frozen=True)
@@ -947,15 +1149,29 @@ class PortReceiver:
         self._thread: Optional[threading.Thread] = None
         self._socket: Optional[socket.socket] = None
         self.actual_rcvbuf = 0
+        # Кэш единственного callback — без lock на каждый UDP-пакет.
+        self._cached_cb: Optional[Callable[[memoryview], None]] = None
+        self._cached_ip: Optional[str] = None
 
     def register(self, camera_ip: str, callback: Callable[[memoryview], None]) -> None:
         with self._lock:
             self._callbacks[camera_ip] = callback
+            self._refresh_cache_locked()
         self.start()
 
     def unregister(self, camera_ip: str) -> None:
         with self._lock:
             self._callbacks.pop(camera_ip, None)
+            self._refresh_cache_locked()
+
+    def _refresh_cache_locked(self) -> None:
+        if len(self._callbacks) == 1:
+            ip, cb = next(iter(self._callbacks.items()))
+            self._cached_ip = ip
+            self._cached_cb = cb
+        else:
+            self._cached_ip = None
+            self._cached_cb = None
 
     def is_empty(self) -> bool:
         with self._lock:
@@ -981,6 +1197,7 @@ class PortReceiver:
         self._thread = None
 
     def _run(self) -> None:
+        _set_current_thread_priority_high()
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._socket = sock
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -990,40 +1207,65 @@ class PortReceiver:
             pass
         self.actual_rcvbuf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
 
-        # Windows может генерировать WSAECONNRESET после ICMP Port Unreachable.
-        # Для постоянно работающего UDP-приемника это поведение нежелательно.
         if hasattr(socket, "SIO_UDP_CONNRESET"):
             try:
                 sock.ioctl(socket.SIO_UDP_CONNRESET, False)
             except OSError:
                 pass
 
-        sock.settimeout(0.25)
         try:
             sock.bind((self.bind_ip, self.port))
         except OSError as exc:
             self.on_error(f"Не удалось открыть видеопорт UDP {self.bind_ip}:{self.port}: {exc}")
             return
 
+        # Блокирующий recv: не крутим пустой цикл на timeout (экономия на батарее).
+        # Stop закрывает сокет → OSError → выход.
+        sock.setblocking(True)
         buffer = bytearray(self._DATAGRAM_BUFFER_SIZE)
         view = memoryview(buffer)
+
         while not self._stop.is_set():
             try:
                 size, source = sock.recvfrom_into(buffer)
-            except socket.timeout:
-                continue
             except OSError:
                 break
 
-            source_ip = source[0]
-            with self._lock:
-                callback = self._callbacks.get(source_ip)
-                if callback is None and self._callbacks:
-                    # Один/несколько потоков на порту: не теряем пакеты из‑за IP.
-                    callback = next(iter(self._callbacks.values()))
-            if callback is not None:
-                callback(view[:size])
-            # Без сессий — нормально (камера ещё шлёт после Stop); не спамим QMessageBox.
+            cached = self._cached_cb
+            if cached is not None:
+                cached(view[:size])
+            else:
+                source_ip = source[0]
+                with self._lock:
+                    callback = self._callbacks.get(source_ip)
+                    if callback is None and self._callbacks:
+                        callback = next(iter(self._callbacks.values()))
+                if callback is not None:
+                    callback(view[:size])
+
+            # Сливаем очередь сокета пачкой — меньше переключений контекста.
+            sock.setblocking(False)
+            try:
+                while not self._stop.is_set():
+                    try:
+                        size, source = sock.recvfrom_into(buffer)
+                    except (BlockingIOError, InterruptedError):
+                        break
+                    except OSError:
+                        return
+                    cached = self._cached_cb
+                    if cached is not None:
+                        cached(view[:size])
+                    else:
+                        source_ip = source[0]
+                        with self._lock:
+                            callback = self._callbacks.get(source_ip)
+                            if callback is None and self._callbacks:
+                                callback = next(iter(self._callbacks.values()))
+                        if callback is not None:
+                            callback(view[:size])
+            finally:
+                sock.setblocking(True)
 
 
 class CameraSession:
@@ -1518,6 +1760,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QRubberBand,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QStatusBar,
     QTableWidget,
@@ -1556,8 +1800,8 @@ class VideoLabel(QLabel):
             image_format = QImage.Format.Format_BGR888
         else:
             return
-        # Обрезка 648×520→640×512 даёт view без C-contiguous — QImage падает.
         frame = np.ascontiguousarray(frame)
+        # copy() обязателен: буфер кадра может быть перезаписан приёмником.
         self._image = QImage(
             frame.data, w, h, int(frame.strides[0]), image_format
         ).copy()
@@ -1826,18 +2070,23 @@ class MainWindow(QMainWindow):
         self._offline_timer.start(1000)
         self._display_timer = QTimer(self)
         self._display_timer.timeout.connect(self._refresh_latest_frames)
-        self._display_timer.start(33)
         self._record_timer = QTimer(self)
         self._record_timer.timeout.connect(self._record_latest_frames)
-        self._record_timer.start(10)
         self._track_timer = QTimer(self)
         self._track_timer.timeout.connect(self._process_live_track)
-        self._track_timer.start(50)
+        self.record_fps.valueChanged.connect(self._apply_fps_limit)
+        self._apply_fps_limit()
         self._start_discovery()
 
     def _build_ui(self) -> None:
         root = QWidget()
         layout = QVBoxLayout(root)
+        # Не сжимать содержимое ниже минимума — иначе скролл не появится.
+        layout.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinimumSize)
+        root.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Minimum,
+        )
 
         network_box = QGroupBox("Сеть")
         net = QGridLayout(network_box)
@@ -1941,10 +2190,13 @@ class MainWindow(QMainWindow):
         browse = QPushButton("Выбрать…")
         browse.clicked.connect(self._choose_output_dir)
         rec.addWidget(browse, 0, 2)
-        rec.addWidget(QLabel("FPS файла:"), 1, 0)
+        rec.addWidget(QLabel("FPS (запись / превью / трекинг):"), 1, 0)
         self.record_fps = QSpinBox()
         self.record_fps.setRange(1, 60)
         self.record_fps.setValue(25)
+        self.record_fps.setToolTip(
+            "Общий лимит кадров/с для записи MP4, обновления превью и трекинга."
+        )
         rec.addWidget(self.record_fps, 1, 1)
         self.record_btn = QPushButton("Начать запись MP4")
         self.record_btn.clicked.connect(self._toggle_recording)
@@ -2017,9 +2269,26 @@ class MainWindow(QMainWindow):
         track.addWidget(self.track_status, 5, 0, 1, 4)
         layout.addWidget(track_box)
 
-        self.setCentralWidget(root)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setWidget(root)
+        self.setCentralWidget(scroll)
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Ожидание телеметрии UDP 53000")
+
+    def _fps_interval_ms(self) -> int:
+        fps = max(int(self.record_fps.value()), 1)
+        return max(1, int(round(1000.0 / fps)))
+
+    def _apply_fps_limit(self) -> None:
+        """Превью, трекинг и опрос записи — с тем же FPS, что и запись."""
+        interval = self._fps_interval_ms()
+        self._display_timer.start(interval)
+        self._record_timer.start(interval)
+        self._track_timer.start(interval)
 
     @staticmethod
     def _local_ipv4_addresses() -> list[str]:
@@ -2190,6 +2459,7 @@ class MainWindow(QMainWindow):
         self.manager.set_stream_mode(StreamMode(mode_val))
 
         self._stop_streams()
+        notes = _enable_windows_capture_performance()
         self.latest_store.clear()
         self.active_slots = {ip: index for index, ip in enumerate(ordered)}
         self.displayed_sequence = {ip: 0 for ip in ordered}
@@ -2204,6 +2474,7 @@ class MainWindow(QMainWindow):
         _, _, _, label = STREAM_MODE_SPECS[StreamMode(mode_val)]
         self.statusBar().showMessage(
             f"Запрошено потоков: {len(ordered)} | {label}"
+            + (f" | {'; '.join(notes)}" if notes else "")
         )
 
     def _stop_streams(self) -> None:
@@ -2215,6 +2486,7 @@ class MainWindow(QMainWindow):
         self.active_slots.clear()
         self.displayed_sequence.clear()
         self.recorded_sequence.clear()
+        _restore_windows_execution_state()
         self.next_record_time.clear()
         self.latest_store.clear()
         self.left_video.clear_frame("Нет видеопотока")
@@ -2602,10 +2874,14 @@ def run() -> int:
         cv2.ocl.setUseOpenCL(False)
     except AttributeError:
         pass
+    # Сразу отключаем EcoQoS Windows — на батарее иначе сыпятся UDP-кадры.
+    _enable_windows_capture_performance()
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
-    return app.exec()
+    code = app.exec()
+    _restore_windows_execution_state()
+    return code
 
 
 if __name__ == "__main__":

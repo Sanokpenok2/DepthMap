@@ -139,7 +139,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--long-range",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
             "Режим дальних дистанций: жёсткий потолок num_disparities ~d(z-near). "
             "Автоматически включается при --z-far >= 800."
