@@ -68,7 +68,7 @@ class LiveTrackDepthController:
         wls: bool = False,
         clahe: bool = True,
         roi_inset: float = 0.32,
-        surface: str = "median",
+        surface: str = "far",
         long_range: bool | None = None,
         on_log: Callable[[str], None] | None = None,
     ) -> None:
@@ -515,6 +515,9 @@ class LiveTrackDepthController:
                     max_disparity=self.max_disp_cap,
                     min_disparity=self.min_disp_floor,
                     max_distance_mm=self.max_distance_mm,
+                    left_gray=rect_l,
+                    right_gray=rect_r,
+                    epipolar_ncc=True,
                 )
                 dist_s, disp_s = self.dist_smoother.update(dist, disp_val)
                 if disp_s is not None:

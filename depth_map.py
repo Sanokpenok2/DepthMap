@@ -519,6 +519,152 @@ class DisparityDebugInfo:
     n_valid: int
     n_used: int
     surface: str
+    refine: str = ""  # "", "cluster-far", "epipolar-ncc", ...
+
+
+def _pick_disparity_surface(valid: np.ndarray, surface: str) -> tuple[float, str]:
+    """Выбор диспаритета; при бимодальности (машина далеко / забор близко) —
+    для far/median берём дальний (меньший d) кластер."""
+    valid = np.asarray(valid, dtype=np.float32).reshape(-1)
+    if valid.size == 0:
+        return 0.0, surface
+    if valid.size < 12:
+        if surface == "far":
+            return float(np.percentile(valid, 40)), surface
+        if surface == "near":
+            return float(np.percentile(valid, 60)), surface
+        return float(np.median(valid)), surface
+
+    med = float(np.median(valid))
+    spread = float(valid.max()) - float(valid.min())
+    multimodal = spread > max(1.5, 0.25 * max(med, 1.0))
+
+    if not multimodal:
+        if surface == "far":
+            return float(np.percentile(valid, 40)), surface
+        if surface == "near":
+            return float(np.percentile(valid, 60)), surface
+        return med, surface
+
+    n_bins = int(np.clip(valid.size // 3, 16, 64))
+    hist, edges = np.histogram(valid, bins=n_bins)
+    hist = hist.astype(np.float32)
+    if hist.size >= 3:
+        hist = np.convolve(hist, np.array([1.0, 2.0, 1.0], np.float32) / 4.0, mode="same")
+    peaks: list[tuple[float, float]] = []
+    for i in range(1, len(hist) - 1):
+        if hist[i] >= hist[i - 1] and hist[i] >= hist[i + 1] and hist[i] > 0:
+            peaks.append((float(hist[i]), float(0.5 * (edges[i] + edges[i + 1]))))
+    if len(peaks) < 2:
+        if surface == "near":
+            return float(np.percentile(valid, 70)), surface
+        # Бимодальный разброс без явных пиков — смещаемся к дальнему плану.
+        return float(np.percentile(valid, 30 if surface == "far" else 35)), (
+            "cluster-far" if surface != "near" else surface
+        )
+
+    peaks.sort(key=lambda t: -t[0])
+    top2 = peaks[:2]
+    centers = sorted(c for _, c in top2)
+    far_c, near_c = float(centers[0]), float(centers[-1])
+    if near_c - far_c < max(1.5, 0.12 * near_c):
+        if surface == "far":
+            return float(np.percentile(valid, 40)), surface
+        if surface == "near":
+            return float(np.percentile(valid, 60)), surface
+        return med, surface
+
+    dist_far = np.abs(valid - far_c)
+    dist_near = np.abs(valid - near_c)
+    far_samples = valid[dist_far <= dist_near]
+    near_samples = valid[dist_near < dist_far]
+    min_keep = max(3, int(0.12 * valid.size))
+
+    if surface == "near":
+        pool = near_samples if near_samples.size >= min_keep else valid
+        return float(np.median(pool)), "cluster-near"
+
+    # far и median: при двух кластерах предпочитаем дальний (анти-забор).
+    if far_samples.size >= min_keep:
+        if surface == "far":
+            return float(np.percentile(far_samples, 40)), "cluster-far"
+        return float(np.median(far_samples)), "cluster-far"
+    # Дальний кластер слишком мал — осторожный перцентиль по всем.
+    return float(np.percentile(valid, 30)), "cluster-far-weak"
+
+
+def epipolar_ncc_disparity(
+    left_gray: np.ndarray,
+    right_gray: np.ndarray,
+    cx: int,
+    cy: int,
+    *,
+    d_min: float,
+    d_max: float,
+    templ_w: int = 25,
+    templ_h: int = 17,
+    dy_search: int = 2,
+) -> tuple[float | None, float]:
+    """Диспаритет по NCC вдоль эпиполяра (и ±dy при небольшой ошибке ректификации).
+
+    Возвращает (disparity, score). Нужен, когда SGBM цепляется за повторяющийся
+    забор/текстуру вместо объекта в ROI.
+    """
+    if left_gray.ndim == 3:
+        left_gray = cv2.cvtColor(left_gray, cv2.COLOR_BGR2GRAY)
+    if right_gray.ndim == 3:
+        right_gray = cv2.cvtColor(right_gray, cv2.COLOR_BGR2GRAY)
+    lh, lw = left_gray.shape[:2]
+    rh, rw = right_gray.shape[:2]
+    tw = max(9, int(templ_w) | 1)
+    th = max(9, int(templ_h) | 1)
+    hx, hy = tw // 2, th // 2
+    if not (hx < cx < lw - hx and hy < cy < lh - hy):
+        return None, -1.0
+
+    templ = left_gray[cy - hy : cy + hy + 1, cx - hx : cx + hx + 1]
+    if templ.shape[0] != th or templ.shape[1] != tw:
+        return None, -1.0
+    if float(np.std(templ)) < 3.0:
+        return None, -1.0
+
+    d0 = int(np.floor(max(0.0, float(d_min))))
+    d1 = int(np.ceil(max(float(d_max), d0 + 1)))
+    best_score = -1.0
+    best_d: float | None = None
+
+    for dy in range(-int(dy_search), int(dy_search) + 1):
+        y = cy + dy
+        if y - hy < 0 or y + hy >= rh:
+            continue
+        # Полоса справа: возможные центры шаблона x = cx - d, d∈[d0,d1]
+        x_right_min = cx - d1
+        x_right_max = cx - d0
+        x0 = x_right_min - hx
+        x1 = x_right_max + hx + 1
+        if x1 - x0 < tw or y - hy < 0:
+            continue
+        x0c = max(0, x0)
+        x1c = min(rw, x1)
+        if x1c - x0c < tw:
+            continue
+        strip = right_gray[y - hy : y + hy + 1, x0c:x1c]
+        if strip.shape[0] != th or strip.shape[1] < tw:
+            continue
+        res = cv2.matchTemplate(strip, templ, cv2.TM_CCOEFF_NORMED)
+        if res.size == 0:
+            continue
+        _min_v, max_v, _min_l, max_l = cv2.minMaxLoc(res)
+        # max_l[0] — смещение в strip; центр шаблона на правом кадре:
+        rx = x0c + int(max_l[0]) + hx
+        disp = float(cx - rx)
+        if disp < d0 - 0.5 or disp > d1 + 0.5:
+            continue
+        if float(max_v) > best_score:
+            best_score = float(max_v)
+            best_d = disp
+
+    return best_d, best_score
 
 
 def measure_roi_distance(
@@ -537,6 +683,10 @@ def measure_roi_distance(
     min_disparity: float = 0.4,
     max_distance_mm: float | None = None,
     collect_debug: bool = False,
+    left_gray: np.ndarray | None = None,
+    right_gray: np.ndarray | None = None,
+    epipolar_ncc: bool = True,
+    ncc_min_score: float = 0.28,
 ) -> (
     tuple[float | None, float | None]
     | tuple[float | None, float | None, DisparityDebugInfo | None]
@@ -544,12 +694,14 @@ def measure_roi_distance(
     """Расстояние по диспаритету внутри ROI (x, y, w, h).
 
     surface:
-      - \"far\"  — слегка смещён к дальнему плану (не экстремальный перцентиль)
+      - \"far\"  — дальняя поверхность / дальний кластер при бимодальности
       - \"near\" — ближняя (больший диспаритет)
-      - \"median\" — обычная медиана (стабильнее на шумном дальнем стерео)
+      - \"median\" — медиана; при двух пиках (забор/машина) тоже предпочитает дальний
 
     max_disparity: отбросить пиксели с d больше порога (ближе z_near).
     max_distance_mm: отбросить/ограничить Z больше ожидаемого z_far.
+    left_gray/right_gray + epipolar_ncc: уточнение NCC вдоль эпиполяра
+    (защита от ложных матчей SGBM на повторяющейся текстуре).
     collect_debug: если True, третьим элементом вернуть DisparityDebugInfo.
     """
     if prefer_near_surface:
@@ -600,42 +752,80 @@ def measure_roi_distance(
     valid = patch[finite]
     n_patch = int(patch.size)
     n_valid = int(valid.size)
+    refine_tag = ""
     if valid.size < max(1, int(patch.size * min_valid_fraction)):
-        dbg = None
-        if collect_debug:
-            dbg = DisparityDebugInfo(
-                inset_roi=inset_roi,
-                used_ys=np.zeros(0, np.int32),
-                used_xs=np.zeros(0, np.int32),
-                used_disp=np.zeros(0, np.float32),
-                selected_disp=None,
-                n_patch=n_patch,
-                n_valid=n_valid,
-                n_used=0,
-                surface=surface,
-            )
-        return _pack(None, None, dbg)
-
-    keep_mask = finite.copy()
-    if robust and valid.size >= 8:
-        q1, q3 = np.percentile(valid, [25, 75])
-        iqr = float(q3 - q1)
-        if iqr > 1e-6:
-            lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-            in_iqr = finite & (patch >= lo) & (patch <= hi)
-            if int(in_iqr.sum()) >= max(3, int(0.25 * valid.size)):
-                keep_mask = in_iqr
-                valid = patch[keep_mask]
-
-    spread = float(valid.max()) - float(valid.min())
-    multimodal = valid.size >= 12 and spread > max(0.8, 0.25 * float(np.median(valid)))
-
-    if surface == "far":
-        disp = float(np.percentile(valid, 35 if multimodal else 40))
-    elif surface == "near":
-        disp = float(np.percentile(valid, 70 if multimodal else 60))
+        # Мало валидного SGBM — всё равно пробуем NCC по центру ROI.
+        disp = None
+        keep_mask = finite
     else:
-        disp = float(np.median(valid))
+        keep_mask = finite.copy()
+        if robust and valid.size >= 8:
+            q1, q3 = np.percentile(valid, [25, 75])
+            iqr = float(q3 - q1)
+            if iqr > 1e-6:
+                lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+                # Для far/median сильнее режем «слишком близкие» выбросы (забор).
+                if surface in ("far", "median"):
+                    hi = min(hi, float(np.percentile(valid, 75)))
+                in_iqr = finite & (patch >= lo) & (patch <= hi)
+                if int(in_iqr.sum()) >= max(3, int(0.20 * valid.size)):
+                    keep_mask = in_iqr
+                    valid = patch[keep_mask]
+
+        disp, refine_tag = _pick_disparity_surface(valid, surface)
+
+    cx = (x0 + x1) // 2
+    cy = (y0 + y1) // 2
+
+    # NCC вдоль эпиполяра: часто находит машину, когда SGBM залип на заборе.
+    ncc_disp = None
+    ncc_score = -1.0
+    if (
+        epipolar_ncc
+        and left_gray is not None
+        and right_gray is not None
+        and surface != "near"
+    ):
+        d_lo = float(min_disparity) if min_disparity > 0 else 0.5
+        d_hi = float(max_disparity) if max_disparity is not None and max_disparity > 0 else float(
+            max(w // 3, 32)
+        )
+        if disp is not None:
+            # Ищем и около SGBM, и по всему допустимому диапазону — берём лучший score.
+            ncc_a, s_a = epipolar_ncc_disparity(
+                left_gray, right_gray, cx, cy, d_min=d_lo, d_max=d_hi
+            )
+            pad = max(4.0, 0.25 * float(disp))
+            ncc_b, s_b = epipolar_ncc_disparity(
+                left_gray,
+                right_gray,
+                cx,
+                cy,
+                d_min=max(d_lo, float(disp) - pad),
+                d_max=min(d_hi, float(disp) + pad),
+            )
+            if s_a >= s_b:
+                ncc_disp, ncc_score = ncc_a, s_a
+            else:
+                ncc_disp, ncc_score = ncc_b, s_b
+        else:
+            ncc_disp, ncc_score = epipolar_ncc_disparity(
+                left_gray, right_gray, cx, cy, d_min=d_lo, d_max=d_hi
+            )
+
+        if ncc_disp is not None and ncc_score >= float(ncc_min_score):
+            use_ncc = disp is None
+            if disp is not None:
+                # NCC заметно «дальше» (меньше d) при хорошем score — типичный анти-забор.
+                if ncc_disp + 3.0 < float(disp) and ncc_score >= float(ncc_min_score):
+                    use_ncc = True
+                elif abs(ncc_disp - float(disp)) <= 3.0 and ncc_score >= 0.45:
+                    use_ncc = True
+                elif ncc_score >= 0.55 and ncc_disp < float(disp):
+                    use_ncc = True
+            if use_ncc:
+                disp = float(ncc_disp)
+                refine_tag = f"epipolar-ncc:{ncc_score:.2f}"
 
     used_ys_l, used_xs_l = np.where(keep_mask)
     used_disp = patch[keep_mask].astype(np.float32)
@@ -648,18 +838,16 @@ def measure_roi_distance(
             used_ys=used_ys,
             used_xs=used_xs,
             used_disp=used_disp,
-            selected_disp=disp,
+            selected_disp=float(disp) if disp is not None else None,
             n_patch=n_patch,
             n_valid=n_valid,
             n_used=int(used_disp.size),
             surface=surface,
+            refine=refine_tag,
         )
 
-    if disp < float(min_disparity):
+    if disp is None or disp < float(min_disparity):
         return _pack(None, disp, dbg)
-
-    cx = (x0 + x1) // 2
-    cy = (y0 + y1) // 2
 
     if Q is not None:
         vec = np.array([[cx], [cy], [disp], [1.0]], dtype=np.float64)
@@ -792,6 +980,7 @@ def draw_disparity_debug(
         f"surface={debug.surface}  selected={debug.selected_disp:.2f}px"
         if debug.selected_disp is not None
         else f"surface={debug.surface}  selected=n/a",
+        f"refine={debug.refine}" if debug.refine else "refine=sgbm-roi",
         "L|R same top edge; gray lines=epipolar rows (R higher => calib/rectify dy)",
     ]
     for i, text in enumerate(lines):

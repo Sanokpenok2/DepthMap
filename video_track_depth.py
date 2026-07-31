@@ -332,10 +332,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--surface",
         choices=["far", "near", "median"],
-        default="median",
+        default="far",
         help=(
-            "Поверхность в ROI: median=стабильнее; far=чуть дальше "
-            "(осторожно: шум малого d завышает Z); near=ближе."
+            "Поверхность в ROI: far=дальний кластер (рекомендуется против ложных "
+            "матчей на заборе); median=медиана (при бимодальности тоже тянет к far); "
+            "near=ближе."
         ),
     )
     p.add_argument(
@@ -1220,6 +1221,8 @@ def _measure_and_smooth(
     max_distance_mm: float | None,
     dist_smoother: DistanceSmoother,
     collect_debug: bool = False,
+    left_gray: np.ndarray | None = None,
+    right_gray: np.ndarray | None = None,
 ) -> tuple[float | None, float | None, float | None, DisparityDebugInfo | None]:
     """ROI → сырая дистанция → сглаживание.
 
@@ -1228,28 +1231,30 @@ def _measure_and_smooth(
     if roi is None or disp_float is None:
         dist_s, disp_s = dist_smoother.update(None, None)
         return dist_s, disp_s, None, None
+    common = dict(
+        inset_fraction=args.roi_inset,
+        surface=args.surface,
+        max_disparity=max_disp_cap,
+        min_disparity=min_disp_floor,
+        max_distance_mm=max_distance_mm,
+        left_gray=left_gray,
+        right_gray=right_gray,
+        epipolar_ncc=True,
+    )
     if collect_debug:
         dist, disp_val, dbg = measure_roi_distance(
             disp_float,
             roi,
             Q=Q,
-            inset_fraction=args.roi_inset,
-            surface=args.surface,
-            max_disparity=max_disp_cap,
-            min_disparity=min_disp_floor,
-            max_distance_mm=max_distance_mm,
             collect_debug=True,
+            **common,
         )
     else:
         dist, disp_val = measure_roi_distance(
             disp_float,
             roi,
             Q=Q,
-            inset_fraction=args.roi_inset,
-            surface=args.surface,
-            max_disparity=max_disp_cap,
-            min_disparity=min_disp_floor,
-            max_distance_mm=max_distance_mm,
+            **common,
         )
         dbg = None
     dist_s, disp_s = dist_smoother.update(dist, disp_val)
@@ -1662,6 +1667,8 @@ def main() -> None:
                                 max_distance_mm=max_distance_mm,
                                 dist_smoother=dist_smoother,
                                 collect_debug=debug_disparity,
+                                left_gray=rect_l,
+                                right_gray=rect_r,
                             )
                             if auto_disp and (
                                 sgbm_future is None or sgbm_future.done()
