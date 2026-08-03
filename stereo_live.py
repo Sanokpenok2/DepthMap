@@ -87,7 +87,7 @@ class LiveTrackDepthController:
         self.clahe = bool(clahe)
         self.roi_inset = float(roi_inset)
         self.surface = str(surface)
-        # None = авто по z_far. Явный True при z_far<800 больше не форсирует long-range.
+        # None / не задано → long-range выключен (только явный флаг).
         self._long_range_pref = long_range
         self.long_range = self._resolve_long_range(long_range)
         self.max_disp_cap: float | None = None
@@ -149,11 +149,10 @@ class LiveTrackDepthController:
 
     @staticmethod
     def _resolve_long_range_flag(z_far_m: float, long_range: bool | None) -> bool:
-        """long-range только для дальних сцен (z_far>=800); иначе обычный SGBM."""
-        if z_far_m < 800.0:
-            return False
+        """long-range только по явному флагу (z_far сам по себе не включает)."""
+        _ = z_far_m
         if long_range is None:
-            return True
+            return False
         return bool(long_range)
 
     def _resolve_long_range(self, long_range: bool | None) -> bool:

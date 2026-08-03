@@ -142,7 +142,7 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help=(
             "Режим дальних дистанций: жёсткий потолок num_disparities ~d(z-near). "
-            "Автоматически включается при --z-far >= 800."
+            "Включается только явно этим флагом."
         ),
     )
     p.add_argument("--wls", action="store_true", help="WLS-фильтр (медленнее).")
@@ -650,12 +650,12 @@ def adapt_disparity_range(
 ) -> tuple[int, int, str | None]:
     """Расширяет диапазон, если объект приблизился или диспаритет упёрся в потолок.
 
-    В long-range (z_far>=800) НЕ сужаем сцену по «ложному» ближнему Z —
+    В long-range НЕ сужаем сцену по «ложному» ближнему Z —
     иначе SGBM начинает искать большие d и дистанция падает до десятков метров.
     """
     width = max(int(image_width), 32)
     if long_range is None:
-        long_range = z_far_m >= 800.0
+        long_range = False
 
     upper = float(cur_min + cur_num)
     saturating = (
@@ -1223,6 +1223,7 @@ def _measure_and_smooth(
     collect_debug: bool = False,
     left_gray: np.ndarray | None = None,
     right_gray: np.ndarray | None = None,
+    epipolar_ncc: bool = True,
 ) -> tuple[float | None, float | None, float | None, DisparityDebugInfo | None]:
     """ROI → сырая дистанция → сглаживание.
 
@@ -1239,7 +1240,7 @@ def _measure_and_smooth(
         max_distance_mm=max_distance_mm,
         left_gray=left_gray,
         right_gray=right_gray,
-        epipolar_ncc=True,
+        epipolar_ncc=bool(epipolar_ncc),
     )
     if collect_debug:
         dist, disp_val, dbg = measure_roi_distance(
@@ -1326,7 +1327,7 @@ def main() -> None:
         sys.exit("Ошибка: --max-fps должен быть >= 0 (0 = без ограничения).")
     if not (0.0 <= args.roi_inset < 0.45):
         sys.exit("Ошибка: --roi-inset должен быть в диапазоне [0.0, 0.45).")
-    long_range = bool(args.long_range) or args.z_far >= 800.0
+    long_range = bool(args.long_range)
     if long_range and args.z_near < 80:
         print(
             "Предупреждение: для 1000+ м лучше --z-near 150..300 "
@@ -1584,6 +1585,9 @@ def main() -> None:
     frame_idx = 0
     t_prev = time.perf_counter()
     fps = 0.0
+    # NCC по эпиполяру — только на новом disp / сдвиге ROI (не каждый кадр).
+    last_ncc_disp_id: int | None = None
+    last_ncc_roi_cxy: tuple[int, int] | None = None
 
     print("R — выбрать объект рамкой, C — кликом (авто-границы). В любой момент.")
     print("X — отменить трекинг (во время трека и при потере цели).")
@@ -1657,6 +1661,22 @@ def main() -> None:
                             if sgbm_future is not None and sgbm_future.done():
                                 disp_float = sgbm_future.result()
                                 sgbm_future = None
+                            rx, ry, rw, rh = (int(v) for v in roi)
+                            roi_cxy = (rx + rw // 2, ry + rh // 2)
+                            disp_id = id(disp_float)
+                            roi_moved = (
+                                last_ncc_roi_cxy is None
+                                or abs(roi_cxy[0] - last_ncc_roi_cxy[0]) >= 10
+                                or abs(roi_cxy[1] - last_ncc_roi_cxy[1]) >= 8
+                            )
+                            run_ncc = (
+                                debug_disparity
+                                or disp_id != last_ncc_disp_id
+                                or roi_moved
+                            )
+                            if run_ncc:
+                                last_ncc_disp_id = disp_id
+                                last_ncc_roi_cxy = roi_cxy
                             dist_s, disp_val, dist, disp_debug = _measure_and_smooth(
                                 disp_float=disp_float,
                                 roi=roi,
@@ -1669,6 +1689,7 @@ def main() -> None:
                                 collect_debug=debug_disparity,
                                 left_gray=rect_l,
                                 right_gray=rect_r,
+                                epipolar_ncc=run_ncc,
                             )
                             if auto_disp and (
                                 sgbm_future is None or sgbm_future.done()

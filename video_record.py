@@ -2245,8 +2245,8 @@ class MainWindow(QMainWindow):
 
         self.long_range_cb = QCheckBox("Long-range")
         self.long_range_cb.setToolTip(
-            "Параметры SGBM для дальних сцен. Имеет смысл при z-far ≥ 800 м "
-            "(при меньшем z-far режим принудительно выключен)."
+            "Параметры SGBM для дальних сцен. Включается только этой галочкой "
+            "(z-far сам по себе long-range не включает)."
         )
         track.addWidget(self.long_range_cb, 3, 0, 1, 2)
         self.scene_apply_btn = QPushButton("Применить диапазон")

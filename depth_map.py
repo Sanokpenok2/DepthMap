@@ -593,28 +593,108 @@ def _pick_disparity_surface(valid: np.ndarray, surface: str) -> tuple[float, str
     return float(np.percentile(valid, 30)), "cluster-far-weak"
 
 
-def _match_image_pair(
-    left_gray: np.ndarray, right_gray: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """Интенсивность или |grad|, если в ROI почти нет текстуры (типично для ТПВ)."""
-    L = left_gray
-    R = right_gray
-    if L.dtype != np.uint8:
-        L = np.clip(L, 0, 255).astype(np.uint8)
-    if R.dtype != np.uint8:
-        R = np.clip(R, 0, 255).astype(np.uint8)
-    return L, R
+def _as_gray_u8(img: np.ndarray) -> np.ndarray:
+    if img.ndim == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if img.dtype != np.uint8:
+        return np.clip(img, 0, 255).astype(np.uint8)
+    return img
 
 
-def _to_grad8(gray: np.ndarray) -> np.ndarray:
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    mag = cv2.magnitude(gx, gy)
-    # Нормализация по кадру — стабильный NCC на слабом тепловом контрасте.
-    p1, p99 = np.percentile(mag, [1.0, 99.0])
-    if p99 <= p1 + 1e-3:
-        return np.zeros_like(gray, dtype=np.uint8)
-    out = np.clip((mag - p1) * (255.0 / (p99 - p1)), 0, 255).astype(np.uint8)
+def _grad8_band(gray: np.ndarray, y0: int, y1: int) -> tuple[np.ndarray, int]:
+    """|∇| только на горизонтальной полосе — без percentile по всему кадру."""
+    h = gray.shape[0]
+    y0 = max(0, int(y0))
+    y1 = min(h, int(y1))
+    if y1 <= y0:
+        return np.zeros((0, gray.shape[1]), np.uint8), y0
+    band = gray[y0:y1]
+    gx = cv2.Sobel(band, cv2.CV_16S, 1, 0, ksize=3)
+    gy = cv2.Sobel(band, cv2.CV_16S, 0, 1, ksize=3)
+    mag = cv2.convertScaleAbs(gx) + cv2.convertScaleAbs(gy)
+    # Быстрая нормализация без np.percentile.
+    _mn, mx, _, _ = cv2.minMaxLoc(mag)
+    if mx < 1.0:
+        return np.zeros_like(mag, dtype=np.uint8), y0
+    if mx > 255.0:
+        mag = cv2.convertScaleAbs(mag, alpha=255.0 / mx)
+    return mag, y0
+
+
+def _ncc_peaks_on_pair(
+    Limg: np.ndarray,
+    Rimg: np.ndarray,
+    cx: int,
+    cy: int,
+    *,
+    hx: int,
+    hy: int,
+    tw: int,
+    th: int,
+    d0: int,
+    d1: int,
+    dy_search: int,
+    ly0: int = 0,
+    ry0: int = 0,
+) -> list[tuple[float, float, float]]:
+    """Пики NCC на одной паре изображений. Возвращает (score, uniq, disp)."""
+    lh, lw = Limg.shape[:2]
+    rh, rw = Rimg.shape[:2]
+    # cy/cx в координатах полного кадра; ly0/ry0 — смещение полосы, если Limg — band.
+    ly = cy - ly0
+    if not (hx < cx < lw - hx and hy < ly < lh - hy):
+        return []
+    templ = Limg[ly - hy : ly + hy + 1, cx - hx : cx + hx + 1]
+    if templ.shape[0] != th or templ.shape[1] != tw:
+        return []
+    if float(cv2.meanStdDev(templ)[1][0, 0]) < 2.0:
+        return []
+
+    out: list[tuple[float, float, float]] = []
+    for dy in range(-int(dy_search), int(dy_search) + 1):
+        y_full = cy + dy
+        ry = y_full - ry0
+        if ry - hy < 0 or ry + hy >= rh:
+            continue
+        x_right_min = cx - d1
+        x_right_max = cx - d0
+        x0 = x_right_min - hx
+        x1 = x_right_max + hx + 1
+        if x1 - x0 < tw:
+            continue
+        x0c = max(0, x0)
+        x1c = min(rw, x1)
+        if x1c - x0c < tw:
+            continue
+        strip = Rimg[ry - hy : ry + hy + 1, x0c:x1c]
+        if strip.shape[0] != th or strip.shape[1] < tw:
+            continue
+        res = cv2.matchTemplate(strip, templ, cv2.TM_CCOEFF_NORMED)
+        if res.size == 0:
+            continue
+        # minMaxLoc + маска вокруг пика для 2-го места (быстрее argpartition).
+        _mn, max_v, _ml, max_l = cv2.minMaxLoc(res)
+        best_s = float(max_v)
+        if best_s < 0.15:
+            continue
+        rx = x0c + int(max_l[0]) + hx
+        best_d = float(cx - rx)
+        if best_d < d0 - 0.5 or best_d > d1 + 0.5:
+            continue
+        res_masked = res.copy()
+        x_lo = max(0, int(max_l[0]) - 2)
+        x_hi = min(res.shape[1], int(max_l[0]) + 3)
+        res_masked[:, x_lo:x_hi] = -1.0
+        _mn2, max_v2, _, max_l2 = cv2.minMaxLoc(res_masked)
+        second = float(max_v2)
+        uniq = best_s - second if second >= 0 else best_s
+        out.append((best_s, uniq, best_d))
+        # Дальний конкурирующий пик (анти-забор).
+        if second >= best_s - 0.08:
+            rx2 = x0c + int(max_l2[0]) + hx
+            d2 = float(cx - rx2)
+            if d0 - 0.5 <= d2 <= d1 + 0.5 and d2 + 3.0 < best_d:
+                out.append((second, second - best_s, d2))
     return out
 
 
@@ -628,22 +708,20 @@ def epipolar_ncc_disparity(
     d_max: float,
     templ_w: int = 25,
     templ_h: int = 17,
-    dy_search: int = 2,
+    dy_search: int = 1,
     prefer_far: bool = True,
+    use_gradient: bool | None = None,
 ) -> tuple[float | None, float]:
     """Диспаритет по NCC вдоль эпиполяра (и ±dy при небольшой ошибке ректификации).
 
     Возвращает (disparity, score). Нужен, когда SGBM цепляется за повторяющийся
     забор/текстуру вместо объекта в ROI.
 
-    При нескольких пиках с близким score и prefer_far=True выбирается меньший
-    диспаритет (дальше) — типичный случай «машина vs забор».
+    Быстрый путь: сначала интенсивность на узкой полосе; |∇| — только если
+    текстуры мало или score слабый (ТПВ).
     """
-    if left_gray.ndim == 3:
-        left_gray = cv2.cvtColor(left_gray, cv2.COLOR_BGR2GRAY)
-    if right_gray.ndim == 3:
-        right_gray = cv2.cvtColor(right_gray, cv2.COLOR_BGR2GRAY)
-    left_gray, right_gray = _match_image_pair(left_gray, right_gray)
+    left_gray = _as_gray_u8(left_gray)
+    right_gray = _as_gray_u8(right_gray)
     lh, lw = left_gray.shape[:2]
     rh, rw = right_gray.shape[:2]
     tw = max(9, int(templ_w) | 1)
@@ -657,88 +735,64 @@ def epipolar_ncc_disparity(
     if d1 <= d0:
         return None, -1.0
 
-    # Кандидаты: интенсивность и градиент (тепловые пятна часто почти flat).
-    left_g = _to_grad8(left_gray)
-    right_g = _to_grad8(right_gray)
-    image_pairs = [(left_gray, right_gray), (left_g, right_g)]
+    dy_search = max(0, int(dy_search))
+    candidates = _ncc_peaks_on_pair(
+        left_gray,
+        right_gray,
+        cx,
+        cy,
+        hx=hx,
+        hy=hy,
+        tw=tw,
+        th=th,
+        d0=d0,
+        d1=d1,
+        dy_search=dy_search,
+    )
 
-    candidates: list[tuple[float, float, float]] = []  # (score, uniqueness, disp)
-
-    for Limg, Rimg in image_pairs:
-        templ = Limg[cy - hy : cy + hy + 1, cx - hx : cx + hx + 1]
-        if templ.shape[0] != th or templ.shape[1] != tw:
-            continue
-        if float(np.std(templ.astype(np.float32))) < 2.0:
-            continue
-
-        for dy in range(-int(dy_search), int(dy_search) + 1):
-            y = cy + dy
-            if y - hy < 0 or y + hy >= rh:
-                continue
-            # Полоса справа: возможные центры шаблона x = cx - d, d∈[d0,d1]
-            x_right_min = cx - d1
-            x_right_max = cx - d0
-            x0 = x_right_min - hx
-            x1 = x_right_max + hx + 1
-            if x1 - x0 < tw:
-                continue
-            x0c = max(0, x0)
-            x1c = min(rw, x1)
-            if x1c - x0c < tw:
-                continue
-            strip = Rimg[y - hy : y + hy + 1, x0c:x1c]
-            if strip.shape[0] != th or strip.shape[1] < tw:
-                continue
-            res = cv2.matchTemplate(strip, templ, cv2.TM_CCOEFF_NORMED)
-            if res.size == 0:
-                continue
-            # Несколько локальных пиков — для анти-забора важна уникальность.
-            res_f = res.astype(np.float32).reshape(-1)
-            # top-k по всей полосе
-            k = min(8, int(res_f.size))
-            if k < 1:
-                continue
-            flat_idx = np.argpartition(res_f, -k)[-k:]
-            flat_idx = flat_idx[np.argsort(res_f[flat_idx])[::-1]]
-            peaks: list[tuple[float, float]] = []
-            cols = int(res.shape[1])
-            for fi in flat_idx:
-                score = float(res_f[fi])
-                if score < 0.15:
-                    break
-                px = int(fi) % cols
-                rx = x0c + px + hx
-                disp = float(cx - rx)
-                if disp < d0 - 0.5 or disp > d1 + 0.5:
-                    continue
-                # Подавляем соседей ±2 px уже выбранных пиков.
-                if any(abs(disp - pd) < 2.0 for _, pd in peaks):
-                    continue
-                peaks.append((score, disp))
-                if len(peaks) >= 4:
-                    break
-            if not peaks:
-                continue
-            best_s, best_d = peaks[0]
-            second = peaks[1][0] if len(peaks) > 1 else -1.0
-            uniq = best_s - second if second >= 0 else best_s
-            candidates.append((best_s, uniq, best_d))
-            # Если второй пик тоже сильный и заметно дальше — держим оба.
-            for s2, d2 in peaks[1:]:
-                if s2 >= best_s - 0.08 and d2 + 3.0 < best_d:
-                    candidates.append((s2, s2 - best_s, d2))
+    templ_std = float(
+        cv2.meanStdDev(
+            left_gray[cy - hy : cy + hy + 1, cx - hx : cx + hx + 1]
+        )[1][0, 0]
+    )
+    best_intensity = max((c[0] for c in candidates), default=-1.0)
+    need_grad = use_gradient is True or (
+        use_gradient is None
+        and (templ_std < 6.0 or best_intensity < 0.40 or not candidates)
+    )
+    if need_grad:
+        y0 = max(0, cy - hy - dy_search)
+        y1 = min(lh, cy + hy + dy_search + 1)
+        Lg, ly0 = _grad8_band(left_gray, y0, y1)
+        Rg, ry0 = _grad8_band(right_gray, y0, min(rh, y1))
+        if Lg.size and Rg.size:
+            candidates.extend(
+                _ncc_peaks_on_pair(
+                    Lg,
+                    Rg,
+                    cx,
+                    cy,
+                    hx=hx,
+                    hy=hy,
+                    tw=tw,
+                    th=th,
+                    d0=d0,
+                    d1=d1,
+                    dy_search=dy_search,
+                    ly0=ly0,
+                    ry0=ry0,
+                )
+            )
 
     if not candidates:
         return None, -1.0
 
-    # Сначала по score, при близких score — меньший диспаритет (дальше).
     def _rank(c: tuple[float, float, float]) -> tuple:
         score, uniq, disp = c
         far_bonus = -disp if prefer_far else 0.0
         return (score + 0.15 * uniq + 0.002 * far_bonus, -disp if prefer_far else disp)
 
     best = max(candidates, key=_rank)
-    # Если есть почти такой же score, но заметно меньший d — берём дальний.
     if prefer_far:
         top_score = best[0]
         farther = [
@@ -748,7 +802,6 @@ def epipolar_ncc_disparity(
         ]
         if farther:
             best = min(farther, key=lambda c: c[2])
-            # сохраняем score дальнего пика
             return float(best[2]), float(best[0])
 
     return float(best[2]), float(best[0])
@@ -865,6 +918,7 @@ def measure_roi_distance(
     cy = (y0 + y1) // 2
 
     # NCC вдоль эпиполяра: часто находит машину, когда SGBM залип на заборе.
+    # Дорогой путь включаем только при подозрении на ложный ближний матч.
     ncc_disp = None
     ncc_score = -1.0
     if (
@@ -873,75 +927,101 @@ def measure_roi_distance(
         and right_gray is not None
         and surface != "near"
     ):
-        d_lo = float(min_disparity) if min_disparity > 0 else 0.5
-        d_hi = float(max_disparity) if max_disparity is not None and max_disparity > 0 else float(
-            max(w // 3, 32)
+        spread = 0.0
+        if valid.size >= 8:
+            spread = float(np.percentile(valid, 90) - np.percentile(valid, 10))
+        suspicious = (
+            disp is None
+            or "cluster" in (refine_tag or "")
+            or (
+                disp is not None
+                and (
+                    float(disp) > max(14.0, 0.10 * w)
+                    or spread > max(4.0, 0.20 * float(disp))
+                )
+            )
         )
-        bw = max(1, x1 - x0)
-        bh = max(1, y1 - y0)
-        # Сначала центр; доп. точки — только если SGBM «подозрительно близко» или пуст.
-        sample_pts = [(cx, cy)]
-        need_extra = disp is None or (
-            disp is not None and float(disp) > max(12.0, 0.08 * w)
-        )
-        if need_extra:
-            sample_pts.extend(
-                [
+        if suspicious:
+            d_lo = float(min_disparity) if min_disparity > 0 else 0.5
+            d_hi = (
+                float(max_disparity)
+                if max_disparity is not None and max_disparity > 0
+                else float(max(w // 3, 32))
+            )
+            left_u8 = _as_gray_u8(left_gray)
+            right_u8 = _as_gray_u8(right_gray)
+            bw = max(1, x1 - x0)
+
+            def _vote(px: int, py: int) -> tuple[float, float] | None:
+                di, si = epipolar_ncc_disparity(
+                    left_u8,
+                    right_u8,
+                    int(px),
+                    int(py),
+                    d_min=d_lo,
+                    d_max=d_hi,
+                    prefer_far=True,
+                    dy_search=1,
+                )
+                if di is not None and si >= float(ncc_min_score):
+                    return float(di), float(si)
+                return None
+
+            votes: list[tuple[float, float]] = []
+            v0 = _vote(cx, cy)
+            if v0 is not None:
+                votes.append(v0)
+
+            # Доп. точки — только если центр спорит с SGBM или NCC не нашёл.
+            need_extra = disp is None or (
+                v0 is not None and disp is not None and v0[0] + 2.5 < float(disp)
+            ) or (v0 is None and disp is not None)
+            if need_extra:
+                for px, py in (
                     (x0 + bw // 3, cy),
                     (x0 + (2 * bw) // 3, cy),
-                    (cx, y0 + max(bh // 4, 1)),
-                ]
-            )
-        votes: list[tuple[float, float]] = []
-        for px, py in sample_pts:
-            ncc_i, s_i = epipolar_ncc_disparity(
-                left_gray,
-                right_gray,
-                int(px),
-                int(py),
-                d_min=d_lo,
-                d_max=d_hi,
-                prefer_far=True,
-            )
-            if ncc_i is not None and s_i >= float(ncc_min_score):
-                votes.append((float(ncc_i), float(s_i)))
-
-        if votes:
-            # Консенсус: среди сильных матчей берём перцентиль «дальше» (меньший d).
-            strong = [v for v in votes if v[1] >= float(ncc_min_score) + 0.05] or votes
-            d_arr = np.array([v[0] for v in strong], dtype=np.float32)
-            s_arr = np.array([v[1] for v in strong], dtype=np.float32)
-            ncc_disp = float(np.percentile(d_arr, 35))
-            near = np.abs(d_arr - ncc_disp) <= 3.0
-            ncc_score = float(s_arr[near].max()) if np.any(near) else float(s_arr.max())
-
-        if ncc_disp is not None and ncc_score >= float(ncc_min_score):
-            use_ncc = disp is None
-            if disp is not None:
-                d_sgbm = float(disp)
-                # NCC заметно «дальше» (меньше d) — типичный анти-забор на SGBM.
-                if ncc_disp + 2.5 < d_sgbm and ncc_score >= float(ncc_min_score):
-                    use_ncc = True
-                elif abs(ncc_disp - d_sgbm) <= 3.0 and ncc_score >= 0.40:
-                    use_ncc = True
-                elif ncc_score >= 0.50 and ncc_disp < d_sgbm:
-                    use_ncc = True
-                # SGBM «слишком близко» относительно широкого диапазона и NCC уверен.
-                elif (
-                    d_sgbm > 1.6 * max(ncc_disp, 1.0)
-                    and ncc_score >= max(0.22, float(ncc_min_score) - 0.06)
                 ):
-                    use_ncc = True
-            if use_ncc:
-                disp = float(ncc_disp)
-                refine_tag = f"epipolar-ncc:{ncc_score:.2f}"
+                    vv = _vote(px, py)
+                    if vv is not None:
+                        votes.append(vv)
 
-    used_ys_l, used_xs_l = np.where(keep_mask)
-    used_disp = patch[keep_mask].astype(np.float32)
-    used_ys = (used_ys_l + y0).astype(np.int32)
-    used_xs = (used_xs_l + x0).astype(np.int32)
+            if votes:
+                strong = [
+                    v for v in votes if v[1] >= float(ncc_min_score) + 0.05
+                ] or votes
+                d_arr = np.array([v[0] for v in strong], dtype=np.float32)
+                s_arr = np.array([v[1] for v in strong], dtype=np.float32)
+                ncc_disp = float(np.percentile(d_arr, 35))
+                near = np.abs(d_arr - ncc_disp) <= 3.0
+                ncc_score = (
+                    float(s_arr[near].max()) if np.any(near) else float(s_arr.max())
+                )
+
+            if ncc_disp is not None and ncc_score >= float(ncc_min_score):
+                use_ncc = disp is None
+                if disp is not None:
+                    d_sgbm = float(disp)
+                    if ncc_disp + 2.5 < d_sgbm and ncc_score >= float(ncc_min_score):
+                        use_ncc = True
+                    elif abs(ncc_disp - d_sgbm) <= 3.0 and ncc_score >= 0.40:
+                        use_ncc = True
+                    elif ncc_score >= 0.50 and ncc_disp < d_sgbm:
+                        use_ncc = True
+                    elif (
+                        d_sgbm > 1.6 * max(ncc_disp, 1.0)
+                        and ncc_score >= max(0.22, float(ncc_min_score) - 0.06)
+                    ):
+                        use_ncc = True
+                if use_ncc:
+                    disp = float(ncc_disp)
+                    refine_tag = f"epipolar-ncc:{ncc_score:.2f}"
+
     dbg = None
     if collect_debug:
+        used_ys_l, used_xs_l = np.where(keep_mask)
+        used_disp = patch[keep_mask].astype(np.float32)
+        used_ys = (used_ys_l + y0).astype(np.int32)
+        used_xs = (used_xs_l + x0).astype(np.int32)
         dbg = DisparityDebugInfo(
             inset_roi=inset_roi,
             used_ys=used_ys,

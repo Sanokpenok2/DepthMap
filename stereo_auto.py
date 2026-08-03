@@ -132,15 +132,15 @@ def estimate_disparity_range_bounds(
     z_far — нижнюю. При keep_far_at_zero min_disparity=0, чтобы дальние объекты
     не обрезались.
 
-    long_range (или z_far>=800): жёстко ограничивает num_disparities сверху
-    значением ~d(z_near). Иначе SGBM находит ложные большие d и «приближает»
-    объекты с 1000 м до десятков метров.
+    long_range: жёстко ограничивает num_disparities сверху значением ~d(z_near).
+    Иначе SGBM находит ложные большие d и «приближает» объекты с 1000 м
+    до десятков метров. Сам по себе z_far long-range не включает.
     """
     if z_near_m <= 0 or z_far_m <= 0 or z_near_m >= z_far_m:
         raise ValueError("Нужно 0 < z_near_m < z_far_m (дистанции в метрах).")
 
     if long_range is None:
-        long_range = z_far_m >= 800.0
+        long_range = False
 
     focal, baseline = extract_calib_geometry(calib)
     z_near_mm = z_near_m * 1000.0
