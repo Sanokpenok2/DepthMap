@@ -520,77 +520,80 @@ class DisparityDebugInfo:
     n_used: int
     surface: str
     refine: str = ""  # "", "cluster-far", "epipolar-ncc", ...
+    # Сглаженный центр креста (L); если задан — рисуем его вместо сырого inset.
+    cross_xy: tuple[float, float] | None = None
+
+
+def _split_disparity_clusters(
+    valid: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Два кластера по наибольшему зазору в отсортированных d (забор / объект)."""
+    s = np.sort(np.asarray(valid, dtype=np.float32).reshape(-1))
+    if s.size < 16:
+        return None
+    # Ищем разрыв не на самых краях выборки.
+    i0 = max(3, int(0.10 * s.size))
+    i1 = min(s.size - 3, int(0.90 * s.size))
+    if i1 <= i0:
+        return None
+    gaps = s[i0:i1] - s[i0 - 1 : i1 - 1]
+    if gaps.size == 0:
+        return None
+    k = int(np.argmax(gaps))
+    gap = float(gaps[k])
+    split = i0 + k
+    left, right = s[:split], s[split:]
+    if left.size < 3 or right.size < 3:
+        return None
+    near_med = float(np.median(right))
+    if gap < max(3.0, 0.20 * max(near_med, 1.0)):
+        return None
+    return left, right
 
 
 def _pick_disparity_surface(valid: np.ndarray, surface: str) -> tuple[float, str]:
     """Выбор диспаритета; при бимодальности (машина далеко / забор близко) —
-    для far/median берём дальний (меньший d) кластер."""
+    для far/median берём дальний (меньший d) кластер.
+
+    Важно: при одном пике берём медиану, а не «дальний» перцентиль —
+    систематическое занижение d на малых диспаритетах раздувает Z ∝ 1/d.
+    """
     valid = np.asarray(valid, dtype=np.float32).reshape(-1)
     if valid.size == 0:
         return 0.0, surface
     if valid.size < 12:
-        if surface == "far":
-            return float(np.percentile(valid, 40)), surface
         if surface == "near":
             return float(np.percentile(valid, 60)), surface
         return float(np.median(valid)), surface
 
     med = float(np.median(valid))
-    spread = float(valid.max()) - float(valid.min())
-    multimodal = spread > max(1.5, 0.25 * max(med, 1.0))
+    # Относительный разброс: на малых d абсолютный шум 1–2 px не значит «забор».
+    spread = float(np.percentile(valid, 90) - np.percentile(valid, 10))
+    multimodal = spread > max(2.5, 0.35 * max(med, 1.0))
 
     if not multimodal:
-        if surface == "far":
-            return float(np.percentile(valid, 40)), surface
         if surface == "near":
             return float(np.percentile(valid, 60)), surface
+        # far/median без второго пика — медиана (без смещения «дальше»).
         return med, surface
 
-    n_bins = int(np.clip(valid.size // 3, 16, 64))
-    hist, edges = np.histogram(valid, bins=n_bins)
-    hist = hist.astype(np.float32)
-    if hist.size >= 3:
-        hist = np.convolve(hist, np.array([1.0, 2.0, 1.0], np.float32) / 4.0, mode="same")
-    peaks: list[tuple[float, float]] = []
-    for i in range(1, len(hist) - 1):
-        if hist[i] >= hist[i - 1] and hist[i] >= hist[i + 1] and hist[i] > 0:
-            peaks.append((float(hist[i]), float(0.5 * (edges[i] + edges[i + 1]))))
-    if len(peaks) < 2:
+    clusters = _split_disparity_clusters(valid)
+    if clusters is None:
         if surface == "near":
             return float(np.percentile(valid, 70)), surface
-        # Бимодальный разброс без явных пиков — смещаемся к дальнему плану.
-        return float(np.percentile(valid, 30 if surface == "far" else 35)), (
-            "cluster-far" if surface != "near" else surface
-        )
-
-    peaks.sort(key=lambda t: -t[0])
-    top2 = peaks[:2]
-    centers = sorted(c for _, c in top2)
-    far_c, near_c = float(centers[0]), float(centers[-1])
-    if near_c - far_c < max(1.5, 0.12 * near_c):
-        if surface == "far":
-            return float(np.percentile(valid, 40)), surface
-        if surface == "near":
-            return float(np.percentile(valid, 60)), surface
         return med, surface
 
-    dist_far = np.abs(valid - far_c)
-    dist_near = np.abs(valid - near_c)
-    far_samples = valid[dist_far <= dist_near]
-    near_samples = valid[dist_near < dist_far]
+    far_samples, near_samples = clusters
     min_keep = max(3, int(0.12 * valid.size))
 
     if surface == "near":
         pool = near_samples if near_samples.size >= min_keep else valid
         return float(np.median(pool)), "cluster-near"
 
-    # far и median: при двух кластерах предпочитаем дальний (анти-забор).
+    # far и median: медиана дальнего кластера (без перцентиля через «дыру»).
     if far_samples.size >= min_keep:
-        if surface == "far":
-            return float(np.percentile(far_samples, 40)), "cluster-far"
         return float(np.median(far_samples)), "cluster-far"
-    # Дальний кластер слишком мал — осторожный перцентиль по всем.
-    return float(np.percentile(valid, 30)), "cluster-far-weak"
+    return med, "cluster-far-weak"
 
 
 def _as_gray_u8(img: np.ndarray) -> np.ndarray:
@@ -621,6 +624,14 @@ def _grad8_band(gray: np.ndarray, y0: int, y1: int) -> tuple[np.ndarray, int]:
     return mag, y0
 
 
+def _parabola_subpixel(ym1: float, y0: float, yp1: float) -> float:
+    """Смещение пика ∈ [-1, 1] по трём выборкам (параболическая интерполяция)."""
+    denom = 2.0 * (2.0 * y0 - ym1 - yp1)
+    if abs(denom) < 1e-9:
+        return 0.0
+    return float(np.clip((ym1 - yp1) / denom, -1.0, 1.0))
+
+
 def _ncc_peaks_on_pair(
     Limg: np.ndarray,
     Rimg: np.ndarray,
@@ -637,7 +648,10 @@ def _ncc_peaks_on_pair(
     ly0: int = 0,
     ry0: int = 0,
 ) -> list[tuple[float, float, float]]:
-    """Пики NCC на одной паре изображений. Возвращает (score, uniq, disp)."""
+    """Пики NCC на одной паре изображений. Возвращает (score, uniq, disp).
+
+    disp — с субпикселем по параболе вокруг пика matchTemplate.
+    """
     lh, lw = Limg.shape[:2]
     rh, rw = Rimg.shape[:2]
     # cy/cx в координатах полного кадра; ly0/ry0 — смещение полосы, если Limg — band.
@@ -677,25 +691,166 @@ def _ncc_peaks_on_pair(
         best_s = float(max_v)
         if best_s < 0.15:
             continue
-        rx = x0c + int(max_l[0]) + hx
-        best_d = float(cx - rx)
-        if best_d < d0 - 0.5 or best_d > d1 + 0.5:
+        px = int(max_l[0])
+        py = int(max_l[1])
+        # Субпиксель по X (и Y при высоте res > 1).
+        dx = 0.0
+        if 0 < px < res.shape[1] - 1:
+            dx = _parabola_subpixel(
+                float(res[py, px - 1]), float(res[py, px]), float(res[py, px + 1])
+            )
+        dy_sp = 0.0
+        if 0 < py < res.shape[0] - 1:
+            dy_sp = _parabola_subpixel(
+                float(res[py - 1, px]), float(res[py, px]), float(res[py + 1, px])
+            )
+        # Центр шаблона на R: учитываем субпиксельный сдвиг пика влево/вправо.
+        rx = float(x0c + px + hx) + dx
+        best_d = float(cx) - rx
+        if best_d < d0 - 0.75 or best_d > d1 + 0.75:
             continue
+        # Небольшой штраф за большой dy — предпочитаем эпиполяр.
+        score_adj = best_s - 0.02 * abs(dy_sp)
         res_masked = res.copy()
-        x_lo = max(0, int(max_l[0]) - 2)
-        x_hi = min(res.shape[1], int(max_l[0]) + 3)
+        x_lo = max(0, px - 2)
+        x_hi = min(res.shape[1], px + 3)
         res_masked[:, x_lo:x_hi] = -1.0
         _mn2, max_v2, _, max_l2 = cv2.minMaxLoc(res_masked)
         second = float(max_v2)
         uniq = best_s - second if second >= 0 else best_s
-        out.append((best_s, uniq, best_d))
+        out.append((score_adj, uniq, best_d))
         # Дальний конкурирующий пик (анти-забор).
         if second >= best_s - 0.08:
-            rx2 = x0c + int(max_l2[0]) + hx
-            d2 = float(cx - rx2)
-            if d0 - 0.5 <= d2 <= d1 + 0.5 and d2 + 3.0 < best_d:
+            px2 = int(max_l2[0])
+            py2 = int(max_l2[1])
+            dx2 = 0.0
+            if 0 < px2 < res.shape[1] - 1:
+                dx2 = _parabola_subpixel(
+                    float(res[py2, px2 - 1]),
+                    float(res[py2, px2]),
+                    float(res[py2, px2 + 1]),
+                )
+            rx2 = float(x0c + px2 + hx) + dx2
+            d2 = float(cx) - rx2
+            if d0 - 0.75 <= d2 <= d1 + 0.75 and d2 + 3.0 < best_d:
                 out.append((second, second - best_s, d2))
     return out
+
+
+def _ncc_at_disparity(
+    left_gray: np.ndarray,
+    right_gray: np.ndarray,
+    cx: float,
+    cy: float,
+    disp: float,
+    *,
+    hx: int,
+    hy: int,
+) -> float:
+    """NCC шаблона L(cx,cy) с патчем R(cx-disp, cy); патч с субпикселем."""
+    tw, th = 2 * hx + 1, 2 * hy + 1
+    lh, lw = left_gray.shape[:2]
+    rh, rw = right_gray.shape[:2]
+    if not (hx < cx < lw - hx - 1 and hy < cy < lh - hy - 1):
+        return -1.0
+    rx = float(cx) - float(disp)
+    if not (hx + 1 < rx < rw - hx - 1 and hy + 1 < cy < rh - hy - 1):
+        return -1.0
+    templ = cv2.getRectSubPix(
+        left_gray, (tw, th), (float(cx), float(cy))
+    ).astype(np.float32)
+    patch = cv2.getRectSubPix(
+        right_gray, (tw, th), (rx, float(cy))
+    ).astype(np.float32)
+    t = templ - float(templ.mean())
+    p = patch - float(patch.mean())
+    denom = float(np.sqrt((t * t).sum() * (p * p).sum()))
+    if denom < 1e-6:
+        return -1.0
+    return float((t * p).sum() / denom)
+
+
+def refine_disparity_subpixel(
+    left_gray: np.ndarray,
+    right_gray: np.ndarray,
+    cx: int,
+    cy: int,
+    d_init: float,
+    *,
+    search_radius: float = 1.0,
+    templ_w: int = 25,
+    templ_h: int = 17,
+    dy_search: int = 0,
+    min_score: float = 0.25,
+    fine_step: float = 0.05,
+    max_delta: float = 0.60,
+    min_improve: float = 0.015,
+) -> tuple[float | None, float]:
+    """Уточняет диспаритет вокруг d_init (точка на R точнее 1 px).
+
+    Узкое окно + порог улучшения score — без скачков между кадрами.
+    """
+    left_gray = _as_gray_u8(left_gray)
+    right_gray = _as_gray_u8(right_gray)
+    if not np.isfinite(d_init) or d_init <= 0:
+        return None, -1.0
+
+    tw = max(9, int(templ_w) | 1)
+    th = max(9, int(templ_h) | 1)
+    hx, hy = tw // 2, th // 2
+    d0 = float(d_init)
+    radius = min(float(search_radius), float(max_delta))
+    d_lo = max(0.25, d0 - radius)
+    d_hi = d0 + radius
+
+    s_init = _ncc_at_disparity(
+        left_gray, right_gray, float(cx), float(cy), d0, hx=hx, hy=hy
+    )
+    best_d = d0
+    best_s = s_init
+
+    # Сетка вокруг d_init (не вокруг чужого пика NCC — меньше прыжков).
+    step_c = 0.20
+    for dd in np.arange(d_lo, d_hi + 1e-9, step_c, dtype=np.float64):
+        sc = _ncc_at_disparity(
+            left_gray, right_gray, float(cx), float(cy), float(dd), hx=hx, hy=hy
+        )
+        if sc > best_s:
+            best_s, best_d = sc, float(dd)
+
+    step = max(0.02, float(fine_step))
+    for off in np.arange(-0.25, 0.25 + 1e-9, step, dtype=np.float64):
+        dd = best_d + float(off)
+        if dd < d_lo or dd > d_hi:
+            continue
+        sc = _ncc_at_disparity(
+            left_gray, right_gray, float(cx), float(cy), dd, hx=hx, hy=hy
+        )
+        if sc > best_s:
+            best_s, best_d = sc, dd
+
+    s_m = _ncc_at_disparity(
+        left_gray, right_gray, float(cx), float(cy), best_d - step, hx=hx, hy=hy
+    )
+    s_0 = _ncc_at_disparity(
+        left_gray, right_gray, float(cx), float(cy), best_d, hx=hx, hy=hy
+    )
+    s_p = _ncc_at_disparity(
+        left_gray, right_gray, float(cx), float(cy), best_d + step, hx=hx, hy=hy
+    )
+    if s_0 >= s_m and s_0 >= s_p:
+        best_d = best_d + step * _parabola_subpixel(s_m, s_0, s_p)
+        best_s = s_0
+
+    # Принимаем только если score реально лучше, иначе оставляем d_init.
+    if best_s < float(min_score):
+        return None, float(best_s)
+    if s_init >= 0 and best_s < s_init + float(min_improve):
+        return float(d0), float(s_init)
+    delta = float(np.clip(best_d - d0, -float(max_delta), float(max_delta)))
+    # Смешиваем с исходным — сглаживает дрожание субпикселя.
+    out_d = d0 + 0.55 * delta
+    return float(out_d), float(best_s)
 
 
 def epipolar_ncc_disparity(
@@ -795,10 +950,12 @@ def epipolar_ncc_disparity(
     best = max(candidates, key=_rank)
     if prefer_far:
         top_score = best[0]
+        # Анти-забор: брать более дальний пик только при заметном разрыве d
+        # (≥6 px) — иначе на малых d «чуть дальше» раздувает Z ∝ 1/d.
         farther = [
             c
             for c in candidates
-            if c[0] >= top_score - 0.06 and c[2] + 2.5 < best[2]
+            if c[0] >= top_score - 0.05 and c[2] + 6.0 < best[2]
         ]
         if farther:
             best = min(farther, key=lambda c: c[2])
@@ -904,9 +1061,13 @@ def measure_roi_distance(
             iqr = float(q3 - q1)
             if iqr > 1e-6:
                 lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-                # Для far/median сильнее режем «слишком близкие» выбросы (забор).
-                if surface in ("far", "median"):
-                    hi = min(hi, float(np.percentile(valid, 75)))
+                # Режем ближние выбросы (забор) только при заметном IQR / больших d.
+                if (
+                    surface in ("far", "median")
+                    and iqr >= 2.0
+                    and float(np.median(valid)) > 12.0
+                ):
+                    hi = min(hi, float(np.percentile(valid, 80)))
                 in_iqr = finite & (patch >= lo) & (patch <= hi)
                 if int(in_iqr.sum()) >= max(3, int(0.20 * valid.size)):
                     keep_mask = in_iqr
@@ -917,8 +1078,7 @@ def measure_roi_distance(
     cx = (x0 + x1) // 2
     cy = (y0 + y1) // 2
 
-    # NCC вдоль эпиполяра: часто находит машину, когда SGBM залип на заборе.
-    # Дорогой путь включаем только при подозрении на ложный ближний матч.
+    # NCC вдоль эпиполяра: только анти-забор (ложный большой d), не «чуть дальше».
     ncc_disp = None
     ncc_score = -1.0
     if (
@@ -930,17 +1090,16 @@ def measure_roi_distance(
         spread = 0.0
         if valid.size >= 8:
             spread = float(np.percentile(valid, 90) - np.percentile(valid, 10))
-        suspicious = (
-            disp is None
-            or "cluster" in (refine_tag or "")
-            or (
-                disp is not None
-                and (
-                    float(disp) > max(14.0, 0.10 * w)
-                    or spread > max(4.0, 0.20 * float(disp))
-                )
-            )
-        )
+        # Подозрение: SGBM пуст / явный ближний кластер / крупный d (забор).
+        # На малых d обычный шум 1–2 px НЕ считаем забором — иначе Z раздувается.
+        suspicious = disp is None or "cluster-near" in (refine_tag or "")
+        if disp is not None and float(disp) > 14.0:
+            suspicious = suspicious or spread > max(5.0, 0.30 * float(disp))
+            suspicious = suspicious or float(disp) > max(18.0, 0.12 * w)
+        if "cluster-far" in (refine_tag or "") and disp is not None and float(disp) > 14.0:
+            # Кластер уже выбран — NCC только если всё ещё похоже на ближний мусор.
+            suspicious = suspicious or spread > max(6.0, 0.40 * float(disp))
+
         if suspicious:
             d_lo = float(min_disparity) if min_disparity > 0 else 0.5
             d_hi = (
@@ -951,6 +1110,8 @@ def measure_roi_distance(
             left_u8 = _as_gray_u8(left_gray)
             right_u8 = _as_gray_u8(right_gray)
             bw = max(1, x1 - x0)
+            # prefer_far только когда SGBM уже «слишком близко» (анти-забор).
+            use_prefer_far = disp is not None and float(disp) > 14.0
 
             def _vote(px: int, py: int) -> tuple[float, float] | None:
                 di, si = epipolar_ncc_disparity(
@@ -960,7 +1121,7 @@ def measure_roi_distance(
                     int(py),
                     d_min=d_lo,
                     d_max=d_hi,
-                    prefer_far=True,
+                    prefer_far=use_prefer_far,
                     dy_search=1,
                 )
                 if di is not None and si >= float(ncc_min_score):
@@ -972,10 +1133,9 @@ def measure_roi_distance(
             if v0 is not None:
                 votes.append(v0)
 
-            # Доп. точки — только если центр спорит с SGBM или NCC не нашёл.
             need_extra = disp is None or (
-                v0 is not None and disp is not None and v0[0] + 2.5 < float(disp)
-            ) or (v0 is None and disp is not None)
+                v0 is not None and disp is not None and v0[0] + 6.0 < float(disp)
+            ) or (v0 is None and disp is not None and float(disp) > 14.0)
             if need_extra:
                 for px, py in (
                     (x0 + bw // 3, cy),
@@ -991,7 +1151,7 @@ def measure_roi_distance(
                 ] or votes
                 d_arr = np.array([v[0] for v in strong], dtype=np.float32)
                 s_arr = np.array([v[1] for v in strong], dtype=np.float32)
-                ncc_disp = float(np.percentile(d_arr, 35))
+                ncc_disp = float(np.median(d_arr))
                 near = np.abs(d_arr - ncc_disp) <= 3.0
                 ncc_score = (
                     float(s_arr[near].max()) if np.any(near) else float(s_arr.max())
@@ -1001,20 +1161,50 @@ def measure_roi_distance(
                 use_ncc = disp is None
                 if disp is not None:
                     d_sgbm = float(disp)
-                    if ncc_disp + 2.5 < d_sgbm and ncc_score >= float(ncc_min_score):
-                        use_ncc = True
-                    elif abs(ncc_disp - d_sgbm) <= 3.0 and ncc_score >= 0.40:
-                        use_ncc = True
-                    elif ncc_score >= 0.50 and ncc_disp < d_sgbm:
+                    # Перебиваем SGBM только если NCC заметно дальше (анти-забор).
+                    if ncc_disp + 6.0 < d_sgbm and ncc_score >= float(ncc_min_score):
                         use_ncc = True
                     elif (
-                        d_sgbm > 1.6 * max(ncc_disp, 1.0)
+                        d_sgbm > 1.8 * max(ncc_disp, 1.0)
+                        and d_sgbm - ncc_disp >= 6.0
                         and ncc_score >= max(0.22, float(ncc_min_score) - 0.06)
                     ):
+                        use_ncc = True
+                    elif (
+                        abs(ncc_disp - d_sgbm) <= 2.0
+                        and ncc_score >= 0.55
+                        and d_sgbm > 10.0
+                    ):
+                        # Высокий score и согласие — лёгкое уточнение, без увода вдаль.
                         use_ncc = True
                 if use_ncc:
                     disp = float(ncc_disp)
                     refine_tag = f"epipolar-ncc:{ncc_score:.2f}"
+
+    # Субпиксельное уточнение (узкое, только при улучшении score — без скачков).
+    if (
+        disp is not None
+        and left_gray is not None
+        and right_gray is not None
+        and surface != "near"
+    ):
+        d_sp, s_sp = refine_disparity_subpixel(
+            left_gray,
+            right_gray,
+            cx,
+            cy,
+            float(disp),
+            search_radius=1.0,
+            max_delta=0.60,
+            min_score=0.22,
+            min_improve=0.015,
+        )
+        if d_sp is not None and s_sp >= 0.22 and abs(d_sp - float(disp)) > 1e-4:
+            disp = float(d_sp)
+            if refine_tag:
+                refine_tag = f"{refine_tag}+subpx:{s_sp:.2f}"
+            else:
+                refine_tag = f"subpx:{s_sp:.2f}"
 
     dbg = None
     if collect_debug:
@@ -1150,11 +1340,17 @@ def draw_disparity_debug(
         cv2.circle(canvas, p2, 3, (0, 255, 255), -1, cv2.LINE_AA)
         cv2.line(canvas, p1, p2, (0, 200, 255), 1, cv2.LINE_AA)
 
-    # Маркер selected disparity на центре inset.
+    # Маркер selected disparity (сглаженный центр + сглаженный d — без дрожания).
     if debug.selected_disp is not None and debug.selected_disp > 0:
-        cx = ix + iw // 2
-        cy = iy + ih // 2
-        rcx = int(round(cx - float(debug.selected_disp)))
+        if debug.cross_xy is not None:
+            cx_f, cy_f = float(debug.cross_xy[0]), float(debug.cross_xy[1])
+        else:
+            cx_f = float(ix + iw * 0.5)
+            cy_f = float(iy + ih * 0.5)
+        cx = int(round(cx_f))
+        cy = int(round(cy_f))
+        rcx_f = cx_f - float(debug.selected_disp)
+        rcx = int(round(rcx_f))
         cv2.drawMarker(canvas, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 16, 2)
         if 0 <= cy < right.shape[0] and 0 <= rcx < right.shape[1]:
             cv2.drawMarker(
@@ -1163,10 +1359,20 @@ def draw_disparity_debug(
             cv2.line(
                 canvas, (cx, cy), (rcx + lw, cy), (0, 0, 255), 2, cv2.LINE_AA
             )
+            cv2.putText(
+                canvas,
+                f"R_x={rcx_f:.2f}",
+                (rcx + lw + 8, max(16, cy - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 0, 255),
+                1,
+                cv2.LINE_AA,
+            )
 
     lines = [
         f"DEBUG disp  used={debug.n_used}/{debug.n_patch}  valid0={debug.n_valid}",
-        f"surface={debug.surface}  selected={debug.selected_disp:.2f}px"
+        f"surface={debug.surface}  selected={debug.selected_disp:.3f}px"
         if debug.selected_disp is not None
         else f"surface={debug.surface}  selected=n/a",
         f"refine={debug.refine}" if debug.refine else "refine=sgbm-roi",

@@ -20,6 +20,9 @@
     r / c   — выбрать объект (рамка / клик)
     x       — отменить трекинг
     d       — вкл/выкл отладку диспаритета (L↔R соответствия)
+    [ / ]   — полоса дистанции назад/вперёд (альтернатива auto)
+    t       — тройной режим (3 полосы → выброс → среднее d)
+    a       — вернуть auto-диспаритет
     q / Esc — выход
 """
 
@@ -52,10 +55,16 @@ from depth_map import (
 from object_tracker import ObjectTracker
 from calib_quality import format_quality_report
 from stereo_auto import (
+    RangeBand,
+    band_measurement_caps,
     clamp_sgbm_range,
     disparity_from_depth,
+    distance_mm_from_disparity,
     estimate_disparity_range_bounds,
     extract_calib_geometry,
+    fuse_point_disparities,
+    make_range_bands,
+    parse_band_edges,
     round_num_disparities,
 )
 
@@ -145,14 +154,46 @@ def parse_args() -> argparse.Namespace:
             "Включается только явно этим флагом."
         ),
     )
+    p.add_argument(
+        "--range-mode",
+        choices=["auto", "bands", "triple"],
+        default="auto",
+        help=(
+            "auto — подбор/адаптация по z-near/z-far; "
+            "bands — одна из 3 полос ([/]); "
+            "triple — 3 полосы сразу, выброс, среднее d в точке."
+        ),
+    )
+    p.add_argument(
+        "--band-edges",
+        type=str,
+        default="100,500,1000,3000",
+        help="Границы полос (м), через запятую: 4 числа → 3 режима.",
+    )
+    p.add_argument(
+        "--band-index",
+        type=int,
+        default=0,
+        help="Стартовая полоса при --range-mode bands (0-based).",
+    )
     p.add_argument("--wls", action="store_true", help="WLS-фильтр (медленнее).")
     p.add_argument("--wls-lambda", type=float, default=8000.0)
     p.add_argument("--wls-sigma", type=float, default=1.5)
     p.add_argument(
+        "--gray",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Принудительно переводить кадры в gray перед треком/SGBM. "
+            "--no-gray оставляет цвет (BGR) для трекера/превью; для диспаритета "
+            "gray всё равно берётся из яркости."
+        ),
+    )
+    p.add_argument(
         "--clahe",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="CLAHE на ректифицированном gray (важно для низкоконтрастного ТВ/ИК).",
+        default=False,
+        help="CLAHE на ректифицированном кадре (важно для низкоконтрастного ТВ/ИК).",
     )
     p.add_argument(
         "--tracker",
@@ -206,25 +247,28 @@ def parse_args() -> argparse.Namespace:
         "--verify",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Отклонять дрейф рамки на другой объект/фон (сходство с эталоном + прыжок).",
+        help=(
+            "Отклонять дрейф рамки на другой объект/фон (сходство с эталоном + прыжок). "
+            "Для --tracker ncc / --kornia-tracker всегда включено."
+        ),
     )
     p.add_argument(
         "--verify-threshold",
         type=float,
-        default=0.30,
-        help="Мин. NCC (CLAHE) [0..1]; ниже soft-полосы — копим LOST.",
+        default=0.45,
+        help="Мин. NCC (CLAHE) [0..1]; для ncc/kornia по умолчанию строже (~0.45).",
     )
     p.add_argument(
         "--max-jump",
         type=float,
-        default=4.0,
-        help="Макс. прыжок центра (доли ширины ROI по X; для быстрых L→R ≥3).",
+        default=2.2,
+        help="Макс. прыжок центра (доли размера ROI; для ncc строже, ~2.2).",
     )
     p.add_argument(
         "--verify-rel",
         type=float,
-        default=0.0,
-        help="Отклонять кадр, если score < EMA*verify-rel (0 = выкл.).",
+        default=0.80,
+        help="Отклонять кадр, если score < EMA*verify-rel (0 = выкл.; ncc: ~0.80).",
     )
     p.add_argument(
         "--min-iou",
@@ -235,8 +279,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--lost-patience",
         type=int,
-        default=14,
-        help="Сколько подряд плохих кадров нужно, чтобы объявить LOST.",
+        default=7,
+        help="Сколько подряд плохих кадров нужно, чтобы объявить LOST (для ncc строже).",
     )
     p.add_argument(
         "--reacquire",
@@ -247,13 +291,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--reacquire-threshold",
         type=float,
-        default=0.55,
+        default=0.68,
         help="Порог NCC для повторного захвата [0..1] (выше = меньше ложных прыжков).",
     )
     p.add_argument(
         "--reacquire-radius",
         type=float,
-        default=3.5,
+        default=2.2,
         help="Окно поиска при перезахвате (доли max(w,h) ROI вокруг последней позиции).",
     )
     p.add_argument(
@@ -326,7 +370,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--roi-inset",
         type=float,
-        default=0.32,
+        default=0, #0.32
         help="Доля обрезки краёв ROI при измерении дистанции (0 = весь бокс).",
     )
     p.add_argument(
@@ -399,7 +443,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--debug-disp-samples",
         type=int,
-        default=48,
+        default=10, #48
         help="Сколько линий L→R рисовать в --debug-disparity.",
     )
     p.add_argument(
@@ -548,6 +592,20 @@ def resize_to_calib(img: np.ndarray, size: tuple[int, int] | None) -> np.ndarray
     return cv2.resize(img, (tw, th), interpolation=cv2.INTER_AREA)
 
 
+def rect_to_bgr(rect: np.ndarray) -> np.ndarray:
+    """Кадр после prepare → BGR для трекера/оверлея."""
+    if rect.ndim == 2:
+        return cv2.cvtColor(rect, cv2.COLOR_GRAY2BGR)
+    return rect
+
+
+def stereo_gray_pair(
+    rect_l: np.ndarray, rect_r: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Gray-пара для SGBM/NCC (если prepare оставил цвет — конвертируем здесь)."""
+    return to_gray(rect_l), to_gray(rect_r)
+
+
 def prepare_side(
     frame: np.ndarray,
     map1: np.ndarray,
@@ -555,12 +613,20 @@ def prepare_side(
     calib_size: tuple[int, int] | None,
     *,
     clahe: bool = True,
+    force_gray: bool = True,
 ) -> np.ndarray:
-    """Gray → resize → remap (+CLAHE) для одной камеры."""
-    gray = to_gray(frame)
-    gray = resize_to_calib(gray, calib_size)
-    gray = cv2.remap(gray, map1, map2, cv2.INTER_LINEAR)
-    return enhance_gray(gray, clahe=clahe)
+    """Resize → remap (+CLAHE). При force_gray — в одноканальный gray."""
+    img = to_gray(frame) if force_gray or frame.ndim == 2 else frame
+    img = resize_to_calib(img, calib_size)
+    img = cv2.remap(img, map1, map2, cv2.INTER_LINEAR)
+    if img.ndim == 2:
+        return enhance_gray(img, clahe=clahe)
+    if clahe:
+        # CLAHE только по яркости, цвет сохраняем.
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        lab[:, :, 0] = enhance_gray(lab[:, :, 0], clahe=True)
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    return img
 
 
 def prepare_pair(
@@ -570,13 +636,23 @@ def prepare_pair(
     pool: ThreadPoolExecutor | None,
     *,
     clahe: bool = True,
+    force_gray: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    # Без калибровки ректификация невозможна: только gray (для трекинга этого хватает).
+    # Без калибровки ректификация невозможна.
     if calib is None:
-        return (
-            enhance_gray(to_gray(frame_l), clahe=clahe),
-            enhance_gray(to_gray(frame_r), clahe=clahe),
-        )
+        if force_gray or frame_l.ndim == 2:
+            return (
+                enhance_gray(to_gray(frame_l), clahe=clahe),
+                enhance_gray(to_gray(frame_r), clahe=clahe),
+            )
+        if clahe:
+            def _enh_bgr(bgr: np.ndarray) -> np.ndarray:
+                lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+                lab[:, :, 0] = enhance_gray(lab[:, :, 0], clahe=True)
+                return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+            return _enh_bgr(frame_l), _enh_bgr(frame_r)
+        return frame_l, frame_r
 
     calib_size = None
     if "image_size" in calib:
@@ -584,18 +660,40 @@ def prepare_pair(
 
     if pool is None:
         rect_l = prepare_side(
-            frame_l, calib["map1_l"], calib["map2_l"], calib_size, clahe=clahe
+            frame_l,
+            calib["map1_l"],
+            calib["map2_l"],
+            calib_size,
+            clahe=clahe,
+            force_gray=force_gray,
         )
         rect_r = prepare_side(
-            frame_r, calib["map1_r"], calib["map2_r"], calib_size, clahe=clahe
+            frame_r,
+            calib["map1_r"],
+            calib["map2_r"],
+            calib_size,
+            clahe=clahe,
+            force_gray=force_gray,
         )
         return rect_l, rect_r
 
     fut_l = pool.submit(
-        prepare_side, frame_l, calib["map1_l"], calib["map2_l"], calib_size, clahe=clahe
+        prepare_side,
+        frame_l,
+        calib["map1_l"],
+        calib["map2_l"],
+        calib_size,
+        clahe=clahe,
+        force_gray=force_gray,
     )
     fut_r = pool.submit(
-        prepare_side, frame_r, calib["map1_r"], calib["map2_r"], calib_size, clahe=clahe
+        prepare_side,
+        frame_r,
+        calib["map1_r"],
+        calib["map2_r"],
+        calib_size,
+        clahe=clahe,
+        force_gray=force_gray,
     )
     return fut_l.result(), fut_r.result()
 
@@ -634,6 +732,104 @@ def make_stereo_matcher(
             speckle_window_size=speckle_window_size,
         )
     return build_bm(num_disparities, block_size)
+
+
+def build_band_matcher(
+    calib: dict,
+    band: RangeBand,
+    *,
+    image_width: int,
+    method: str,
+    block_size: int,
+) -> dict:
+    """Собирает SGBM/BM и пороги измерения под одну дистанционную полосу."""
+    uniqueness = 12 if band.long_range else 5
+    disp_min, disp_num, log = estimate_disparity_range_bounds(
+        calib,
+        band.z_near_m,
+        band.z_far_m,
+        image_width=image_width,
+        long_range=band.long_range,
+    )
+    max_num = 96 if band.long_range else 512
+    disp_min, disp_num = clamp_sgbm_range(
+        disp_min, disp_num, image_width, max_num=max_num
+    )
+    matcher = make_stereo_matcher(
+        method,
+        disp_min,
+        disp_num,
+        block_size,
+        uniqueness_ratio=uniqueness,
+        speckle_window_size=40 if band.long_range else 50,
+    )
+    max_cap, min_floor, max_z = band_measurement_caps(calib, band)
+    return {
+        "band": band,
+        "matcher": matcher,
+        "disp_min": int(disp_min),
+        "disp_num": int(disp_num),
+        "uniqueness": uniqueness,
+        "max_disp_cap": max_cap,
+        "min_disp_floor": min_floor,
+        "max_distance_mm": max_z,
+        "log": log,
+    }
+
+
+def measure_triple_band_point(
+    *,
+    gray_l: np.ndarray,
+    gray_r: np.ndarray,
+    roi: tuple[int, int, int, int],
+    band_states: list[dict],
+    calib: dict,
+    Q,
+    args: argparse.Namespace,
+    left_gray: np.ndarray | None = None,
+    right_gray: np.ndarray | None = None,
+    epipolar_ncc: bool = True,
+    wls: bool = False,
+    wls_lambda: float = 8000.0,
+    wls_sigma: float = 1.5,
+) -> tuple[float | None, float | None, list[float | None], np.ndarray | None]:
+    """Три SGBM-полосы → d в ROI → отброс выброса → среднее.
+
+    Возвращает (distance_mm, disparity_px, per_band_d, last_disp_map).
+    """
+    per_d: list[float | None] = []
+    last_map: np.ndarray | None = None
+    for st in band_states:
+        disp_map = compute_disparity(
+            gray_l,
+            gray_r,
+            st["matcher"],
+            wls=wls,
+            wls_lambda=wls_lambda,
+            wls_sigma=wls_sigma,
+        )
+        last_map = disp_map
+        _dist, d_px = measure_roi_distance(
+            disp_map,
+            roi,
+            Q=Q,
+            inset_fraction=args.roi_inset,
+            surface=args.surface,
+            max_disparity=st["max_disp_cap"],
+            min_disparity=st["min_disp_floor"],
+            max_distance_mm=st["max_distance_mm"],
+            left_gray=left_gray,
+            right_gray=right_gray,
+            epipolar_ncc=bool(epipolar_ncc),
+        )
+        del _dist
+        per_d.append(float(d_px) if d_px is not None and np.isfinite(d_px) else None)
+
+    fused_d = fuse_point_disparities(per_d)
+    if fused_d is None:
+        return None, None, per_d, last_map
+    dist_mm = distance_mm_from_disparity(calib, fused_d)
+    return dist_mm, float(fused_d), per_d, last_map
 
 
 def adapt_disparity_range(
@@ -773,6 +969,7 @@ def draw_overlay(
     sgbm_busy: bool = False,
     disp_range: tuple[int, int] | None = None,
     speed_mps: float | None = None,
+    mode_label: str | None = None,
 ) -> np.ndarray:
     out = frame_bgr.copy()
     if roi is not None:
@@ -783,6 +980,8 @@ def draw_overlay(
         cv2.drawMarker(out, (cx, cy), color, cv2.MARKER_CROSS, 14, 2)
 
     lines = [f"frame {frame_idx}", f"FPS {fps:.1f}"]
+    if mode_label:
+        lines.append(mode_label)
     if distance_mm is not None:
         if distance_mm >= 1000:
             lines.append(f"distance {distance_mm / 1000.0:.2f} m")
@@ -1260,6 +1459,9 @@ def _measure_and_smooth(
         dbg = None
     dist_s, disp_s = dist_smoother.update(dist, disp_val)
     out_disp = disp_s if disp_s is not None else disp_val
+    # Крест в debug — по сглаженному d (как дистанция на оверлее), не по сырому кадру.
+    if dbg is not None and out_disp is not None and np.isfinite(out_disp):
+        dbg.selected_disp = float(out_disp)
     return dist_s, out_disp, dist, dbg
 
 
@@ -1327,6 +1529,15 @@ def main() -> None:
         sys.exit("Ошибка: --max-fps должен быть >= 0 (0 = без ограничения).")
     if not (0.0 <= args.roi_inset < 0.45):
         sys.exit("Ошибка: --roi-inset должен быть в диапазоне [0.0, 0.45).")
+    try:
+        band_edges = parse_band_edges(args.band_edges)
+        range_bands = make_range_bands(band_edges)
+    except ValueError as exc:
+        sys.exit(f"Ошибка --band-edges: {exc}")
+    range_mode = str(args.range_mode)
+    band_index = int(np.clip(args.band_index, 0, len(range_bands) - 1))
+    z_near_auto = float(args.z_near)
+    z_far_auto = float(args.z_far)
     long_range = bool(args.long_range)
     if long_range and args.z_near < 80:
         print(
@@ -1406,11 +1617,16 @@ def main() -> None:
     disp_min = int(args.min_disparity)
     disp_num = int(args.num_disparities)
     auto_disp = bool(args.auto_disparity) and not track_only
+    if range_mode in ("bands", "triple"):
+        # Полосы/тройной — альтернатива auto: без runtime-адаптации окна.
+        auto_disp = False
 
     prep_pool = ThreadPoolExecutor(max_workers=args.workers)
     # Отдельный пул на 1 поток: matcher.compute не запускаем параллельно самому себе.
     sgbm_pool = (
-        ThreadPoolExecutor(max_workers=1) if (args.async_sgbm and not track_only) else None
+        ThreadPoolExecutor(max_workers=1)
+        if (args.async_sgbm and not track_only and range_mode != "triple")
+        else None
     )
     sgbm_future: Future | None = None
 
@@ -1424,68 +1640,122 @@ def main() -> None:
     )
 
     rect_l, rect_r = prepare_pair(
-        frame_l, frame_r, calib, prep_pool, clahe=args.clahe
+        frame_l,
+        frame_r,
+        calib,
+        prep_pool,
+        clahe=args.clahe,
+        force_gray=args.gray,
     )
-    rect_l_bgr = cv2.cvtColor(rect_l, cv2.COLOR_GRAY2BGR)
+    rect_l_bgr = rect_to_bgr(rect_l)
+    gray_l, gray_r = stereo_gray_pair(rect_l, rect_r)
 
     max_disp_cap: float | None = None
     min_disp_floor = 0.75
     max_distance_mm: float | None = None
     uniqueness = 5
+    band_states: list[dict] = []
+    matcher = None
     if not track_only:
         Q = calib["Q"]
-        if long_range:
-            uniqueness = 12
-            print(f"Режим long-range: z={args.z_near:.0f}–{args.z_far:.0f} м, uniqueness={uniqueness}")
-        if auto_disp and calib is not None:
-            disp_min, disp_num, range_log = estimate_disparity_range_bounds(
-                calib,
-                args.z_near,
-                args.z_far,
-                image_width=int(rect_l.shape[1]),
-                long_range=long_range,
-            )
-            max_num = 96 if long_range else 512
-            disp_min, disp_num = clamp_sgbm_range(
-                disp_min, disp_num, int(rect_l.shape[1]), max_num=max_num
-            )
-            print(range_log)
-        else:
-            if args.auto_disparity and calib is None:
-                print(
-                    "Предупреждение: --auto-disparity без --calib — "
-                    "фиксированный --num-disparities."
+        img_w = int(rect_l.shape[1])
+        if range_mode in ("bands", "triple"):
+            band_states = [
+                build_band_matcher(
+                    calib,
+                    band,
+                    image_width=img_w,
+                    method=args.method,
+                    block_size=args.block_size,
                 )
-                auto_disp = False
-            print(
-                f"Фиксированный диапазон диспаритета: "
-                f"min={disp_min}, num={disp_num}."
+                for band in range_bands
+            ]
+            for st in band_states:
+                print(st["log"])
+            if range_mode == "bands":
+                st0 = band_states[band_index]
+                band = st0["band"]
+                args.z_near = band.z_near_m
+                args.z_far = band.z_far_m
+                long_range = band.long_range
+                uniqueness = st0["uniqueness"]
+                disp_min, disp_num = st0["disp_min"], st0["disp_num"]
+                matcher = st0["matcher"]
+                max_disp_cap = st0["max_disp_cap"]
+                min_disp_floor = st0["min_disp_floor"]
+                max_distance_mm = st0["max_distance_mm"]
+                print(f"Полоса [{band_index}] {band.label} (клавиши [/]).")
+            else:
+                # Тройной: берём самую дальнюю полосу для оверлея/потолков отображения.
+                st_far = band_states[-1]
+                band = st_far["band"]
+                args.z_near = range_bands[0].z_near_m
+                args.z_far = range_bands[-1].z_far_m
+                long_range = any(b.long_range for b in range_bands)
+                uniqueness = st_far["uniqueness"]
+                disp_min, disp_num = st_far["disp_min"], st_far["disp_num"]
+                matcher = st_far["matcher"]
+                max_disp_cap = max(st["max_disp_cap"] for st in band_states)
+                min_disp_floor = min(st["min_disp_floor"] for st in band_states)
+                max_distance_mm = max(st["max_distance_mm"] for st in band_states)
+                print(
+                    "Тройной режим: 3 полосы → выброс → среднее d "
+                    f"({range_bands[0].z_near_m:.0f}…{range_bands[-1].z_far_m:.0f} м)."
+                )
+        else:
+            if long_range:
+                uniqueness = 12
+                print(
+                    f"Режим long-range: z={args.z_near:.0f}–{args.z_far:.0f} м, "
+                    f"uniqueness={uniqueness}"
+                )
+            if auto_disp and calib is not None:
+                disp_min, disp_num, range_log = estimate_disparity_range_bounds(
+                    calib,
+                    args.z_near,
+                    args.z_far,
+                    image_width=img_w,
+                    long_range=long_range,
+                )
+                max_num = 96 if long_range else 512
+                disp_min, disp_num = clamp_sgbm_range(
+                    disp_min, disp_num, img_w, max_num=max_num
+                )
+                print(range_log)
+            else:
+                if args.auto_disparity and calib is None:
+                    print(
+                        "Предупреждение: --auto-disparity без --calib — "
+                        "фиксированный --num-disparities."
+                    )
+                    auto_disp = False
+                print(
+                    f"Фиксированный диапазон диспаритета: "
+                    f"min={disp_min}, num={disp_num}."
+                )
+            try:
+                focal, baseline = extract_calib_geometry(calib)
+                max_disp_cap = disparity_from_depth(
+                    focal, baseline, args.z_near * 1000.0
+                ) * 1.05
+                d_far = disparity_from_depth(focal, baseline, args.z_far * 1000.0)
+                min_disp_floor = max(0.85, float(d_far) * 0.75)
+                max_distance_mm = float(args.z_far) * 1000.0 * 1.15
+                print(
+                    f"Потолок d ≤ {max_disp_cap:.2f} px (z_near={args.z_near:.0f} м); "
+                    f"пол d ≥ {min_disp_floor:.2f} px; Z ≤ {max_distance_mm/1000:.0f} м"
+                )
+            except Exception:
+                max_disp_cap = float(disp_min + disp_num)
+                max_distance_mm = float(args.z_far) * 1000.0 * 1.15
+            matcher = make_stereo_matcher(
+                args.method,
+                disp_min,
+                disp_num,
+                args.block_size,
+                uniqueness_ratio=uniqueness,
+                speckle_window_size=40 if long_range else 50,
             )
-        try:
-            focal, baseline = extract_calib_geometry(calib)
-            # Потолок d: чуть выше d(z_near), всё большее — мусор для дальней сцены.
-            max_disp_cap = disparity_from_depth(
-                focal, baseline, args.z_near * 1000.0
-            ) * 1.05
-            # Пол d: не ниже ~0.75*d(z_far) — иначе шум 0.4px даёт Z в тысячи км.
-            d_far = disparity_from_depth(focal, baseline, args.z_far * 1000.0)
-            min_disp_floor = max(0.85, float(d_far) * 0.75)
-            max_distance_mm = float(args.z_far) * 1000.0 * 1.15
-            print(
-                f"Потолок d ≤ {max_disp_cap:.2f} px (z_near={args.z_near:.0f} м); "
-                f"пол d ≥ {min_disp_floor:.2f} px; Z ≤ {max_distance_mm/1000:.0f} м"
-            )
-        except Exception:
-            max_disp_cap = float(disp_min + disp_num)
-            max_distance_mm = float(args.z_far) * 1000.0 * 1.15
-        matcher = make_stereo_matcher(
-            args.method,
-            disp_min,
-            disp_num,
-            args.block_size,
-            uniqueness_ratio=uniqueness,
-            speckle_window_size=40 if long_range else 50,
-        )
 
     # ROI можно выбрать в любой момент клавишей R — на старте объекта нет.
     # Thermal IR: base (KCF или NCC/Kornia) + CLAHE-NCC + intensity + reacquire.
@@ -1502,7 +1772,7 @@ def main() -> None:
         keep_aspect=args.keep_aspect,
         max_scale_step=args.max_scale_step,
         max_size_ratio=args.max_size_ratio,
-        verify=args.verify,
+        verify=True if tracker_kind == "ncc" else args.verify,
         verify_threshold=args.verify_threshold,
         max_jump=args.max_jump,
         lost_patience=args.lost_patience,
@@ -1516,6 +1786,14 @@ def main() -> None:
         reacquire_scale_min=args.reacquire_scale_min,
         reacquire_scale_max=args.reacquire_scale_max,
     )
+    if tracker_kind == "ncc":
+        print(
+            "Kornia/NCC: режим слежения "
+            f"(verify≥{tracker.verify_threshold:.2f}, "
+            f"reacq≥{tracker.reacquire_threshold:.2f}, "
+            f"peak≥{tracker.min_peak_ratio:.2f}, "
+            f"jump≤{tracker.max_jump:.1f}; anti-stick on cold background)."
+        )
     roi: tuple[int, int, int, int] | None = None
     tracking_ok = False
 
@@ -1575,7 +1853,10 @@ def main() -> None:
             (rect_l_bgr.shape[1], rect_l_bgr.shape[0]),
         )
 
-    window = "Track + distance (Space=pause, R/C=select, X=cancel, D=disp, Q=quit)"
+    window = (
+        "Track + distance (Space=pause, R/C=select, X=cancel, "
+        "D=disp, [/]=band, T=triple, A=auto, Q=quit)"
+    )
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     debug_window = "Disparity debug (L | R correspondences)"
     debug_disparity = bool(args.debug_disparity) and not track_only
@@ -1588,9 +1869,58 @@ def main() -> None:
     # NCC по эпиполяру — только на новом disp / сдвиге ROI (не каждый кадр).
     last_ncc_disp_id: int | None = None
     last_ncc_roi_cxy: tuple[int, int] | None = None
+    dbg_cross_ema: tuple[float, float] | None = None
+
+    def range_mode_label() -> str | None:
+        if track_only:
+            return None
+        if range_mode == "triple":
+            return (
+                f"mode TRIPLE "
+                f"{range_bands[0].z_near_m:.0f}…{range_bands[-1].z_far_m:.0f}m"
+            )
+        if range_mode == "bands":
+            b = range_bands[band_index]
+            return (
+                f"mode BAND {band_index + 1}/{len(range_bands)} "
+                f"{b.z_near_m:.0f}–{b.z_far_m:.0f}m"
+            )
+        return "mode AUTO"
+
+    def apply_band(idx: int) -> None:
+        nonlocal band_index, range_mode, long_range, uniqueness
+        nonlocal disp_min, disp_num, matcher
+        nonlocal max_disp_cap, min_disp_floor, max_distance_mm, auto_disp
+        nonlocal sgbm_future, disp_float
+        if track_only or not band_states:
+            return
+        band_index = int(idx) % len(band_states)
+        range_mode = "bands"
+        auto_disp = False
+        st = band_states[band_index]
+        band = st["band"]
+        args.z_near = band.z_near_m
+        args.z_far = band.z_far_m
+        long_range = band.long_range
+        uniqueness = st["uniqueness"]
+        disp_min, disp_num = st["disp_min"], st["disp_num"]
+        matcher = st["matcher"]
+        max_disp_cap = st["max_disp_cap"]
+        min_disp_floor = st["min_disp_floor"]
+        max_distance_mm = st["max_distance_mm"]
+        dist_smoother.max_distance_mm = max_distance_mm
+        if sgbm_future is not None:
+            try:
+                sgbm_future.result(timeout=2)
+            except Exception:
+                pass
+            sgbm_future = None
+        disp_float = None
+        print(f"Полоса [{band_index}] {band.label}")
 
     print("R — выбрать объект рамкой, C — кликом (авто-границы). В любой момент.")
     print("X — отменить трекинг (во время трека и при потере цели).")
+    print("[ / ] — полоса дистанции; T — тройной режим; A — auto.")
     base_label = tracker_kind.upper()
     if tracker_kind == "ncc":
         base_label = "NCC(Kornia-style)"
@@ -1618,9 +1948,15 @@ def main() -> None:
 
                     # 1) prepare
                     rect_l, rect_r = prepare_pair(
-                        frame_l, frame_r, calib, prep_pool, clahe=args.clahe
+                        frame_l,
+                        frame_r,
+                        calib,
+                        prep_pool,
+                        clahe=args.clahe,
+                        force_gray=args.gray,
                     )
-                    rect_l_bgr = cv2.cvtColor(rect_l, cv2.COLOR_GRAY2BGR)
+                    rect_l_bgr = rect_to_bgr(rect_l)
+                    gray_l, gray_r = stereo_gray_pair(rect_l, rect_r)
 
                     # 2) track
                     if tracker.initialized:
@@ -1628,97 +1964,127 @@ def main() -> None:
 
                     # 3) depth (только при живом треке)
                     if not track_only and tracker.initialized and tracking_ok:
-                        if sgbm_future is not None and sgbm_future.done():
-                            disp_float = sgbm_future.result()
-                            sgbm_future = None
-
                         need_sgbm = frame_idx % args.sgbm_interval == 0
-                        if need_sgbm:
-                            if sgbm_pool is not None:
-                                if sgbm_future is None or sgbm_future.done():
-                                    if sgbm_future is not None and sgbm_future.done():
-                                        disp_float = sgbm_future.result()
-                                    sgbm_future = sgbm_pool.submit(
-                                        compute_disparity,
-                                        rect_l.copy(),
-                                        rect_r.copy(),
+
+                        if range_mode == "triple" and band_states and roi is not None:
+                            if need_sgbm:
+                                dist, disp_val, _per_d, disp_float = (
+                                    measure_triple_band_point(
+                                        gray_l=gray_l,
+                                        gray_r=gray_r,
+                                        roi=roi,
+                                        band_states=band_states,
+                                        calib=calib,
+                                        Q=Q,
+                                        args=args,
+                                        left_gray=gray_l,
+                                        right_gray=gray_r,
+                                        epipolar_ncc=True,
+                                        wls=args.wls,
+                                        wls_lambda=args.wls_lambda,
+                                        wls_sigma=args.wls_sigma,
+                                    )
+                                )
+                                dist_s, disp_s = dist_smoother.update(dist, disp_val)
+                                if disp_s is not None:
+                                    disp_val = disp_s
+                                disp_debug = None
+                            else:
+                                dist_s, disp_s = dist_smoother.update(None, None)
+                                if disp_s is not None:
+                                    disp_val = disp_s
+                                dist = None
+                        else:
+                            if sgbm_future is not None and sgbm_future.done():
+                                disp_float = sgbm_future.result()
+                                sgbm_future = None
+
+                            if need_sgbm:
+                                if sgbm_pool is not None:
+                                    if sgbm_future is None or sgbm_future.done():
+                                        if sgbm_future is not None and sgbm_future.done():
+                                            disp_float = sgbm_future.result()
+                                        sgbm_future = sgbm_pool.submit(
+                                            compute_disparity,
+                                            gray_l.copy(),
+                                            gray_r.copy(),
+                                            matcher,
+                                            wls=args.wls,
+                                            wls_lambda=args.wls_lambda,
+                                            wls_sigma=args.wls_sigma,
+                                        )
+                                else:
+                                    disp_float = compute_disparity(
+                                        gray_l,
+                                        gray_r,
                                         matcher,
                                         wls=args.wls,
                                         wls_lambda=args.wls_lambda,
                                         wls_sigma=args.wls_sigma,
                                     )
-                            else:
-                                disp_float = compute_disparity(
-                                    rect_l,
-                                    rect_r,
-                                    matcher,
-                                    wls=args.wls,
-                                    wls_lambda=args.wls_lambda,
-                                    wls_sigma=args.wls_sigma,
-                                )
 
-                        if roi is not None and disp_float is not None:
-                            if sgbm_future is not None and sgbm_future.done():
-                                disp_float = sgbm_future.result()
-                                sgbm_future = None
-                            rx, ry, rw, rh = (int(v) for v in roi)
-                            roi_cxy = (rx + rw // 2, ry + rh // 2)
-                            disp_id = id(disp_float)
-                            roi_moved = (
-                                last_ncc_roi_cxy is None
-                                or abs(roi_cxy[0] - last_ncc_roi_cxy[0]) >= 10
-                                or abs(roi_cxy[1] - last_ncc_roi_cxy[1]) >= 8
-                            )
-                            run_ncc = (
-                                debug_disparity
-                                or disp_id != last_ncc_disp_id
-                                or roi_moved
-                            )
-                            if run_ncc:
-                                last_ncc_disp_id = disp_id
-                                last_ncc_roi_cxy = roi_cxy
-                            dist_s, disp_val, dist, disp_debug = _measure_and_smooth(
-                                disp_float=disp_float,
-                                roi=roi,
-                                Q=Q,
-                                args=args,
-                                max_disp_cap=max_disp_cap,
-                                min_disp_floor=min_disp_floor,
-                                max_distance_mm=max_distance_mm,
-                                dist_smoother=dist_smoother,
-                                collect_debug=debug_disparity,
-                                left_gray=rect_l,
-                                right_gray=rect_r,
-                                epipolar_ncc=run_ncc,
-                            )
-                            if auto_disp and (
-                                sgbm_future is None or sgbm_future.done()
-                            ):
-                                disp_min, disp_num, matcher = _maybe_adapt_matcher(
-                                    auto_disp=auto_disp,
-                                    calib=calib,
-                                    args=args,
-                                    rect_w=int(rect_l.shape[1]),
-                                    disp_min=disp_min,
-                                    disp_num=disp_num,
-                                    dist_s=dist_s,
-                                    dist=dist,
-                                    disp_val=disp_val,
-                                    long_range=long_range,
-                                    uniqueness=uniqueness,
-                                    matcher=matcher,
+                            if roi is not None and disp_float is not None:
+                                if sgbm_future is not None and sgbm_future.done():
+                                    disp_float = sgbm_future.result()
+                                    sgbm_future = None
+                                rx, ry, rw, rh = (int(v) for v in roi)
+                                roi_cxy = (rx + rw // 2, ry + rh // 2)
+                                disp_id = id(disp_float)
+                                roi_moved = (
+                                    last_ncc_roi_cxy is None
+                                    or abs(roi_cxy[0] - last_ncc_roi_cxy[0]) >= 10
+                                    or abs(roi_cxy[1] - last_ncc_roi_cxy[1]) >= 8
                                 )
-                        else:
-                            dist_s, disp_val, _, disp_debug = _measure_and_smooth(
-                                disp_float=None,
-                                roi=None,
-                                Q=Q,
-                                args=args,
-                                max_disp_cap=max_disp_cap,
-                                min_disp_floor=min_disp_floor,
-                                max_distance_mm=max_distance_mm,
-                                dist_smoother=dist_smoother,
-                            )
+                                run_ncc = (
+                                    debug_disparity
+                                    or disp_id != last_ncc_disp_id
+                                    or roi_moved
+                                )
+                                if run_ncc:
+                                    last_ncc_disp_id = disp_id
+                                    last_ncc_roi_cxy = roi_cxy
+                                dist_s, disp_val, dist, disp_debug = _measure_and_smooth(
+                                    disp_float=disp_float,
+                                    roi=roi,
+                                    Q=Q,
+                                    args=args,
+                                    max_disp_cap=max_disp_cap,
+                                    min_disp_floor=min_disp_floor,
+                                    max_distance_mm=max_distance_mm,
+                                    dist_smoother=dist_smoother,
+                                    collect_debug=debug_disparity,
+                                    left_gray=gray_l,
+                                    right_gray=gray_r,
+                                    epipolar_ncc=run_ncc,
+                                )
+                                if auto_disp and (
+                                    sgbm_future is None or sgbm_future.done()
+                                ):
+                                    disp_min, disp_num, matcher = _maybe_adapt_matcher(
+                                        auto_disp=auto_disp,
+                                        calib=calib,
+                                        args=args,
+                                        rect_w=int(rect_l.shape[1]),
+                                        disp_min=disp_min,
+                                        disp_num=disp_num,
+                                        dist_s=dist_s,
+                                        dist=dist,
+                                        disp_val=disp_val,
+                                        long_range=long_range,
+                                        uniqueness=uniqueness,
+                                        matcher=matcher,
+                                    )
+                            else:
+                                dist_s, disp_val, _, disp_debug = _measure_and_smooth(
+                                    disp_float=None,
+                                    roi=None,
+                                    Q=Q,
+                                    args=args,
+                                    max_disp_cap=max_disp_cap,
+                                    min_disp_floor=min_disp_floor,
+                                    max_distance_mm=max_distance_mm,
+                                    dist_smoother=dist_smoother,
+                                )
                     elif not track_only and tracker.initialized and not tracking_ok:
                         dist_s, disp_val, _, disp_debug = _measure_and_smooth(
                             disp_float=None,
@@ -1763,6 +2129,7 @@ def main() -> None:
                     sgbm_busy=sgbm_busy,
                     disp_range=(disp_min, disp_num) if not track_only else None,
                     speed_mps=speed_mps if speed_est is not None else None,
+                    mode_label=range_mode_label(),
                 )
                 if debug_disparity:
                     overlay = _annotate_debug_flag(overlay)
@@ -1770,7 +2137,19 @@ def main() -> None:
                     writer.write(overlay)
 
                 if debug_disparity and disp_debug is not None and rect_r is not None:
-                    rect_r_bgr = cv2.cvtColor(rect_r, cv2.COLOR_GRAY2BGR)
+                    ix, iy, iw, ih = disp_debug.inset_roi
+                    cx_raw = float(ix) + 0.5 * float(iw)
+                    cy_raw = float(iy) + 0.5 * float(ih)
+                    if dbg_cross_ema is None:
+                        dbg_cross_ema = (cx_raw, cy_raw)
+                    else:
+                        a = 0.22
+                        dbg_cross_ema = (
+                            (1.0 - a) * dbg_cross_ema[0] + a * cx_raw,
+                            (1.0 - a) * dbg_cross_ema[1] + a * cy_raw,
+                        )
+                    disp_debug.cross_xy = dbg_cross_ema
+                    rect_r_bgr = rect_to_bgr(rect_r)
                     dbg_vis = draw_disparity_debug(
                         rect_l_bgr,
                         rect_r_bgr,
@@ -1820,6 +2199,7 @@ def main() -> None:
                     disp_s = None
                     disp_val = None
                     disp_debug = None
+                    dbg_cross_ema = None
                     speed_mps = None
                     print("Трекинг отменён. R/C — выбрать объект заново.")
                     base = rect_l_bgr if rect_l_bgr is not None else overlay
@@ -1835,6 +2215,7 @@ def main() -> None:
                             sgbm_busy=False,
                             disp_range=(disp_min, disp_num) if not track_only else None,
                             speed_mps=None,
+                            mode_label=range_mode_label(),
                         )
                         cv2.imshow(
                             window,
@@ -1853,6 +2234,122 @@ def main() -> None:
                         cv2.destroyWindow(debug_window)
                     except cv2.error:
                         pass
+            if key in (ord("["), ord(",")) and not track_only:
+                if not band_states and calib is not None:
+                    band_states = [
+                        build_band_matcher(
+                            calib,
+                            band,
+                            image_width=int(rect_l.shape[1]),
+                            method=args.method,
+                            block_size=args.block_size,
+                        )
+                        for band in range_bands
+                    ]
+                apply_band(band_index - 1)
+            if key in (ord("]"), ord(".")) and not track_only:
+                if not band_states and calib is not None:
+                    band_states = [
+                        build_band_matcher(
+                            calib,
+                            band,
+                            image_width=int(rect_l.shape[1]),
+                            method=args.method,
+                            block_size=args.block_size,
+                        )
+                        for band in range_bands
+                    ]
+                apply_band(band_index + 1)
+            if key in (ord("t"), ord("T")) and not track_only and calib is not None:
+                if not band_states:
+                    band_states = [
+                        build_band_matcher(
+                            calib,
+                            band,
+                            image_width=int(rect_l.shape[1]),
+                            method=args.method,
+                            block_size=args.block_size,
+                        )
+                        for band in range_bands
+                    ]
+                if range_mode == "triple":
+                    apply_band(band_index)
+                    print("Тройной режим выключен → полосы.")
+                else:
+                    range_mode = "triple"
+                    auto_disp = False
+                    if sgbm_future is not None:
+                        try:
+                            sgbm_future.result(timeout=2)
+                        except Exception:
+                            pass
+                        sgbm_future = None
+                    disp_float = None
+                    st_far = band_states[-1]
+                    args.z_near = range_bands[0].z_near_m
+                    args.z_far = range_bands[-1].z_far_m
+                    long_range = any(b.long_range for b in range_bands)
+                    uniqueness = st_far["uniqueness"]
+                    disp_min, disp_num = st_far["disp_min"], st_far["disp_num"]
+                    matcher = st_far["matcher"]
+                    max_disp_cap = max(st["max_disp_cap"] for st in band_states)
+                    min_disp_floor = min(st["min_disp_floor"] for st in band_states)
+                    max_distance_mm = max(st["max_distance_mm"] for st in band_states)
+                    dist_smoother.max_distance_mm = max_distance_mm
+                    print(
+                        "Тройной режим: 3 полосы → выброс → среднее d "
+                        f"({range_bands[0].z_near_m:.0f}…{range_bands[-1].z_far_m:.0f} м)."
+                    )
+            if key in (ord("a"), ord("A")) and not track_only and calib is not None:
+                range_mode = "auto"
+                auto_disp = bool(args.auto_disparity)
+                args.z_near = z_near_auto
+                args.z_far = z_far_auto
+                long_range = bool(args.long_range)
+                uniqueness = 12 if long_range else 5
+                img_w = int(rect_l.shape[1])
+                if auto_disp:
+                    disp_min, disp_num, range_log = estimate_disparity_range_bounds(
+                        calib,
+                        args.z_near,
+                        args.z_far,
+                        image_width=img_w,
+                        long_range=long_range,
+                    )
+                    max_num = 96 if long_range else 512
+                    disp_min, disp_num = clamp_sgbm_range(
+                        disp_min, disp_num, img_w, max_num=max_num
+                    )
+                    print(range_log)
+                matcher = make_stereo_matcher(
+                    args.method,
+                    disp_min,
+                    disp_num,
+                    args.block_size,
+                    uniqueness_ratio=uniqueness,
+                    speckle_window_size=40 if long_range else 50,
+                )
+                try:
+                    focal, baseline = extract_calib_geometry(calib)
+                    max_disp_cap = disparity_from_depth(
+                        focal, baseline, args.z_near * 1000.0
+                    ) * 1.05
+                    d_far = disparity_from_depth(
+                        focal, baseline, args.z_far * 1000.0
+                    )
+                    min_disp_floor = max(0.85, float(d_far) * 0.75)
+                    max_distance_mm = float(args.z_far) * 1000.0 * 1.15
+                    dist_smoother.max_distance_mm = max_distance_mm
+                except Exception:
+                    pass
+                if sgbm_future is not None:
+                    try:
+                        sgbm_future.result(timeout=2)
+                    except Exception:
+                        pass
+                    sgbm_future = None
+                disp_float = None
+                print("Режим AUTO-диспаритета.")
             if key in (ord("r"), ord("R"), ord("c"), ord("C")):
                 by_click = key in (ord("c"), ord("C"))
                 print(
@@ -1893,11 +2390,13 @@ def main() -> None:
                         speed_est.reset()
                     dist_s = None
                     disp_s = None
+                    dbg_cross_ema = None
                     speed_mps = None
                     if not track_only and matcher is not None:
+                        gray_l, gray_r = stereo_gray_pair(rect_l, rect_r)
                         disp_float = compute_disparity(
-                            rect_l,
-                            rect_r,
+                            gray_l,
+                            gray_r,
                             matcher,
                             wls=args.wls,
                             wls_lambda=args.wls_lambda,
@@ -1913,8 +2412,8 @@ def main() -> None:
                             max_distance_mm=max_distance_mm,
                             dist_smoother=dist_smoother,
                             collect_debug=debug_disparity,
-                            left_gray=rect_l,
-                            right_gray=rect_r,
+                            left_gray=gray_l,
+                            right_gray=gray_r,
                         )
                         disp_min, disp_num, matcher = _maybe_adapt_matcher(
                             auto_disp=auto_disp,

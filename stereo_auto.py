@@ -2,10 +2,117 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Sequence
+
 import cv2
 import numpy as np
 
 from stereo_filters import valid_disparity_mask
+
+# Три полосы по умолчанию: 100–500 / 500–1000 / 1000–3000 м.
+DEFAULT_RANGE_BAND_EDGES: tuple[float, ...] = (100.0, 500.0, 1000.0, 3000.0)
+
+
+@dataclass(frozen=True)
+class RangeBand:
+    """Одна дистанция-полоса для SGBM (альтернатива непрерывному auto)."""
+
+    index: int
+    name: str
+    z_near_m: float
+    z_far_m: float
+    long_range: bool
+
+    @property
+    def label(self) -> str:
+        return f"{self.name} {self.z_near_m:.0f}–{self.z_far_m:.0f} м"
+
+
+def parse_band_edges(value: str | Sequence[float]) -> tuple[float, ...]:
+    """Парсит границы полос: нужно N+1 чисел → N полос (по умолчанию 4 полосы → 5 краёв)."""
+    if isinstance(value, str):
+        parts = [p.strip() for p in value.replace(";", ",").split(",") if p.strip()]
+        edges = tuple(float(p) for p in parts)
+    else:
+        edges = tuple(float(v) for v in value)
+    if len(edges) < 4:
+        raise ValueError(
+            "Нужно ≥4 границы полос (для 3 режимов), напр. 100,500,1000,3000."
+        )
+    for i in range(1, len(edges)):
+        if edges[i] <= edges[i - 1]:
+            raise ValueError("Границы полос должны строго возрастать.")
+    if edges[0] <= 0:
+        raise ValueError("Первая граница полосы должна быть > 0.")
+    return edges
+
+
+def make_range_bands(
+    edges: Sequence[float] | None = None,
+) -> list[RangeBand]:
+    """Строит полосы [e0–e1], [e1–e2], … Дальняя полоса — long_range."""
+    e = parse_band_edges(edges if edges is not None else DEFAULT_RANGE_BAND_EDGES)
+    names = ("near", "mid", "far")
+    bands: list[RangeBand] = []
+    n = len(e) - 1
+    for i in range(n):
+        z0, z1 = float(e[i]), float(e[i + 1])
+        name = names[i] if i < len(names) else f"band{i}"
+        # Дальняя полоса и всё с z_near ≥ 800 м — long-range потолок numDisp.
+        long_range = bool(i == n - 1 or z0 >= 800.0)
+        bands.append(
+            RangeBand(
+                index=i,
+                name=name,
+                z_near_m=z0,
+                z_far_m=z1,
+                long_range=long_range,
+            )
+        )
+    return bands
+
+
+def fuse_point_disparities(
+    values: Sequence[float | None],
+    *,
+    min_valid: float = 0.35,
+) -> float | None:
+    """Среднее валидных оценок d в точке (без отсева выбросов)."""
+    vals = [
+        float(v)
+        for v in values
+        if v is not None and np.isfinite(v) and float(v) >= min_valid
+    ]
+    if not vals:
+        return None
+    return float(np.mean(vals))
+
+
+def distance_mm_from_disparity(
+    calib: dict,
+    disparity_px: float,
+) -> float | None:
+    """Z = f·B / d (мм) по геометрии калибровки."""
+    if disparity_px is None or not np.isfinite(disparity_px) or disparity_px < 0.35:
+        return None
+    focal, baseline = extract_calib_geometry(calib)
+    return float(focal * baseline / float(disparity_px))
+
+
+def band_measurement_caps(
+    calib: dict,
+    band: RangeBand,
+) -> tuple[float, float, float]:
+    """(max_disp_cap, min_disp_floor, max_distance_mm) для полосы."""
+    focal, baseline = extract_calib_geometry(calib)
+    max_disp_cap = (
+        disparity_from_depth(focal, baseline, band.z_near_m * 1000.0) * 1.05
+    )
+    d_far = disparity_from_depth(focal, baseline, band.z_far_m * 1000.0)
+    min_disp_floor = max(0.85, float(d_far) * 0.75)
+    max_distance_mm = float(band.z_far_m) * 1000.0 * 1.15
+    return float(max_disp_cap), float(min_disp_floor), float(max_distance_mm)
 
 
 def extract_calib_geometry(calib: dict) -> tuple[float, float]:

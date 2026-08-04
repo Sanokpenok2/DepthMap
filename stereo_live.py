@@ -11,6 +11,7 @@ import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Callable
 
 import cv2
@@ -19,18 +20,26 @@ import numpy as np
 from depth_map import load_calibration, measure_roi_distance
 from object_tracker import ObjectTracker
 from stereo_auto import (
+    RangeBand,
     clamp_sgbm_range,
     disparity_from_depth,
     estimate_disparity_range_bounds,
     extract_calib_geometry,
+    make_range_bands,
+    parse_band_edges,
+    DEFAULT_RANGE_BAND_EDGES,
 )
 from video_track_depth import (
     DistanceSmoother,
     adapt_disparity_range,
+    build_band_matcher,
     compute_disparity,
     draw_overlay,
     make_stereo_matcher,
+    measure_triple_band_point,
     prepare_pair,
+    rect_to_bgr,
+    stereo_gray_pair,
 )
 
 
@@ -46,6 +55,9 @@ class LiveStatus:
     disp_num: int = 128
     sgbm_busy: bool = False
     message: str = ""
+    range_mode: str = "auto"
+    band_index: int = 0
+    band_label: str = ""
 
 
 class LiveTrackDepthController:
@@ -67,13 +79,19 @@ class LiveTrackDepthController:
         block_size: int = 7,
         wls: bool = False,
         clahe: bool = True,
+        force_gray: bool = True,
         roi_inset: float = 0.32,
         surface: str = "far",
         long_range: bool | None = None,
+        range_mode: str = "auto",
+        band_edges: tuple[float, ...] | str | None = None,
+        band_index: int = 0,
         on_log: Callable[[str], None] | None = None,
     ) -> None:
         self.z_near_m = float(z_near_m)
         self.z_far_m = float(z_far_m)
+        self._z_near_auto = float(z_near_m)
+        self._z_far_auto = float(z_far_m)
         self.auto_disparity = bool(auto_disparity)
         self.sgbm_interval = max(1, int(sgbm_interval))
         self.smooth_window = int(smooth_window)
@@ -85,6 +103,7 @@ class LiveTrackDepthController:
         self.block_size = int(block_size)
         self.wls = bool(wls)
         self.clahe = bool(clahe)
+        self.force_gray = bool(force_gray)
         self.roi_inset = float(roi_inset)
         self.surface = str(surface)
         # None / не задано → long-range выключен (только явный флаг).
@@ -95,6 +114,21 @@ class LiveTrackDepthController:
         self.max_distance_mm: float | None = self.z_far_m * 1000.0 * 1.15
         self.uniqueness = 12 if self.long_range else 5
         self._on_log = on_log
+
+        self.range_mode = str(range_mode)
+        if self.range_mode not in ("auto", "bands", "triple"):
+            self.range_mode = "auto"
+        try:
+            edges = parse_band_edges(
+                band_edges if band_edges is not None else DEFAULT_RANGE_BAND_EDGES
+            )
+        except ValueError:
+            edges = DEFAULT_RANGE_BAND_EDGES
+        self.range_bands: list[RangeBand] = make_range_bands(edges)
+        self.band_index = int(
+            np.clip(band_index, 0, max(0, len(self.range_bands) - 1))
+        )
+        self._band_states: list[dict] = []
 
         self._lock = threading.RLock()
         self.enabled = False
@@ -170,17 +204,176 @@ class LiveTrackDepthController:
             raise ValueError("Нужно 0 < z_near_m < z_far_m.")
         self.z_near_m = float(z_near_m)
         self.z_far_m = float(z_far_m)
+        self._z_near_auto = float(z_near_m)
+        self._z_far_auto = float(z_far_m)
         self._long_range_pref = long_range
         self.long_range = self._resolve_long_range(long_range)
         self.uniqueness = 12 if self.long_range else 5
         self.max_distance_mm = self.z_far_m * 1000.0 * 1.15
         self.dist_smoother.max_distance_mm = self.max_distance_mm
-        self._log(
-            f"Сцена: z={self.z_near_m:.0f}–{self.z_far_m:.0f} м "
-            f"(long_range={self.long_range})."
+        if self.range_mode == "auto":
+            self._log(
+                f"Сцена: z={self.z_near_m:.0f}–{self.z_far_m:.0f} м "
+                f"(long_range={self.long_range})."
+            )
+            if self.calib is not None:
+                self._rebuild_matcher_from_calib("reconfigure")
+
+    def set_band_edges(self, edges: str | tuple[float, ...] | list[float]) -> None:
+        """Задать границы полос (м), напр. '100,500,1000,3000'."""
+        parsed = parse_band_edges(edges)
+        self.range_bands = make_range_bands(parsed)
+        self.band_index = int(
+            np.clip(self.band_index, 0, max(0, len(self.range_bands) - 1))
         )
-        if self.calib is not None:
-            self._rebuild_matcher_from_calib("reconfigure")
+        self._band_states = []
+        self._log(
+            "Полосы: "
+            + " | ".join(
+                f"{b.z_near_m:.0f}–{b.z_far_m:.0f}" for b in self.range_bands
+            )
+        )
+        if self.calib is not None and self.range_mode in ("bands", "triple"):
+            self._ensure_band_states()
+            if self.range_mode == "bands":
+                self.apply_band(self.band_index)
+            else:
+                self.set_range_mode("triple")
+
+    def range_mode_label(self) -> str:
+        if self.range_mode == "triple":
+            return (
+                f"TRIPLE "
+                f"{self.range_bands[0].z_near_m:.0f}…"
+                f"{self.range_bands[-1].z_far_m:.0f}m"
+            )
+        if self.range_mode == "bands" and self.range_bands:
+            b = self.range_bands[self.band_index]
+            return (
+                f"BAND {self.band_index + 1}/{len(self.range_bands)} "
+                f"{b.z_near_m:.0f}–{b.z_far_m:.0f}m"
+            )
+        return "AUTO"
+
+    def _ensure_band_states(self) -> None:
+        if self.calib is None:
+            return
+        if self._band_states and len(self._band_states) == len(self.range_bands):
+            return
+        width = 640
+        if "image_size" in self.calib:
+            width = int(self.calib["image_size"][0])
+        if self._last_rect_l is not None:
+            width = int(self._last_rect_l.shape[1])
+        self._band_states = [
+            build_band_matcher(
+                self.calib,
+                band,
+                image_width=width,
+                method=self.method,
+                block_size=self.block_size,
+            )
+            for band in self.range_bands
+        ]
+
+    def apply_band(self, index: int) -> None:
+        """Включить одну полосу (выключает auto/triple)."""
+        if not self.range_bands:
+            return
+        self._ensure_band_states()
+        if not self._band_states:
+            self._log("Нет калибровки для полос.")
+            return
+        self.band_index = int(index) % len(self._band_states)
+        self.range_mode = "bands"
+        self.auto_disparity = False
+        st = self._band_states[self.band_index]
+        band = st["band"]
+        self.z_near_m = band.z_near_m
+        self.z_far_m = band.z_far_m
+        self.long_range = band.long_range
+        self.uniqueness = st["uniqueness"]
+        with self._lock:
+            self.disp_min = st["disp_min"]
+            self.disp_num = st["disp_num"]
+            self.matcher = st["matcher"]
+            self._disp_float = None
+            fut = self._sgbm_future
+            self._sgbm_future = None
+        if fut is not None:
+            try:
+                fut.result(timeout=2)
+            except Exception:
+                pass
+        self.max_disp_cap = st["max_disp_cap"]
+        self.min_disp_floor = st["min_disp_floor"]
+        self.max_distance_mm = st["max_distance_mm"]
+        self.dist_smoother.max_distance_mm = self.max_distance_mm
+        self._log(f"Полоса [{self.band_index}] {band.label}")
+
+    def cycle_band(self, delta: int = 1) -> None:
+        if self.range_mode != "bands":
+            self.apply_band(self.band_index)
+            return
+        self.apply_band(self.band_index + int(delta))
+
+    def set_range_mode(self, mode: str) -> None:
+        mode = str(mode).lower()
+        if mode not in ("auto", "bands", "triple"):
+            raise ValueError("mode: auto | bands | triple")
+        if mode == "auto":
+            self.range_mode = "auto"
+            self.auto_disparity = True
+            self.z_near_m = self._z_near_auto
+            self.z_far_m = self._z_far_auto
+            self.long_range = self._resolve_long_range(self._long_range_pref)
+            self.uniqueness = 12 if self.long_range else 5
+            self._log("Режим AUTO-диспаритета.")
+            if self.calib is not None:
+                self._rebuild_matcher_from_calib("auto")
+            return
+        if mode == "bands":
+            self.apply_band(self.band_index)
+            return
+        # triple
+        self._ensure_band_states()
+        if not self._band_states:
+            self._log("Нет калибровки для тройного режима.")
+            return
+        self.range_mode = "triple"
+        self.auto_disparity = False
+        st_far = self._band_states[-1]
+        self.z_near_m = self.range_bands[0].z_near_m
+        self.z_far_m = self.range_bands[-1].z_far_m
+        self.long_range = any(b.long_range for b in self.range_bands)
+        self.uniqueness = st_far["uniqueness"]
+        with self._lock:
+            self.disp_min = st_far["disp_min"]
+            self.disp_num = st_far["disp_num"]
+            self.matcher = st_far["matcher"]
+            self._disp_float = None
+            fut = self._sgbm_future
+            self._sgbm_future = None
+        if fut is not None:
+            try:
+                fut.result(timeout=2)
+            except Exception:
+                pass
+        self.max_disp_cap = max(st["max_disp_cap"] for st in self._band_states)
+        self.min_disp_floor = min(st["min_disp_floor"] for st in self._band_states)
+        self.max_distance_mm = max(st["max_distance_mm"] for st in self._band_states)
+        self.dist_smoother.max_distance_mm = self.max_distance_mm
+        self._log(
+            "Тройной режим: 3 полосы → выброс → среднее d "
+            f"({self.range_bands[0].z_near_m:.0f}…"
+            f"{self.range_bands[-1].z_far_m:.0f} м)."
+        )
+
+    def toggle_triple(self) -> None:
+        if self.range_mode == "triple":
+            self.set_range_mode("bands")
+        else:
+            self.set_range_mode("triple")
 
     def _log(self, msg: str) -> None:
         self._status_msg = msg
@@ -201,11 +394,11 @@ class LiveTrackDepthController:
 
     def load_calib(self, path: str) -> None:
         calib = load_calibration(path)
-        self._rebuild_matcher_from_calib(path, calib=calib)
         with self._lock:
             self.calib = calib
             self.Q = calib["Q"]
             self.track_only = False
+        self._rebuild_matcher_from_calib(path, calib=calib)
         self._log(f"Калибровка загружена: {path}")
 
     def _rebuild_matcher_from_calib(
@@ -218,10 +411,52 @@ class LiveTrackDepthController:
         width = 640
         if "image_size" in calib:
             width = int(calib["image_size"][0])
+        if self.range_mode in ("bands", "triple"):
+            self._band_states = [
+                build_band_matcher(
+                    calib,
+                    band,
+                    image_width=width,
+                    method=self.method,
+                    block_size=self.block_size,
+                )
+                for band in self.range_bands
+            ]
+            for st in self._band_states:
+                self._log(st["log"])
+            if self.range_mode == "bands":
+                self.apply_band(self.band_index)
+            else:
+                # apply triple caps without recursive set_range_mode rebuild
+                st_far = self._band_states[-1]
+                self.z_near_m = self.range_bands[0].z_near_m
+                self.z_far_m = self.range_bands[-1].z_far_m
+                self.long_range = any(b.long_range for b in self.range_bands)
+                self.uniqueness = st_far["uniqueness"]
+                self.max_disp_cap = max(st["max_disp_cap"] for st in self._band_states)
+                self.min_disp_floor = min(
+                    st["min_disp_floor"] for st in self._band_states
+                )
+                self.max_distance_mm = max(
+                    st["max_distance_mm"] for st in self._band_states
+                )
+                self.dist_smoother.max_distance_mm = self.max_distance_mm
+                with self._lock:
+                    self.disp_min = st_far["disp_min"]
+                    self.disp_num = st_far["disp_num"]
+                    self.matcher = st_far["matcher"]
+                self._log(
+                    "Тройной режим готов "
+                    f"({self.range_bands[0].z_near_m:.0f}…"
+                    f"{self.range_bands[-1].z_far_m:.0f} м)."
+                )
+            return
+
         self.long_range = self._resolve_long_range(self._long_range_pref)
         self.uniqueness = 12 if self.long_range else 5
         disp_min, disp_num = 0, 48
-        if self.auto_disparity:
+        use_auto = self.auto_disparity and self.range_mode == "auto"
+        if use_auto:
             disp_min, disp_num, range_log = estimate_disparity_range_bounds(
                 calib,
                 self.z_near_m,
@@ -324,6 +559,9 @@ class LiveTrackDepthController:
                     self._sgbm_future is not None and not self._sgbm_future.done()
                 ),
                 message=self._status_msg,
+                range_mode=self.range_mode,
+                band_index=self.band_index,
+                band_label=self.range_mode_label(),
             )
 
     def last_overlay(self) -> np.ndarray | None:
@@ -332,11 +570,20 @@ class LiveTrackDepthController:
                 return None
             return self._last_overlay.copy()
 
+    def set_force_gray(self, enabled: bool) -> None:
+        """Вкл/выкл принудительный перевод кадров в gray (для UI)."""
+        with self._lock:
+            self.force_gray = bool(enabled)
+
+    def set_clahe(self, enabled: bool) -> None:
+        with self._lock:
+            self.clahe = bool(enabled)
+
     def _snapshot_rect_left(self) -> np.ndarray | None:
         with self._lock:
             if self._last_rect_l is None:
                 return None
-            return cv2.cvtColor(self._last_rect_l, cv2.COLOR_GRAY2BGR)
+            return rect_to_bgr(self._last_rect_l)
 
     def init_roi_box(self, max_display: int = 1200) -> bool:
         snap = self._snapshot_rect_left()
@@ -442,10 +689,19 @@ class LiveTrackDepthController:
             track_only = self.track_only or matcher is None or calib is None
             disp_min, disp_num = self.disp_min, self.disp_num
 
+        with self._lock:
+            use_clahe = self.clahe
+            use_gray = self.force_gray
         rect_l, rect_r = prepare_pair(
-            frame_l, frame_r, calib, self._prep_pool, clahe=self.clahe
+            frame_l,
+            frame_r,
+            calib,
+            self._prep_pool,
+            clahe=use_clahe,
+            force_gray=use_gray,
         )
-        rect_l_bgr = cv2.cvtColor(rect_l, cv2.COLOR_GRAY2BGR)
+        rect_l_bgr = rect_to_bgr(rect_l)
+        gray_l, gray_r = stereo_gray_pair(rect_l, rect_r)
 
         with self._lock:
             self._last_rect_l = rect_l
@@ -464,96 +720,128 @@ class LiveTrackDepthController:
         sgbm_busy = False
 
         if not track_only and self.tracker.initialized and tracking_ok and matcher is not None:
-            with self._lock:
-                fut = self._sgbm_future
-            if fut is not None and fut.done():
-                try:
-                    self._disp_float = fut.result()
-                except Exception as exc:
-                    self._log(f"SGBM ошибка: {exc}")
-                with self._lock:
-                    self._sgbm_future = None
-
             need_sgbm = self.frame_idx % self.sgbm_interval == 0
-            with self._lock:
-                fut = self._sgbm_future
-            if need_sgbm and (fut is None or fut.done()):
+
+            if self.range_mode == "triple":
+                self._ensure_band_states()
+                if need_sgbm and roi is not None and self._band_states:
+                    measure_args = SimpleNamespace(
+                        roi_inset=self.roi_inset,
+                        surface=self.surface,
+                    )
+                    dist, disp_val, _per, disp_map = measure_triple_band_point(
+                        gray_l=gray_l,
+                        gray_r=gray_r,
+                        roi=roi,
+                        band_states=self._band_states,
+                        calib=calib,
+                        Q=self.Q,
+                        args=measure_args,
+                        left_gray=gray_l,
+                        right_gray=gray_r,
+                        epipolar_ncc=True,
+                        wls=self.wls,
+                    )
+                    if disp_map is not None:
+                        self._disp_float = disp_map
+                    dist_s, disp_s = self.dist_smoother.update(dist, disp_val)
+                    if disp_s is not None:
+                        disp_val = disp_s
+                else:
+                    dist_s, disp_s = self.dist_smoother.update(None, None)
+                    if disp_s is not None:
+                        disp_val = disp_s
+            else:
+                with self._lock:
+                    fut = self._sgbm_future
                 if fut is not None and fut.done():
                     try:
                         self._disp_float = fut.result()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        self._log(f"SGBM ошибка: {exc}")
                     with self._lock:
                         self._sgbm_future = None
+
                 with self._lock:
-                    matcher_now = self.matcher
-                if matcher_now is not None:
-                    self._sgbm_future = self._sgbm_pool.submit(
-                        compute_disparity,
-                        rect_l.copy(),
-                        rect_r.copy(),
-                        matcher_now,
-                        wls=self.wls,
-                        wls_lambda=8000.0,
-                        wls_sigma=1.5,
-                    )
-
-            with self._lock:
-                sgbm_busy = (
-                    self._sgbm_future is not None and not self._sgbm_future.done()
-                )
-                disp_float = self._disp_float
-
-            if roi is not None and disp_float is not None:
-                dist, disp_val = measure_roi_distance(
-                    disp_float,
-                    roi,
-                    Q=self.Q,
-                    inset_fraction=self.roi_inset,
-                    surface=self.surface,
-                    max_disparity=self.max_disp_cap,
-                    min_disparity=self.min_disp_floor,
-                    max_distance_mm=self.max_distance_mm,
-                    left_gray=rect_l,
-                    right_gray=rect_r,
-                    epipolar_ncc=True,
-                )
-                dist_s, disp_s = self.dist_smoother.update(dist, disp_val)
-                if disp_s is not None:
-                    disp_val = disp_s
-                if (
-                    self.auto_disparity
-                    and calib is not None
-                    and (self._sgbm_future is None or self._sgbm_future.done())
-                ):
-                    new_min, new_num, adapt_log = adapt_disparity_range(
-                        calib=calib,
-                        image_width=int(rect_l.shape[1]),
-                        z_near_m=self.z_near_m,
-                        z_far_m=self.z_far_m,
-                        cur_min=disp_min,
-                        cur_num=disp_num,
-                        distance_mm=dist_s if dist_s is not None else dist,
-                        disparity_px=disp_val,
-                        long_range=self.long_range,
-                    )
-                    if adapt_log is not None:
+                    fut = self._sgbm_future
+                if need_sgbm and (fut is None or fut.done()):
+                    if fut is not None and fut.done():
+                        try:
+                            self._disp_float = fut.result()
+                        except Exception:
+                            pass
                         with self._lock:
-                            self.disp_min, self.disp_num = new_min, new_num
-                            self.matcher = make_stereo_matcher(
-                                self.method,
-                                self.disp_min,
-                                self.disp_num,
-                                self.block_size,
-                                uniqueness_ratio=self.uniqueness,
-                                speckle_window_size=40 if self.long_range else 50,
-                            )
-                            disp_min, disp_num = new_min, new_num
-                        self._log(adapt_log)
-            else:
-                dist_s, disp_s = self.dist_smoother.update(None, None)
-                if disp_s is not None:
-                    disp_val = disp_s
+                            self._sgbm_future = None
+                    with self._lock:
+                        matcher_now = self.matcher
+                    if matcher_now is not None:
+                        self._sgbm_future = self._sgbm_pool.submit(
+                            compute_disparity,
+                            gray_l.copy(),
+                            gray_r.copy(),
+                            matcher_now,
+                            wls=self.wls,
+                            wls_lambda=8000.0,
+                            wls_sigma=1.5,
+                        )
+
+                with self._lock:
+                    sgbm_busy = (
+                        self._sgbm_future is not None and not self._sgbm_future.done()
+                    )
+                    disp_float = self._disp_float
+
+                if roi is not None and disp_float is not None:
+                    dist, disp_val = measure_roi_distance(
+                        disp_float,
+                        roi,
+                        Q=self.Q,
+                        inset_fraction=self.roi_inset,
+                        surface=self.surface,
+                        max_disparity=self.max_disp_cap,
+                        min_disparity=self.min_disp_floor,
+                        max_distance_mm=self.max_distance_mm,
+                        left_gray=gray_l,
+                        right_gray=gray_r,
+                        epipolar_ncc=True,
+                    )
+                    dist_s, disp_s = self.dist_smoother.update(dist, disp_val)
+                    if disp_s is not None:
+                        disp_val = disp_s
+                    if (
+                        self.auto_disparity
+                        and self.range_mode == "auto"
+                        and calib is not None
+                        and (self._sgbm_future is None or self._sgbm_future.done())
+                    ):
+                        new_min, new_num, adapt_log = adapt_disparity_range(
+                            calib=calib,
+                            image_width=int(rect_l.shape[1]),
+                            z_near_m=self.z_near_m,
+                            z_far_m=self.z_far_m,
+                            cur_min=disp_min,
+                            cur_num=disp_num,
+                            distance_mm=dist_s if dist_s is not None else dist,
+                            disparity_px=disp_val,
+                            long_range=self.long_range,
+                        )
+                        if adapt_log is not None:
+                            with self._lock:
+                                self.disp_min, self.disp_num = new_min, new_num
+                                self.matcher = make_stereo_matcher(
+                                    self.method,
+                                    self.disp_min,
+                                    self.disp_num,
+                                    self.block_size,
+                                    uniqueness_ratio=self.uniqueness,
+                                    speckle_window_size=40 if self.long_range else 50,
+                                )
+                                disp_min, disp_num = new_min, new_num
+                            self._log(adapt_log)
+                else:
+                    dist_s, disp_s = self.dist_smoother.update(None, None)
+                    if disp_s is not None:
+                        disp_val = disp_s
         elif self.tracker.initialized and not tracking_ok:
             dist_s, disp_s = self.dist_smoother.update(None, None)
             if disp_s is not None:
@@ -580,6 +868,7 @@ class LiveTrackDepthController:
             self.fps,
             sgbm_busy=sgbm_busy,
             disp_range=(disp_min, disp_num) if not track_only else None,
+            mode_label=self.range_mode_label() if not track_only else None,
         )
         self.frame_idx += 1
 

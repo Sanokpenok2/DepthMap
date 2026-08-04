@@ -1973,7 +1973,8 @@ class TrackViewWindow(QMainWindow):
         layout = QVBoxLayout(root)
         self.hint = QLabel(
             "Клик по объекту — трекинг сразу. "
-            "R — выделить рамкой (drag). Esc — отмена режима рамки. X — сброс трекера."
+            "R — рамка. Esc — отмена рамки. X — сброс. "
+            "[ / ] — полоса дистанции. T — тройной режим. A — auto."
         )
         self.hint.setWordWrap(True)
         layout.addWidget(self.hint)
@@ -1984,7 +1985,9 @@ class TrackViewWindow(QMainWindow):
         layout.addWidget(self.status)
         self.setCentralWidget(root)
         self.setStatusBar(QStatusBar())
-        self.statusBar().showMessage("Клик = цель | R = рамка")
+        self.statusBar().showMessage(
+            "Клик=цель | R=рамка | [/]=полоса | T=тройной | A=auto | X=сброс"
+        )
 
         self.video.box_mode_changed.connect(self._on_box_mode)
         QShortcut(QKeySequence("R"), self, activated=self._toggle_box_mode)
@@ -2003,10 +2006,13 @@ class TrackViewWindow(QMainWindow):
             self.statusBar().showMessage("Режим рамки: зажмите ЛКМ и выделите область")
             self.hint.setText("Режим рамки активен — тяните прямоугольник. Esc — отмена.")
         else:
-            self.statusBar().showMessage("Клик = цель | R = рамка")
+            self.statusBar().showMessage(
+                "Клик=цель | R=рамка | [/]=полоса | T=тройной | A=auto | X=сброс"
+            )
             self.hint.setText(
                 "Клик по объекту — трекинг сразу. "
-                "R — выделить рамкой (drag). Esc — отмена режима рамки. X — сброс трекера."
+                "R — рамка. Esc — отмена рамки. X — сброс. "
+                "[ / ] — полоса дистанции. T — тройной режим. A — auto."
             )
 
     def set_frame(self, frame: np.ndarray) -> None:
@@ -2246,27 +2252,75 @@ class MainWindow(QMainWindow):
         self.long_range_cb = QCheckBox("Long-range")
         self.long_range_cb.setToolTip(
             "Параметры SGBM для дальних сцен. Включается только этой галочкой "
-            "(z-far сам по себе long-range не включает)."
+            "(z-far сам по себе long-range не включает). Для режима Auto."
         )
         track.addWidget(self.long_range_cb, 3, 0, 1, 2)
         self.scene_apply_btn = QPushButton("Применить диапазон")
         self.scene_apply_btn.clicked.connect(lambda: self._apply_scene_range())
         track.addWidget(self.scene_apply_btn, 3, 2, 1, 2)
 
+        track.addWidget(QLabel("Режим дисп.:"), 4, 0)
+        self.range_mode_box = QComboBox()
+        self.range_mode_box.addItem("Auto (z-near/z-far)", "auto")
+        self.range_mode_box.addItem("Полосы ([/])", "bands")
+        self.range_mode_box.addItem("Тройной (выброс→среднее)", "triple")
+        self.range_mode_box.setToolTip(
+            "Auto — подбор по z-near/z-far. "
+            "Полосы — 3 диапазона, переключение [ / ]. "
+            "Тройной — 3 SGBM в точке, отброс выброса, среднее d."
+        )
+        self.range_mode_box.currentIndexChanged.connect(self._on_range_mode_changed)
+        track.addWidget(self.range_mode_box, 4, 1)
+        track.addWidget(QLabel("Границы (м):"), 4, 2)
+        self.band_edges_edit = QLineEdit("100,500,1000,3000")
+        self.band_edges_edit.setToolTip(
+            "4+ числа через запятую → полосы, напр. 100,500,1000,3000."
+        )
+        track.addWidget(self.band_edges_edit, 4, 3)
+
+        band_row = QHBoxLayout()
+        self.band_prev_btn = QPushButton("◀ Полоса")
+        self.band_prev_btn.clicked.connect(lambda: self._cycle_band(-1))
+        band_row.addWidget(self.band_prev_btn)
+        self.band_next_btn = QPushButton("Полоса ▶")
+        self.band_next_btn.clicked.connect(lambda: self._cycle_band(1))
+        band_row.addWidget(self.band_next_btn)
+        self.band_apply_btn = QPushButton("Применить границы")
+        self.band_apply_btn.clicked.connect(self._apply_band_edges)
+        band_row.addWidget(self.band_apply_btn)
+        track.addLayout(band_row, 5, 0, 1, 4)
+
+        self.force_gray_cb = QCheckBox("Gray (ч/б)")
+        self.force_gray_cb.setChecked(True)
+        self.force_gray_cb.setToolTip(
+            "Принудительно переводить кадры в gray для трека/превью. "
+            "Выключите для цветных камер (BGR). Для SGBM gray всё равно "
+            "берётся из яркости. На уже монохромном ТПВ разницы почти нет."
+        )
+        self.force_gray_cb.toggled.connect(self._on_force_gray_toggled)
+        track.addWidget(self.force_gray_cb, 6, 0, 1, 2)
+        self.clahe_cb = QCheckBox("CLAHE")
+        self.clahe_cb.setChecked(True)
+        self.clahe_cb.setToolTip(
+            "Локальное повышение контраста на ректифицированном кадре (ТПВ/ИК)."
+        )
+        self.clahe_cb.toggled.connect(self._on_clahe_toggled)
+        track.addWidget(self.clahe_cb, 6, 2, 1, 2)
+
         self.roi_box_btn = QPushButton("ROI рамкой (окно)")
         self.roi_box_btn.setToolTip("Либо клавиша R в окне трекинга и drag мышью.")
         self.roi_box_btn.clicked.connect(self._select_roi_box_live)
-        track.addWidget(self.roi_box_btn, 4, 0)
+        track.addWidget(self.roi_box_btn, 7, 0)
         self.roi_click_btn = QPushButton("Показать окно трекинга")
         self.roi_click_btn.clicked.connect(self._show_track_window)
-        track.addWidget(self.roi_click_btn, 4, 1)
+        track.addWidget(self.roi_click_btn, 7, 1)
         self.track_reset_btn = QPushButton("Сброс трекинга")
         self.track_reset_btn.clicked.connect(self._reset_tracking)
-        track.addWidget(self.track_reset_btn, 4, 2)
+        track.addWidget(self.track_reset_btn, 7, 2)
         self.track_status = QLabel(
-            "Трекинг выключен. В окне: клик = цель, R = рамка."
+            "Трекинг выключен. В окне: клик = цель, R = рамка, [/]=полоса, T=тройной."
         )
-        track.addWidget(self.track_status, 5, 0, 1, 4)
+        track.addWidget(self.track_status, 8, 0, 1, 4)
         layout.addWidget(track_box)
 
         scroll = QScrollArea()
@@ -2579,11 +2633,25 @@ class MainWindow(QMainWindow):
         if st.disparity_px is not None:
             parts.append(f"disp={st.disparity_px:.1f}px")
         parts.append(f"range=[{st.disp_min},{st.disp_min + st.disp_num})")
+        if st.band_label:
+            parts.append(st.band_label)
         if st.sgbm_busy:
             parts.append("SGBM…")
         if st.message:
             parts.append(st.message)
         self.track_status.setText(" | ".join(parts))
+
+    def _on_force_gray_toggled(self, checked: bool) -> None:
+        self.live_track.set_force_gray(bool(checked))
+        self.statusBar().showMessage(
+            f"Gray: {'ВКЛ' if checked else 'ВЫКЛ (цвет BGR)'}", 2500
+        )
+
+    def _on_clahe_toggled(self, checked: bool) -> None:
+        self.live_track.set_clahe(bool(checked))
+        self.statusBar().showMessage(
+            f"CLAHE: {'ВКЛ' if checked else 'ВЫКЛ'}", 2500
+        )
 
     def _process_live_track(self) -> None:
         if not self.track_enable.isChecked():
@@ -2662,6 +2730,13 @@ class MainWindow(QMainWindow):
             if not quiet:
                 QMessageBox.warning(self, "Диапазон", str(exc))
             return False
+        # После ручного z-near/z-far обычно нужен Auto.
+        idx = self.range_mode_box.findData("auto")
+        if idx >= 0 and self.range_mode_box.currentData() != "auto":
+            self.range_mode_box.blockSignals(True)
+            self.range_mode_box.setCurrentIndex(idx)
+            self.range_mode_box.blockSignals(False)
+            self.live_track.set_range_mode("auto")
         if not quiet:
             self.statusBar().showMessage(
                 f"Сцена: {z_near:.0f}–{z_far:.0f} м, "
@@ -2670,6 +2745,73 @@ class MainWindow(QMainWindow):
             )
         self._update_track_status_label()
         return True
+
+    def _apply_band_edges(self) -> None:
+        text = self.band_edges_edit.text().strip()
+        try:
+            self.live_track.set_band_edges(text)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Полосы", str(exc))
+            return
+        mode = self.range_mode_box.currentData()
+        if mode in ("bands", "triple"):
+            self.live_track.set_range_mode(str(mode))
+        self.statusBar().showMessage(
+            f"Границы полос: {text} → {self.live_track.range_mode_label()}",
+            5000,
+        )
+        self._update_track_status_label()
+
+    def _on_range_mode_changed(self, _index: int = 0) -> None:
+        mode = self.range_mode_box.currentData()
+        if mode is None:
+            return
+        try:
+            if mode in ("bands", "triple"):
+                self.live_track.set_band_edges(self.band_edges_edit.text().strip())
+            self.live_track.set_range_mode(str(mode))
+        except Exception as exc:
+            QMessageBox.warning(self, "Режим", str(exc))
+            return
+        self.statusBar().showMessage(
+            f"Режим диспаритета: {self.live_track.range_mode_label()}", 4000
+        )
+        self._update_track_status_label()
+
+    def _cycle_band(self, delta: int) -> None:
+        try:
+            self.live_track.set_band_edges(self.band_edges_edit.text().strip())
+        except ValueError:
+            pass
+        if self.live_track.range_mode != "bands":
+            idx = self.range_mode_box.findData("bands")
+            if idx >= 0:
+                self.range_mode_box.blockSignals(True)
+                self.range_mode_box.setCurrentIndex(idx)
+                self.range_mode_box.blockSignals(False)
+            self.live_track.set_range_mode("bands")
+        self.live_track.cycle_band(int(delta))
+        self.statusBar().showMessage(self.live_track.range_mode_label(), 3000)
+        self._update_track_status_label()
+
+    def _toggle_triple_mode(self) -> None:
+        self.live_track.toggle_triple()
+        mode = self.live_track.range_mode
+        idx = self.range_mode_box.findData(mode)
+        if idx >= 0:
+            self.range_mode_box.blockSignals(True)
+            self.range_mode_box.setCurrentIndex(idx)
+            self.range_mode_box.blockSignals(False)
+        self.statusBar().showMessage(self.live_track.range_mode_label(), 3000)
+        self._update_track_status_label()
+
+    def _set_auto_range_mode(self) -> None:
+        idx = self.range_mode_box.findData("auto")
+        if idx >= 0:
+            self.range_mode_box.setCurrentIndex(idx)
+        else:
+            self.live_track.set_range_mode("auto")
+            self._update_track_status_label()
 
     def _track_window_active(self) -> bool:
         return self._track_window is not None and self._track_window.isVisible()
@@ -2682,6 +2824,10 @@ class MainWindow(QMainWindow):
             win.closed.connect(self._on_track_window_closed)
             # X в окне трекинга — сброс ROI (как Backspace в CLI).
             QShortcut(QKeySequence("X"), win, activated=self._reset_tracking)
+            QShortcut(QKeySequence("["), win, activated=lambda: self._cycle_band(-1))
+            QShortcut(QKeySequence("]"), win, activated=lambda: self._cycle_band(1))
+            QShortcut(QKeySequence("T"), win, activated=self._toggle_triple_mode)
+            QShortcut(QKeySequence("A"), win, activated=self._set_auto_range_mode)
             self._track_window = win
         return self._track_window
 
