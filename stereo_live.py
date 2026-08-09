@@ -82,6 +82,7 @@ class LiveTrackDepthController:
         force_gray: bool = True,
         roi_inset: float = 0.32,
         surface: str = "far",
+        depth_scale: float = 1.0,
         long_range: bool | None = None,
         range_mode: str = "auto",
         band_edges: tuple[float, ...] | str | None = None,
@@ -106,6 +107,7 @@ class LiveTrackDepthController:
         self.force_gray = bool(force_gray)
         self.roi_inset = float(roi_inset)
         self.surface = str(surface)
+        self.depth_scale = float(depth_scale) if float(depth_scale) > 0 else 1.0
         # None / не задано → long-range выключен (только явный флаг).
         self._long_range_pref = long_range
         self.long_range = self._resolve_long_range(long_range)
@@ -728,6 +730,7 @@ class LiveTrackDepthController:
                     measure_args = SimpleNamespace(
                         roi_inset=self.roi_inset,
                         surface=self.surface,
+                        depth_scale=float(self.depth_scale),
                     )
                     dist, disp_val, _per, disp_map = measure_triple_band_point(
                         gray_l=gray_l,
@@ -804,6 +807,7 @@ class LiveTrackDepthController:
                         left_gray=gray_l,
                         right_gray=gray_r,
                         epipolar_ncc=True,
+                        depth_scale=float(self.depth_scale),
                     )
                     dist_s, disp_s = self.dist_smoother.update(dist, disp_val)
                     if disp_s is not None:

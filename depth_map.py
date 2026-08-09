@@ -984,6 +984,7 @@ def measure_roi_distance(
     right_gray: np.ndarray | None = None,
     epipolar_ncc: bool = True,
     ncc_min_score: float = 0.28,
+    depth_scale: float = 1.0,
 ) -> (
     tuple[float | None, float | None]
     | tuple[float | None, float | None, DisparityDebugInfo | None]
@@ -997,6 +998,7 @@ def measure_roi_distance(
 
     max_disparity: отбросить пиксели с d больше порога (ближе z_near).
     max_distance_mm: отбросить/ограничить Z больше ожидаемого z_far.
+    depth_scale: множитель к Z (если якорь верный, а Z систематически смещён).
     left_gray/right_gray + epipolar_ncc: уточнение NCC вдоль эпиполяра
     (защита от ложных матчей SGBM на повторяющейся текстуре).
     collect_debug: если True, третьим элементом вернуть DisparityDebugInfo.
@@ -1228,20 +1230,24 @@ def measure_roi_distance(
     if disp is None or disp < float(min_disparity):
         return _pack(None, disp, dbg)
 
+    scale = float(depth_scale) if depth_scale and np.isfinite(depth_scale) else 1.0
+    if scale <= 0:
+        scale = 1.0
+
     if Q is not None:
         vec = np.array([[cx], [cy], [disp], [1.0]], dtype=np.float64)
         xyzw = Q @ vec
         wv = xyzw[3, 0]
         if abs(wv) < 1e-9:
             return _pack(None, disp, dbg)
-        z = float(xyzw[2, 0] / wv)
+        z = float(xyzw[2, 0] / wv) * scale
         if not np.isfinite(z) or z <= 0:
             return _pack(None, disp, dbg)
         if max_distance_mm is not None and z > float(max_distance_mm):
             return _pack(None, disp, dbg)
         return _pack(z, disp, dbg)
     if focal is not None and baseline is not None and disp > 0:
-        z = float(focal * baseline / disp)
+        z = float(focal * baseline / disp) * scale
         if max_distance_mm is not None and z > float(max_distance_mm):
             return _pack(None, disp, dbg)
         return _pack(z, disp, dbg)

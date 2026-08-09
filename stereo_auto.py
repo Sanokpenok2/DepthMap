@@ -92,12 +92,18 @@ def fuse_point_disparities(
 def distance_mm_from_disparity(
     calib: dict,
     disparity_px: float,
+    *,
+    depth_scale: float = 1.0,
 ) -> float | None:
     """Z = f·B / d (мм) по геометрии калибровки."""
     if disparity_px is None or not np.isfinite(disparity_px) or disparity_px < 0.35:
         return None
     focal, baseline = extract_calib_geometry(calib)
-    return float(focal * baseline / float(disparity_px))
+    z = float(focal * baseline / float(disparity_px))
+    scale = float(depth_scale) if depth_scale and np.isfinite(depth_scale) else 1.0
+    if scale > 0 and abs(scale - 1.0) > 1e-12:
+        z *= scale
+    return z
 
 
 def band_measurement_caps(
@@ -126,6 +132,41 @@ def extract_calib_geometry(calib: dict) -> tuple[float, float]:
     else:
         baseline = float(np.linalg.norm(calib["T"]))
     return focal, baseline
+
+
+def geometry_scale_audit(calib: dict) -> list[str]:
+    """Диагностика масштаба Z: при верном d занижение Z ≈ занижение f·B."""
+    lines: list[str] = []
+    try:
+        focal, baseline = extract_calib_geometry(calib)
+    except Exception:
+        return lines
+    lines.append(
+        f"Масштаб глубины: Z = f·B/d = {focal:.1f}·{baseline:.1f}/d мм "
+        f"(f·B={focal * baseline:.0f} px·мм)."
+    )
+    Q = calib.get("Q")
+    if Q is not None:
+        Q = np.asarray(Q, dtype=np.float64)
+        if Q.shape == (4, 4):
+            q32 = float(Q[3, 2])
+            q23 = float(Q[2, 3])
+            if abs(q32) > 1e-12:
+                b_q = abs(1.0 / q32)
+                f_q = abs(q23) if abs(q23) > 1.0 else focal
+                ratio = (f_q * b_q) / max(focal * baseline, 1e-6)
+                lines.append(
+                    f"  Из Q: f≈{f_q:.1f}, |Tx|≈{b_q:.1f} → f·B_Q/f·B_T = {ratio:.3f}."
+                )
+                if abs(ratio - 1.0) > 0.08:
+                    lines.append(
+                        "  Внимание: Q и T/P1 расходятся — Z по Q и по f·B будут разными."
+                    )
+    lines.append(
+        "  Если якорь на правом кадре верный, а Z занижен — увеличьте --depth-scale "
+        "(Z_meas * scale ≈ Z_истина) или перекалибруйте с верным --square-size."
+    )
+    return lines
 
 
 def disparity_from_depth(focal_px: float, baseline_mm: float, depth_mm: float) -> float:

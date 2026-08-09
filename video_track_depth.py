@@ -63,6 +63,7 @@ from stereo_auto import (
     estimate_disparity_range_bounds,
     extract_calib_geometry,
     fuse_point_disparities,
+    geometry_scale_audit,
     make_range_bands,
     parse_band_edges,
     round_num_disparities,
@@ -131,6 +132,16 @@ def parse_args() -> argparse.Namespace:
             "Подбирать и расширять диапазон диспаритета по --z-near/--z-far и "
             "текущей дистанции объекта (нужен --calib). Иначе диапазон фиксирован "
             "и при приближении измерение портится."
+        ),
+    )
+    p.add_argument(
+        "--depth-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Множитель к Z после верного диспаритета. Если якорь на R совпадает, "
+            "а расстояние занижено: scale = Z_истина / Z_измеренное "
+            "(часто из‑за неверного --square-size при калибровке)."
         ),
     )
     p.add_argument(
@@ -821,6 +832,7 @@ def measure_triple_band_point(
             left_gray=left_gray,
             right_gray=right_gray,
             epipolar_ncc=bool(epipolar_ncc),
+            depth_scale=float(getattr(args, "depth_scale", 1.0)),
         )
         del _dist
         per_d.append(float(d_px) if d_px is not None and np.isfinite(d_px) else None)
@@ -828,7 +840,11 @@ def measure_triple_band_point(
     fused_d = fuse_point_disparities(per_d)
     if fused_d is None:
         return None, None, per_d, last_map
-    dist_mm = distance_mm_from_disparity(calib, fused_d)
+    dist_mm = distance_mm_from_disparity(
+        calib,
+        fused_d,
+        depth_scale=float(getattr(args, "depth_scale", 1.0)),
+    )
     return dist_mm, float(fused_d), per_d, last_map
 
 
@@ -1440,6 +1456,7 @@ def _measure_and_smooth(
         left_gray=left_gray,
         right_gray=right_gray,
         epipolar_ncc=bool(epipolar_ncc),
+        depth_scale=float(getattr(args, "depth_scale", 1.0)),
     )
     if collect_debug:
         dist, disp_val, dbg = measure_roi_distance(
@@ -1525,6 +1542,8 @@ def main() -> None:
         sys.exit("Ошибка: --reacquire-threshold должен быть в диапазоне [0.0, 1.0].")
     if args.z_near <= 0 or args.z_far <= 0 or args.z_near >= args.z_far:
         sys.exit("Ошибка: нужно 0 < --z-near < --z-far (дистанции в метрах).")
+    if not np.isfinite(args.depth_scale) or float(args.depth_scale) <= 0:
+        sys.exit("Ошибка: --depth-scale должен быть > 0.")
     if args.max_fps < 0:
         sys.exit("Ошибка: --max-fps должен быть >= 0 (0 = без ограничения).")
     if not (0.0 <= args.roi_inset < 0.45):
@@ -1609,6 +1628,10 @@ def main() -> None:
                 "Ожидание: при 1000+ м disp должен быть малым (единицы px). "
                 "Большой disp = ложное совпадение / ближняя поверхность."
             )
+            for line in geometry_scale_audit(calib):
+                print(line)
+            if abs(float(args.depth_scale) - 1.0) > 1e-6:
+                print(f"Применён --depth-scale={float(args.depth_scale):.4f}")
         except Exception:
             pass
     elif track_only:
