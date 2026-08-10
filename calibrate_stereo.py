@@ -40,19 +40,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--cols",
         type=int,
-        default=9,
+        default=8,
         help="Число внутренних углов доски по горизонтали.",
     )
     p.add_argument(
         "--rows",
         type=int,
-        default=6,
+        default=5,
         help="Число внутренних углов доски по вертикали.",
     )
     p.add_argument(
         "--square-size",
         type=float,
-        default=25.0,
+        default=90.0,
         help="Размер клетки доски в мм (задаёт масштаб глубины).",
     )
     p.add_argument(
@@ -286,6 +286,159 @@ def build_object_points(cols: int, rows: int, square_size: float) -> np.ndarray:
     objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
     objp *= square_size
     return objp
+
+
+_SUBPIX_CRITERIA = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-3)
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+
+
+def to_gray(img: np.ndarray) -> np.ndarray:
+    if img.ndim == 2:
+        return img
+    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+
+def find_board_corners(
+    gray: np.ndarray, cols: int, rows: int
+) -> np.ndarray | None:
+    """Ищет углы доски на одном кадре. Возвращает corners или None."""
+    if gray is None or gray.size == 0:
+        return None
+    gray = to_gray(gray)
+    pattern = find_pattern_size(cols, rows)
+    flags = cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
+    found, corners = cv2.findChessboardCorners(gray, pattern, flags)
+    if not found:
+        return None
+    return cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), _SUBPIX_CRITERIA)
+
+
+def draw_board_corners(
+    bgr: np.ndarray, corners: np.ndarray, cols: int, rows: int
+) -> np.ndarray:
+    """Копия кадра с нарисованными углами доски."""
+    if bgr.ndim == 2:
+        out = cv2.cvtColor(bgr, cv2.COLOR_GRAY2BGR)
+    else:
+        out = bgr.copy()
+    pattern = find_pattern_size(cols, rows)
+    cv2.drawChessboardCorners(out, pattern, corners, True)
+    return out
+
+
+def list_images_in_dir(folder: str | Path) -> list[str]:
+    """Отсортированный список путей к изображениям в каталоге (без рекурсии)."""
+    path = Path(folder)
+    if not path.is_dir():
+        raise ValueError(f"Нет каталога: {path}")
+    files = [
+        str(p)
+        for p in sorted(path.iterdir())
+        if p.is_file() and p.suffix.lower() in _IMAGE_EXTS
+    ]
+    if not files:
+        raise ValueError(f"В каталоге нет изображений: {path}")
+    return files
+
+
+def run_stereo_calibration_from_folders(
+    left_dir: str,
+    right_dir: str,
+    output: str,
+    *,
+    cols: int = 8,
+    rows: int = 5,
+    square_size: float = 90.0,
+    alpha: float = 1.0,
+    rectify_mode: str = "calibrated",
+    debug_dir: str | None = None,
+    fix_k1: bool = False,
+    fix_k2: bool = False,
+    fix_k3: bool = False,
+    fix_tangential: bool = False,
+    zero_distortion: bool = False,
+    calib_left: str | None = None,
+    calib_right: str | None = None,
+    export_mono_left: str | None = None,
+    export_mono_right: str | None = None,
+) -> tuple[str, list[str]]:
+    """Калибровка стереопары по папкам left/right → .npz.
+
+    Опционально калибровки камер по отдельности (как CLI --calib-left/--calib-right):
+    тогда intrinsics берутся из файлов, считается только stereoCalibrate + rectify.
+    """
+    left_paths = list_images_in_dir(left_dir)
+    right_paths = list_images_in_dir(right_dir)
+    pairs = load_pairs_from_paths(left_paths, right_paths)
+    dist_flags, fixed = build_distortion_flags(
+        fix_k1=fix_k1,
+        fix_k2=fix_k2,
+        fix_k3=fix_k3,
+        fix_tangential=fix_tangential,
+        zero_distortion=zero_distortion,
+    )
+    mono_left = mono_right = None
+    if calib_left or calib_right:
+        if not (calib_left and calib_right):
+            raise ValueError(
+                "Нужны оба файла калибровки камер: calib_left и calib_right."
+            )
+        mono_left = load_mono_calibration(calib_left, prefer="left")
+        mono_right = load_mono_calibration(calib_right, prefer="right")
+    return calibrate_stereo(
+        pairs,
+        cols,
+        rows,
+        square_size,
+        output,
+        debug_dir=debug_dir,
+        alpha=alpha,
+        rectify_mode=rectify_mode,
+        dist_flags=dist_flags,
+        fixed_dist_names=fixed,
+        mono_left=mono_left,
+        mono_right=mono_right,
+        export_mono_left=export_mono_left,
+        export_mono_right=export_mono_right,
+    )
+
+
+def run_mono_calibration_from_folder(
+    images_dir: str,
+    output: str,
+    *,
+    cols: int = 8,
+    rows: int = 5,
+    square_size: float = 90.0,
+    side: str = "",
+    debug_dir: str | None = None,
+    fix_k1: bool = False,
+    fix_k2: bool = False,
+    fix_k3: bool = False,
+    fix_tangential: bool = False,
+    zero_distortion: bool = False,
+) -> tuple[str, list[str]]:
+    """Монокалибровка по одной папке → .npz."""
+    paths = list_images_in_dir(images_dir)
+    images = _load_gray_images(paths)
+    dist_flags, fixed = build_distortion_flags(
+        fix_k1=fix_k1,
+        fix_k2=fix_k2,
+        fix_k3=fix_k3,
+        fix_tangential=fix_tangential,
+        zero_distortion=zero_distortion,
+    )
+    return calibrate_mono_camera(
+        images,
+        cols,
+        rows,
+        square_size,
+        output,
+        debug_dir=debug_dir,
+        dist_flags=dist_flags,
+        fixed_dist_names=fixed,
+        side=side,
+    )
 
 
 def describe_stereo_geometry(

@@ -32,6 +32,7 @@ import argparse
 import math
 import sys
 import time
+from dataclasses import dataclass
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -399,6 +400,12 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Оценивать скорость выбранного объекта по стерео-траектории (нужен --calib).",
+    )
+    p.add_argument(
+        "--velocity-arrow",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Рисовать стрелку вектора скорости на кадре (V переключает).",
     )
     p.add_argument(
         "--speed-window",
@@ -985,15 +992,54 @@ def draw_overlay(
     sgbm_busy: bool = False,
     disp_range: tuple[int, int] | None = None,
     speed_mps: float | None = None,
+    velocity_mps: tuple[float, float, float] | None = None,
+    image_vel_px_s: tuple[float, float] | None = None,
+    show_velocity_arrow: bool = True,
     mode_label: str | None = None,
 ) -> np.ndarray:
     out = frame_bgr.copy()
+    roi_cx = roi_cy = None
     if roi is not None:
         x, y, rw, rh = roi
         color = (0, 220, 0) if tracking_ok else (0, 0, 255)
         cv2.rectangle(out, (x, y), (x + rw, y + rh), color, 2)
-        cx, cy = x + rw // 2, y + rh // 2
-        cv2.drawMarker(out, (cx, cy), color, cv2.MARKER_CROSS, 14, 2)
+        roi_cx, roi_cy = x + rw // 2, y + rh // 2
+        cv2.drawMarker(out, (roi_cx, roi_cy), color, cv2.MARKER_CROSS, 14, 2)
+
+    # Стрелка: проекция 3D-скорости на кадр (px/s).
+    if (
+        show_velocity_arrow
+        and tracking_ok
+        and roi_cx is not None
+        and roi_cy is not None
+        and speed_mps is not None
+        and np.isfinite(speed_mps)
+        and speed_mps > 0.05
+        and image_vel_px_s is not None
+    ):
+        du, dv = float(image_vel_px_s[0]), float(image_vel_px_s[1])
+        mag = float(np.hypot(du, dv))
+        if mag > 0.35:
+            arrow_len = float(np.clip(28.0 + 4.5 * float(speed_mps), 28.0, 120.0))
+            scale = arrow_len / mag
+            x1 = int(round(roi_cx + du * scale))
+            y1 = int(round(roi_cy + dv * scale))
+            cv2.arrowedLine(
+                out,
+                (int(roi_cx), int(roi_cy)),
+                (x1, y1),
+                (0, 0, 0),
+                4,
+                tipLength=0.28,
+            )
+            cv2.arrowedLine(
+                out,
+                (int(roi_cx), int(roi_cy)),
+                (x1, y1),
+                (0, 220, 255),
+                2,
+                tipLength=0.28,
+            )
 
     lines = [f"frame {frame_idx}", f"FPS {fps:.1f}"]
     if mode_label:
@@ -1007,6 +1053,9 @@ def draw_overlay(
         lines.append("distance n/a")
     if speed_mps is not None and np.isfinite(speed_mps):
         lines.append(f"speed {speed_mps * 3.6:.1f} km/h ({speed_mps:.1f} m/s)")
+        if velocity_mps is not None:
+            vx, vy, vz = velocity_mps
+            lines.append(f"vel cam ({vx:+.2f}, {vy:+.2f}, {vz:+.2f}) m/s")
     elif roi is not None and tracking_ok:
         lines.append("speed n/a")
     if disparity is not None:
@@ -1047,24 +1096,22 @@ def draw_overlay(
     return out
 
 
-def smoothed_value(history: deque[float], value: float | None, window: int) -> float | None:
-    """Устаревшая простая медиана — предпочтите DistanceSmoother."""
-    if value is None or not np.isfinite(value) or value <= 0:
-        return float(np.median(history)) if history else None
-    history.append(float(value))
-    while window > 0 and len(history) > window:
-        history.popleft()
-    if window <= 0:
-        return float(value)
-    return float(np.median(history))
+@dataclass
+class SpeedState:
+    """Оценка скорости объекта относительно камеры."""
+
+    speed_mps: float | None = None
+    # (vx, vy, vz) м/с: x вправо, y вниз, z вперёд (удаление > 0).
+    velocity_mps: tuple[float, float, float] | None = None
+    # Проекция v на кадр (px/s) для стрелки.
+    image_vel_px_s: tuple[float, float] | None = None
 
 
 class SpeedEstimator:
-    """Скорость объекта относительно камеры по изменению дистанции Z.
+    """Скорость и 3D-вектор по (ROI-центр, Z) во времени.
 
-    Берём в основном |dZ/dt| (range-rate): боковое дрожание ROI на большой
-    дальности иначе постоянно «разгоняет» |v|. Сэмплы равномерные по времени;
-    выбросы Z в историю не пишутся; малый ΔZ за окно → скорость 0.
+    X=(u−cx)·Z/f, Y=(v−cy)·Z/f в мм; v = d(X,Y,Z)/dt. Боковой джиттер ROI
+    гасим: сильный EMA на (u,v) и обнуление латерали при малом размахе в px.
     """
 
     def __init__(
@@ -1083,6 +1130,7 @@ class SpeedEstimator:
         max_z_jump_m: float = 10.0,
         min_dz_m: float = 0.8,
         min_speed_mps: float = 0.5,
+        min_pixel_span: float = 2.5,
     ) -> None:
         self.focal_px = max(float(focal_px), 1.0)
         self.cx = float(cx)
@@ -1090,7 +1138,6 @@ class SpeedEstimator:
         self.window_s = max(0.5, float(window_s))
         self.min_dt_s = max(0.1, float(min_dt_s))
         self.ema_alpha = float(np.clip(ema_alpha, 0.0, 1.0))
-        # Спуск быстрее подъёма — иначе шумовые пики «защёлкивают» скорость вверх.
         self.ema_alpha_down = float(np.clip(max(self.ema_alpha * 3.0, 0.12), 0.0, 1.0))
         self.sample_interval_s = max(0.05, float(sample_interval_s))
         self.median_len = max(1, int(median_len))
@@ -1099,23 +1146,37 @@ class SpeedEstimator:
         self.max_z_jump_mm = max(100.0, float(max_z_jump_m) * 1000.0)
         self.min_dz_mm = max(50.0, float(min_dz_m) * 1000.0)
         self.min_speed_mps = max(0.0, float(min_speed_mps))
-        # (t, z_mm) — только дистанция; боковой ROI для скорости не используем.
-        self._samples: deque[tuple[float, float]] = deque()
+        self.min_pixel_span = max(0.5, float(min_pixel_span))
+        # (t, u, v, z_mm)
+        self._samples: deque[tuple[float, float, float, float]] = deque()
         self._z_hist: deque[float] = deque(maxlen=21)
         self._raw_speeds: deque[float] = deque(maxlen=self.median_len)
+        self._raw_vel: deque[tuple[float, float, float]] = deque(maxlen=self.median_len)
         self._speed_mps: float | None = None
+        self._velocity_mps: tuple[float, float, float] | None = None
+        self._image_vel_px_s: tuple[float, float] | None = None
         self._last_sample_t: float | None = None
         self._last_emit_t: float | None = None
         self._z_s: float | None = None
+        self._u_s: float | None = None
+        self._v_s: float | None = None
 
     def reset(self) -> None:
         self._samples.clear()
         self._z_hist.clear()
         self._raw_speeds.clear()
+        self._raw_vel.clear()
         self._speed_mps = None
+        self._velocity_mps = None
+        self._image_vel_px_s = None
         self._last_sample_t = None
         self._last_emit_t = None
         self._z_s = None
+        self._u_s = None
+        self._v_s = None
+
+    def state(self) -> SpeedState:
+        return SpeedState(self._speed_mps, self._velocity_mps, self._image_vel_px_s)
 
     def _ref_z_mm(self) -> float | None:
         if len(self._z_hist) >= 3:
@@ -1135,7 +1196,6 @@ class SpeedEstimator:
         return bool(ratio > self.max_z_ratio or ratio < 1.0 / self.max_z_ratio)
 
     def _filter_z(self, z_mm: float) -> float | None:
-        """Сглаженный Z или None при выбросе (выброс не двигает фильтр)."""
         z_mm = float(z_mm)
         if self._is_z_outlier(z_mm):
             return None
@@ -1146,6 +1206,17 @@ class SpeedEstimator:
             self._z_s = (1.0 - a_z) * self._z_s + a_z * z_mm
         self._z_hist.append(float(self._z_s))
         return float(self._z_s)
+
+    def _filter_uv(self, u: float, v: float) -> tuple[float, float]:
+        # Сильнее глушим дрожание рамки, чем Z.
+        a = 0.22
+        if self._u_s is None or self._v_s is None:
+            self._u_s = float(u)
+            self._v_s = float(v)
+        else:
+            self._u_s = (1.0 - a) * self._u_s + a * float(u)
+            self._v_s = (1.0 - a) * self._v_s + a * float(v)
+        return float(self._u_s), float(self._v_s)
 
     @staticmethod
     def _slope_mm_s(times: np.ndarray, values: np.ndarray) -> float:
@@ -1161,69 +1232,103 @@ class SpeedEstimator:
         roi: tuple[int, int, int, int] | None,
         *,
         tracking_ok: bool,
-    ) -> float | None:
-        del roi  # боковой ROI намеренно не используем — источник ложного разгона
+    ) -> SpeedState:
         if (
             not tracking_ok
             or distance_mm is None
             or not np.isfinite(distance_mm)
             or distance_mm <= 0
+            or roi is None
         ):
-            return self._speed_mps
+            return self.state()
 
         now = float(now)
         z_acc = self._filter_z(float(distance_mm))
         if z_acc is None:
-            return self._speed_mps
+            return self.state()
 
-        # Равномерные сэмплы по времени (НЕ по порогу ΔZ — иначе «лесенка» и разгон).
+        x, y, rw, rh = (int(v) for v in roi)
+        u_raw = float(x) + float(rw) * 0.5
+        v_raw = float(y) + float(rh) * 0.5
+        u_acc, v_acc = self._filter_uv(u_raw, v_raw)
+
         if (
             self._last_sample_t is not None
             and (now - self._last_sample_t) < self.sample_interval_s
         ):
-            return self._speed_mps
+            return self.state()
 
-        self._samples.append((now, z_acc))
+        self._samples.append((now, u_acc, v_acc, z_acc))
         self._last_sample_t = now
         cutoff = now - self.window_s
         while len(self._samples) > 2 and self._samples[0][0] < cutoff:
             self._samples.popleft()
 
         if len(self._samples) < 3:
-            return self._speed_mps
+            return self.state()
 
         t0 = self._samples[0][0]
         t1 = self._samples[-1][0]
         dt = t1 - t0
         if dt < self.min_dt_s:
-            return self._speed_mps
+            return self.state()
 
         times = np.asarray([s[0] for s in self._samples], dtype=np.float64)
-        zs = np.asarray([s[1] for s in self._samples], dtype=np.float64)
+        us = np.asarray([s[1] for s in self._samples], dtype=np.float64)
+        vs = np.asarray([s[2] for s in self._samples], dtype=np.float64)
+        zs = np.asarray([s[3] for s in self._samples], dtype=np.float64)
 
-        # Малый размах Z за окно → нет достоверного движения по дальности.
-        z_span = float(np.ptp(zs))  # max - min
-        if z_span < self.min_dz_mm:
-            speed = 0.0
+        # 3D точки в мм (камера: z вперёд).
+        xs = (us - self.cx) * zs / self.focal_px
+        ys = (vs - self.cy) * zs / self.focal_px
+
+        u_span = float(np.ptp(us))
+        v_span = float(np.ptp(vs))
+        z_span = float(np.ptp(zs))
+
+        # Латераль только при заметном смещении рамки (анти-джаттер).
+        if u_span >= self.min_pixel_span:
+            vx = self._slope_mm_s(times, xs) / 1000.0
+            vx_ends = (float(xs[-1] - xs[0]) / max(dt, 1e-3)) / 1000.0
+            vx = float(np.clip(vx, -abs(vx_ends) * 1.35, abs(vx_ends) * 1.35))
         else:
-            # |dZ/dt|: скорость сближения/удаления относительно камеры.
-            vz = abs(self._slope_mm_s(times, zs)) / 1000.0
-            # Доп. проверка: простая оценка по концам окна (устойчивее к краям).
-            vz_ends = abs(float(zs[-1] - zs[0])) / max(dt, 1e-3) / 1000.0
-            speed = float(min(vz, vz_ends * 1.25))  # не раздувать МНК сверх концов
+            vx = 0.0
+        if v_span >= self.min_pixel_span:
+            vy = self._slope_mm_s(times, ys) / 1000.0
+            vy_ends = (float(ys[-1] - ys[0]) / max(dt, 1e-3)) / 1000.0
+            vy = float(np.clip(vy, -abs(vy_ends) * 1.35, abs(vy_ends) * 1.35))
+        else:
+            vy = 0.0
 
+        if z_span < self.min_dz_mm:
+            vz = 0.0
+        else:
+            vz = self._slope_mm_s(times, zs) / 1000.0
+            vz_ends = (float(zs[-1] - zs[0]) / max(dt, 1e-3)) / 1000.0
+            # Не раздувать МНК сверх оценки по концам окна.
+            if abs(vz) > abs(vz_ends) * 1.25:
+                vz = float(np.copysign(abs(vz_ends) * 1.25, vz))
+
+        speed = float(np.hypot(np.hypot(vx, vy), vz))
         if not np.isfinite(speed) or speed < 0:
-            return self._speed_mps
+            return self.state()
         if speed < self.min_speed_mps:
             speed = 0.0
+            vx = vy = vz = 0.0
 
         self._raw_speeds.append(speed)
+        self._raw_vel.append((float(vx), float(vy), float(vz)))
         speed_med = float(np.median(self._raw_speeds))
+        vx_med = float(np.median([v[0] for v in self._raw_vel]))
+        vy_med = float(np.median([v[1] for v in self._raw_vel]))
+        vz_med = float(np.median([v[2] for v in self._raw_vel]))
         if speed_med < self.min_speed_mps:
             speed_med = 0.0
+            vx_med = vy_med = vz_med = 0.0
 
         if self._speed_mps is None or self.ema_alpha >= 1.0:
             smoothed = speed_med
+            vel_s = (vx_med, vy_med, vz_med)
         else:
             a = (
                 self.ema_alpha_down
@@ -1231,6 +1336,15 @@ class SpeedEstimator:
                 else self.ema_alpha
             )
             smoothed = (1.0 - a) * self._speed_mps + a * speed_med
+            if self._velocity_mps is None:
+                vel_s = (vx_med, vy_med, vz_med)
+            else:
+                ox, oy, oz = self._velocity_mps
+                vel_s = (
+                    (1.0 - a) * ox + a * vx_med,
+                    (1.0 - a) * oy + a * vy_med,
+                    (1.0 - a) * oz + a * vz_med,
+                )
 
         if self._speed_mps is not None and self._last_emit_t is not None:
             dt_emit = max(now - self._last_emit_t, 1e-3)
@@ -1241,10 +1355,30 @@ class SpeedEstimator:
 
         if smoothed < self.min_speed_mps:
             smoothed = 0.0
+            vel_s = (0.0, 0.0, 0.0)
 
         self._speed_mps = float(smoothed)
+        self._velocity_mps = (
+            float(vel_s[0]),
+            float(vel_s[1]),
+            float(vel_s[2]),
+        )
+        # Проекция 3D → px/s: du = (f·vx − (u−cx)·vz) / Z_m
+        u_now = float(us[-1])
+        v_now = float(vs[-1])
+        z_m = max(float(zs[-1]) / 1000.0, 1e-3)
+        vx_s, vy_s, vz_s = self._velocity_mps
+        if smoothed <= 0:
+            self._image_vel_px_s = None
+        else:
+            du = (self.focal_px * vx_s - (u_now - self.cx) * vz_s) / z_m
+            dv = (self.focal_px * vy_s - (v_now - self.cy) * vz_s) / z_m
+            # Чисто радиальное: слабый визуальный намёк «к/от».
+            if abs(du) + abs(dv) < 0.8 and abs(vz_s) > 0.05:
+                du, dv = 0.25 * abs(vz_s) * 8.0, (8.0 if vz_s > 0 else -8.0)
+            self._image_vel_px_s = (float(du), float(dv))
         self._last_emit_t = now
-        return self._speed_mps
+        return self.state()
 
 
 class DistanceSmoother:
@@ -1833,6 +1967,9 @@ def main() -> None:
     dist_s = None
     disp_s = None
     speed_mps: float | None = None
+    velocity_mps: tuple[float, float, float] | None = None
+    image_vel_px_s: tuple[float, float] | None = None
+    show_velocity_arrow = bool(args.velocity_arrow)
     speed_est: SpeedEstimator | None = None
     if args.speed and not track_only and calib is not None:
         focal_px, _baseline = extract_calib_geometry(calib)
@@ -2122,6 +2259,8 @@ def main() -> None:
                         if speed_est is not None:
                             speed_est.reset()
                             speed_mps = None
+                            velocity_mps = None
+                            image_vel_px_s = None
 
                 if (
                     speed_est is not None
@@ -2130,14 +2269,19 @@ def main() -> None:
                     and dist_s is not None
                     and roi is not None
                 ):
-                    speed_mps = speed_est.update(
+                    spd = speed_est.update(
                         time.perf_counter(),
                         dist_s,
                         roi,
                         tracking_ok=True,
                     )
+                    speed_mps = spd.speed_mps
+                    velocity_mps = spd.velocity_mps
+                    image_vel_px_s = spd.image_vel_px_s
                 elif speed_est is not None and not tracker.initialized:
                     speed_mps = None
+                    velocity_mps = None
+                    image_vel_px_s = None
 
                 # 4) draw
                 sgbm_busy = sgbm_future is not None and not sgbm_future.done()
@@ -2152,6 +2296,9 @@ def main() -> None:
                     sgbm_busy=sgbm_busy,
                     disp_range=(disp_min, disp_num) if not track_only else None,
                     speed_mps=speed_mps if speed_est is not None else None,
+                    velocity_mps=velocity_mps if speed_est is not None else None,
+                    image_vel_px_s=image_vel_px_s if speed_est is not None else None,
+                    show_velocity_arrow=show_velocity_arrow,
                     mode_label=range_mode_label(),
                 )
                 if debug_disparity:
@@ -2208,6 +2355,12 @@ def main() -> None:
             key = cv2.waitKey(10 if not paused else 50) & 0xFF
             if key in (ord("q"), 27):
                 break
+            if key in (ord("v"), ord("V")):
+                show_velocity_arrow = not show_velocity_arrow
+                print(
+                    f"Стрелка скорости: "
+                    f"{'ВКЛ' if show_velocity_arrow else 'ВЫКЛ'}"
+                )
             if key == ord(" "):
                 paused = not paused
             if key in (ord("x"), ord("X"), 8):  # X или Backspace — сброс трека
@@ -2224,6 +2377,8 @@ def main() -> None:
                     disp_debug = None
                     dbg_cross_ema = None
                     speed_mps = None
+                    velocity_mps = None
+                    image_vel_px_s = None
                     print("Трекинг отменён. R/C — выбрать объект заново.")
                     base = rect_l_bgr if rect_l_bgr is not None else overlay
                     if base is not None:
@@ -2238,6 +2393,9 @@ def main() -> None:
                             sgbm_busy=False,
                             disp_range=(disp_min, disp_num) if not track_only else None,
                             speed_mps=None,
+                            velocity_mps=None,
+                            image_vel_px_s=None,
+                            show_velocity_arrow=show_velocity_arrow,
                             mode_label=range_mode_label(),
                         )
                         cv2.imshow(
@@ -2415,6 +2573,8 @@ def main() -> None:
                     disp_s = None
                     dbg_cross_ema = None
                     speed_mps = None
+                    velocity_mps = None
+                    image_vel_px_s = None
                     if not track_only and matcher is not None:
                         gray_l, gray_r = stereo_gray_pair(rect_l, rect_r)
                         disp_float = compute_disparity(

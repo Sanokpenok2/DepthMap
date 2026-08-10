@@ -31,6 +31,7 @@ from stereo_auto import (
 )
 from video_track_depth import (
     DistanceSmoother,
+    SpeedEstimator,
     adapt_disparity_range,
     build_band_matcher,
     compute_disparity,
@@ -51,6 +52,8 @@ class LiveStatus:
     roi: tuple[int, int, int, int] | None = None
     distance_mm: float | None = None
     disparity_px: float | None = None
+    speed_mps: float | None = None
+    velocity_mps: tuple[float, float, float] | None = None
     disp_min: int = 0
     disp_num: int = 128
     sgbm_busy: bool = False
@@ -78,11 +81,12 @@ class LiveTrackDepthController:
         method: str = "sgbm",
         block_size: int = 7,
         wls: bool = False,
-        clahe: bool = True,
-        force_gray: bool = True,
+        clahe: bool = False,
+        force_gray: bool = False,
         roi_inset: float = 0.32,
         surface: str = "far",
         depth_scale: float = 1.0,
+        show_velocity_arrow: bool = True,
         long_range: bool | None = None,
         range_mode: str = "auto",
         band_edges: tuple[float, ...] | str | None = None,
@@ -108,6 +112,7 @@ class LiveTrackDepthController:
         self.roi_inset = float(roi_inset)
         self.surface = str(surface)
         self.depth_scale = float(depth_scale) if float(depth_scale) > 0 else 1.0
+        self.show_velocity_arrow = bool(show_velocity_arrow)
         # None / не задано → long-range выключен (только явный флаг).
         self._long_range_pref = long_range
         self.long_range = self._resolve_long_range(long_range)
@@ -180,6 +185,10 @@ class LiveTrackDepthController:
         self._last_rect_r: np.ndarray | None = None
         self._dist_s: float | None = None
         self._disp_val: float | None = None
+        self._speed_mps: float | None = None
+        self._velocity_mps: tuple[float, float, float] | None = None
+        self._image_vel_px_s: tuple[float, float] | None = None
+        self.speed_est: SpeedEstimator | None = None
         self._tracking_ok = False
         self._status_msg = ""
 
@@ -400,8 +409,35 @@ class LiveTrackDepthController:
             self.calib = calib
             self.Q = calib["Q"]
             self.track_only = False
+            self.speed_est = self._make_speed_estimator(calib)
         self._rebuild_matcher_from_calib(path, calib=calib)
         self._log(f"Калибровка загружена: {path}")
+
+    @staticmethod
+    def _make_speed_estimator(calib: dict) -> SpeedEstimator:
+        focal_px, _baseline = extract_calib_geometry(calib)
+        if "P1" in calib:
+            p1 = np.asarray(calib["P1"], dtype=np.float64)
+            cam_cx = float(p1[0, 2])
+            cam_cy = float(p1[1, 2])
+            if abs(float(p1[0, 0])) > 1.0:
+                focal_px = float(p1[0, 0])
+        else:
+            mtx = np.asarray(calib["mtx_l"], dtype=np.float64)
+            cam_cx = float(mtx[0, 2])
+            cam_cy = float(mtx[1, 2])
+        return SpeedEstimator(
+            focal_px=focal_px,
+            cx=cam_cx,
+            cy=cam_cy,
+            window_s=4.0,
+            min_dt_s=1.5,
+            ema_alpha=0.04,
+            max_z_ratio=1.18,
+            max_z_jump_m=10.0,
+            min_dz_m=0.8,
+            min_speed_mps=0.5,
+        )
 
     def _rebuild_matcher_from_calib(
         self, path: str, calib: dict | None = None
@@ -509,6 +545,10 @@ class LiveTrackDepthController:
             self.Q = None
             self.matcher = None
             self.track_only = True
+            self.speed_est = None
+            self._speed_mps = None
+            self._velocity_mps = None
+            self._image_vel_px_s = None
         self._log("Калибровка сброшена (track-only).")
 
     def set_enabled(self, enabled: bool) -> None:
@@ -539,6 +579,11 @@ class LiveTrackDepthController:
             self.dist_smoother.reset()
             self._dist_s = None
             self._disp_val = None
+            self._speed_mps = None
+            self._velocity_mps = None
+            self._image_vel_px_s = None
+            if self.speed_est is not None:
+                self.speed_est.reset()
             self._tracking_ok = False
             self._disp_float = None
             self._last_overlay = None
@@ -555,6 +600,8 @@ class LiveTrackDepthController:
                 roi=roi,
                 distance_mm=self._dist_s,
                 disparity_px=self._disp_val,
+                speed_mps=self._speed_mps,
+                velocity_mps=self._velocity_mps,
                 disp_min=self.disp_min,
                 disp_num=self.disp_num,
                 sgbm_busy=(
@@ -581,6 +628,10 @@ class LiveTrackDepthController:
         with self._lock:
             self.clahe = bool(enabled)
 
+    def set_show_velocity_arrow(self, enabled: bool) -> None:
+        with self._lock:
+            self.show_velocity_arrow = bool(enabled)
+
     def _snapshot_rect_left(self) -> np.ndarray | None:
         with self._lock:
             if self._last_rect_l is None:
@@ -598,9 +649,14 @@ class LiveTrackDepthController:
             return False
         with self._lock:
             self.dist_smoother.reset()
+            if self.speed_est is not None:
+                self.speed_est.reset()
             self._tracking_ok = True
             self._dist_s = None
             self._disp_val = None
+            self._speed_mps = None
+            self._velocity_mps = None
+            self._image_vel_px_s = None
         self._log(f"ROI выбран рамкой: {roi}")
         return True
 
@@ -615,9 +671,14 @@ class LiveTrackDepthController:
             return False
         with self._lock:
             self.dist_smoother.reset()
+            if self.speed_est is not None:
+                self.speed_est.reset()
             self._tracking_ok = True
             self._dist_s = None
             self._disp_val = None
+            self._speed_mps = None
+            self._velocity_mps = None
+            self._image_vel_px_s = None
         self._log(f"ROI выбран кликом: {roi}")
         return True
 
@@ -634,9 +695,14 @@ class LiveTrackDepthController:
             return False
         with self._lock:
             self.dist_smoother.reset()
+            if self.speed_est is not None:
+                self.speed_est.reset()
             self._tracking_ok = True
             self._dist_s = None
             self._disp_val = None
+            self._speed_mps = None
+            self._velocity_mps = None
+            self._image_vel_px_s = None
         self._log(f"ROI задан: {self.tracker.roi}")
         return True
 
@@ -862,6 +928,28 @@ class LiveTrackDepthController:
         if dt > 0:
             self.fps = 0.9 * self.fps + 0.1 * (1.0 / dt) if self.fps > 0 else 1.0 / dt
 
+        speed_mps = None
+        velocity_mps = None
+        image_vel_px_s = None
+        if (
+            self.speed_est is not None
+            and self.tracker.initialized
+            and tracking_ok
+            and dist_s is not None
+            and roi is not None
+        ):
+            spd = self.speed_est.update(
+                now,
+                dist_s,
+                roi,
+                tracking_ok=True,
+            )
+            speed_mps = spd.speed_mps
+            velocity_mps = spd.velocity_mps
+            image_vel_px_s = spd.image_vel_px_s
+        elif self.speed_est is not None and not self.tracker.initialized:
+            self.speed_est.reset()
+
         overlay = draw_overlay(
             rect_l_bgr,
             roi,
@@ -872,6 +960,10 @@ class LiveTrackDepthController:
             self.fps,
             sgbm_busy=sgbm_busy,
             disp_range=(disp_min, disp_num) if not track_only else None,
+            speed_mps=speed_mps,
+            velocity_mps=velocity_mps,
+            image_vel_px_s=image_vel_px_s,
+            show_velocity_arrow=self.show_velocity_arrow,
             mode_label=self.range_mode_label() if not track_only else None,
         )
         self.frame_idx += 1
@@ -880,5 +972,8 @@ class LiveTrackDepthController:
             self._tracking_ok = bool(tracking_ok and self.tracker.initialized)
             self._dist_s = dist_s
             self._disp_val = disp_val
+            self._speed_mps = speed_mps
+            self._velocity_mps = velocity_mps
+            self._image_vel_px_s = image_vel_px_s
             self._last_overlay = overlay
         return overlay

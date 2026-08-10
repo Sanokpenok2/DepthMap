@@ -2054,6 +2054,8 @@ class MainWindow(QMainWindow):
             z_near_m=10.0,
             z_far_m=100.0,
             long_range=None,
+            force_gray=False,
+            clahe=False,
             on_log=self._on_live_log,
         )
         self._live_overlay: Optional[np.ndarray] = None
@@ -2291,7 +2293,7 @@ class MainWindow(QMainWindow):
         track.addLayout(band_row, 5, 0, 1, 4)
 
         self.force_gray_cb = QCheckBox("Gray (ч/б)")
-        self.force_gray_cb.setChecked(True)
+        self.force_gray_cb.setChecked(False)
         self.force_gray_cb.setToolTip(
             "Принудительно переводить кадры в gray для трека/превью. "
             "Выключите для цветных камер (BGR). Для SGBM gray всё равно "
@@ -2300,12 +2302,20 @@ class MainWindow(QMainWindow):
         self.force_gray_cb.toggled.connect(self._on_force_gray_toggled)
         track.addWidget(self.force_gray_cb, 6, 0, 1, 2)
         self.clahe_cb = QCheckBox("CLAHE")
-        self.clahe_cb.setChecked(True)
+        self.clahe_cb.setChecked(False)
         self.clahe_cb.setToolTip(
             "Локальное повышение контраста на ректифицированном кадре (ТПВ/ИК)."
         )
         self.clahe_cb.toggled.connect(self._on_clahe_toggled)
-        track.addWidget(self.clahe_cb, 6, 2, 1, 2)
+        track.addWidget(self.clahe_cb, 6, 2)
+        self.vel_arrow_cb = QCheckBox("Стрелка скорости")
+        self.vel_arrow_cb.setChecked(True)
+        self.vel_arrow_cb.setToolTip(
+            "Рисовать на кадре стрелку проекции вектора скорости. "
+            "Скорость и текст vel остаются на экране."
+        )
+        self.vel_arrow_cb.toggled.connect(self._on_vel_arrow_toggled)
+        track.addWidget(self.vel_arrow_cb, 6, 3)
 
         self.roi_box_btn = QPushButton("ROI рамкой (окно)")
         self.roi_box_btn.setToolTip("Либо клавиша R в окне трекинга и drag мышью.")
@@ -2630,6 +2640,11 @@ class MainWindow(QMainWindow):
             parts.append(f"dist={st.distance_mm / 1000.0:.2f} m")
         elif not st.has_calib:
             parts.append("без calib (track-only)")
+        if st.speed_mps is not None and np.isfinite(st.speed_mps):
+            parts.append(f"speed={st.speed_mps * 3.6:.1f} km/h")
+            if st.velocity_mps is not None:
+                vx, vy, vz = st.velocity_mps
+                parts.append(f"vel=({vx:+.2f},{vy:+.2f},{vz:+.2f}) m/s")
         if st.disparity_px is not None:
             parts.append(f"disp={st.disparity_px:.1f}px")
         parts.append(f"range=[{st.disp_min},{st.disp_min + st.disp_num})")
@@ -2651,6 +2666,12 @@ class MainWindow(QMainWindow):
         self.live_track.set_clahe(bool(checked))
         self.statusBar().showMessage(
             f"CLAHE: {'ВКЛ' if checked else 'ВЫКЛ'}", 2500
+        )
+
+    def _on_vel_arrow_toggled(self, checked: bool) -> None:
+        self.live_track.set_show_velocity_arrow(bool(checked))
+        self.statusBar().showMessage(
+            f"Стрелка скорости: {'ВКЛ' if checked else 'ВЫКЛ'}", 2500
         )
 
     def _process_live_track(self) -> None:
@@ -3013,6 +3034,18 @@ class MainWindow(QMainWindow):
 
 
 def run() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="П139Н-1: приём UDP-видео, запись MP4 или режим калибровки.",
+    )
+    parser.add_argument(
+        "--calib-mode",
+        action="store_true",
+        help="Открыть окно калибровки (захват доски + расчёт .npz).",
+    )
+    args = parser.parse_args()
+
     # Два параллельных декодера быстрее и стабильнее работают без внутренних
     # пулов OpenCV, которые иначе конкурируют друг с другом за ядра процессора.
     cv2.setNumThreads(1)
@@ -3023,7 +3056,12 @@ def run() -> int:
     # Сразу отключаем EcoQoS Windows — на батарее иначе сыпятся UDP-кадры.
     _enable_windows_capture_performance()
     app = QApplication(sys.argv)
-    window = MainWindow()
+    if args.calib_mode:
+        from calib_window import CalibMainWindow
+
+        window: QMainWindow = CalibMainWindow()
+    else:
+        window = MainWindow()
     window.show()
     code = app.exec()
     _restore_windows_execution_state()
